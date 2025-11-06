@@ -119,6 +119,17 @@ npm install @silvermine/tauri-plugin-sqlite
 
 Use the plugin from JavaScript:
 
+Add the plugin permission to your capabilities file `src-tauri/capabilities/default.json`:
+
+```json
+{
+    "permissions": [
+        "core:default",
+        "sqlite:default"
+    ]
+}
+```
+
 ```typescript
 // TODO: Add real examples once we have decided on the plugin API
 import { hello } from '@silvermine/tauri-plugin-sqlite';
