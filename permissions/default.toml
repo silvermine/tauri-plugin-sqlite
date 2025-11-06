@@ -1,0 +1,8 @@
+# Default permissions for the sqlite plugin
+# This file defines which commands are available to the frontend
+
+[default]
+description = "Default permissions for the sqlite plugin"
+permissions = [
+   "allow-hello",
+]

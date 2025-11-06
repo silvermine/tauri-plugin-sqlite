@@ -1,0 +1,33 @@
+{
+   "name": "tauri-plugin-sqlite",
+   "version": "0.1.0",
+   "description": "A Tauri plugin for SQLite database access with connection pool management",
+   "main": "dist-js/index.js",
+   "types": "dist-js/index.d.ts",
+   "files": [
+      "dist-js",
+      "permissions"
+   ],
+   "scripts": {
+      "build": "tsc -p guest-js/tsconfig.json",
+      "check-node-version": "check-node-version --npm 10.5.0",
+      "markdownlint": "markdownlint-cli2",
+      "rust:lint": "cargo lint-clippy && cargo lint-fmt",
+      "rust:lint:fix": "cargo fix-clippy && cargo fix-fmt",
+      "standards": "npm run markdownlint && npm run rust:lint"
+   },
+   "author": "Jeremy Thomerson",
+   "license": "MIT",
+   "repository": {
+      "type": "git",
+      "url": "https://github.com/silvermine/tauri-plugin-sqlite.git"
+   },
+   "devDependencies": {
+      "@silvermine/standardization": "2.2.3",
+      "@tauri-apps/api": "2.9.0",
+      "typescript": "5.8.3"
+   },
+   "peerDependencies": {
+      "@tauri-apps/api": "2.9.0"
+   }
+}

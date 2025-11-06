@@ -1,0 +1,11 @@
+[package]
+name = "sqlx-sqlite-conn-mgr"
+version = "0.8.6" # Sync with SQLx crate version
+description = "Wraps SQLx for SQLite, enforcing pragmatic connection policies for mobile and desktop applications"
+license = "MIT"
+edition = "2024"
+rust-version = "1.89"
+
+[dependencies]
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["full"] }

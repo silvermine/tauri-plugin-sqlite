@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+   "crates/sqlx-sqlite-conn-mgr",
+]
+
+[package]
+name = "tauri-plugin-sqlite"
+version = "0.1.0"
+description = "A Tauri plugin for SQLite database access with connection management"
+license = "MIT"
+edition = "2024"
+rust-version = "1.89"
+links = "tauri-plugin-sqlite"
+
+[dependencies]
+tauri = "2.5.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[build-dependencies]
+tauri-plugin = { version = "2.5.1", features = ["build"] }
