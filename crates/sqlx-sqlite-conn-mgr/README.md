@@ -8,19 +8,20 @@ management.
 
 ## Features
 
-   * **Single connection pool per database**: Prevents violation of access policies
-     and/or a glut of open file handles and (mostly) idle threads
+   * **Maintains one read connection pool and one write connection per database**:
+     Prevents violation of access policies and/or a glut of open file handles and
+     (mostly) idle threads
    * **Connection pooling**:
       * Read-only pool for concurrent reads (up to 6 connections)
-   * **Lazy write pool**: Single write connection pool (max=1) initialized on
+   * **Lazy write pool**: Single write connection pool (max_connections=1) initialized on
      first use
    * **Exclusive write access**: WriteGuard ensures serialized writes
-     (enforced by max_connections=1)
    * **WAL mode**: Automatically enabled on first `acquire_writer()` call
      (idempotent)
+      * See [WAL documentation](https://www.sqlite.org/wal.html) for details
    * **30-second idle timeout**: Both read and write connections close after
      30 seconds of inactivity
-   * **No perpetual caching**: Zero minimum connections (min_connections=0) to
+   * **No perpetual connection caching**: Zero minimum connections (min_connections=0) to
      avoid idle thread overhead
 
 ## Design Philosophy
@@ -110,9 +111,11 @@ queries.
    is released via `WriteGuard` drop.
 
 5. **Connection Management**:
-   * Read pool: max 6 concurrent connections, 0 cached
+   * Read pool: 6 concurrent connections by default, 0 cached
+      * Can be configured via `SqliteDatabaseConfig`
    * Write pool: max 1 connection, 0 cached
    * Idle timeout: 30 seconds for both pools
+      * Can be configured via `SqliteDatabaseConfig`
    * No perpetual caching to minimize idle thread overhead
 
 ## Error Handling
