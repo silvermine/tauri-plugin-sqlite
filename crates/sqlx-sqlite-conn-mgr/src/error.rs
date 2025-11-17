@@ -18,6 +18,3 @@ pub enum Error {
    #[error("Database has been closed")]
    DatabaseClosed,
 }
-
-/// A type alias for Results with our Error type
-pub type Result<T> = std::result::Result<T, Error>;

@@ -12,12 +12,12 @@ management.
      Prevents violation of access policies and/or a glut of open file handles and
      (mostly) idle threads
    * **Connection pooling**:
-      * Read-only pool for concurrent reads (up to 6 connections)
+      * Read-only pool for concurrent reads (default: 6 connections, configurable)
    * **Lazy write pool**: Single write connection pool (max_connections=1) initialized on
      first use
    * **Exclusive write access**: WriteGuard ensures serialized writes
-   * **WAL mode**: Automatically enabled on first `acquire_writer()` call
-     (idempotent)
+   * **WAL mode**: Automatically enabled on first `acquire_writer()` call (setting
+     journal mode to WAL is safe and idempotent)
       * See [WAL documentation](https://www.sqlite.org/wal.html) for details
    * **30-second idle timeout**: Both read and write connections close after
      30 seconds of inactivity
@@ -44,18 +44,19 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), sqlx_sqlite_conn_mgr::Error> {
     // Connect to database (creates if missing, returns Arc<SqliteDatabase>)
+    // (See below for how to customize the configuration)
     let db = SqliteDatabase::connect("example.db").await?;
 
     // Multiple connects to the same path return the same instance
     let db2 = SqliteDatabase::connect("example.db").await?;
     assert!(Arc::ptr_eq(&db, &db2));
 
-    // Use read_pool() for SELECT queries (supports concurrent reads)
+    // Use read_pool() for read queries (supports concurrent reads)
     let rows = query("SELECT * FROM users")
         .fetch_all(db.read_pool()?)
         .await?;
 
-    // Optionally acquire writer for INSERT/UPDATE/DELETE (exclusive access)
+    // Optionally acquire writer for write queries (exclusive access)
     // WAL mode is enabled automatically on first call
     let mut writer = db.acquire_writer().await?;
     query("INSERT INTO users (name) VALUES (?)")
@@ -70,12 +71,39 @@ async fn main() -> Result<(), sqlx_sqlite_conn_mgr::Error> {
 }
 ```
 
+### Custom Configuration
+
+Only customize the configuration when the defaults don't meet your requirements:
+
+```rust
+use sqlx_sqlite_conn_mgr::{SqliteDatabase, SqliteDatabaseConfig};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), sqlx_sqlite_conn_mgr::Error> {
+    // Only create custom configuration when defaults aren't suitable
+    let custom_config = SqliteDatabaseConfig {
+        max_read_connections: 10,
+        idle_timeout: Duration::from_secs(60),
+    };
+
+    // Pass custom configuration to connect()
+    let db = SqliteDatabase::connect("example.db", Some(custom_config)).await?;
+
+    // Use the database as normal...
+    db.close().await?;
+    Ok(())
+}
+```
+
 ## API Overview
 
 ### `SqliteDatabase`
 
-   * `connect(path)` - Connect to a database (creates if missing, returns cached
-     `Arc<SqliteDatabase>` if already open)
+   * `connect(path, custom_config)` - Connect to a database (creates if missing,
+     returns cached `Arc<SqliteDatabase>` if already open). Pass `None` for
+     `custom_config` to use defaults (recommended for most use cases), or
+     `Some(SqliteDatabaseConfig)` when you need to customize the configuration
    * `read_pool()` - Get reference to the read-only connection pool for read
      operations (returns `Result`)
    * `acquire_writer()` - Acquire exclusive write access (returns
@@ -84,6 +112,15 @@ async fn main() -> Result<(), sqlx_sqlite_conn_mgr::Error> {
      close return `DatabaseClosed` error)
    * `close_and_remove()` - Close and delete all database files (.db, .db-wal,
      .db-shm)
+
+### `SqliteDatabaseConfig`
+
+Configuration for connection pool behavior:
+
+   * `max_read_connections: u32` - Maximum number of concurrent read connections
+     (default: 6)
+   * `idle_timeout: Duration` - How long idle connections remain open before
+     being closed (default: 30 seconds)
 
 ### `WriteGuard`
 
@@ -111,12 +148,11 @@ queries.
    is released via `WriteGuard` drop.
 
 5. **Connection Management**:
-   * Read pool: 6 concurrent connections by default, 0 cached
-      * Can be configured via `SqliteDatabaseConfig`
-   * Write pool: max 1 connection, 0 cached
-   * Idle timeout: 30 seconds for both pools
-      * Can be configured via `SqliteDatabaseConfig`
-   * No perpetual caching to minimize idle thread overhead
+   * Read pool: 6 concurrent connections by default (configurable via `custom_config`)
+   * Write pool: max 1 connection
+   * Minimum connections: 0 (no perpetual caching)
+   * Idle timeout: 30 seconds by default (configurable via `custom_config`)
+   * Only customize `SqliteDatabaseConfig` when defaults don't meet your needs
 
 ## Error Handling
 
