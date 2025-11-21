@@ -10,12 +10,13 @@ use sqlx::{ConnectOptions, Pool, Sqlite};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::error;
 
 /// SQLite database with connection pooling for concurrent reads and optional exclusive writes.
 ///
-/// The database is opened in read-write mode but can be used for read-only operations
-/// by calling `read_pool()`. Write operations are available by calling `acquire_writer()`
-/// which lazily initializes WAL mode on first use.
+/// Once the database is opened it can be used for read-only operations by calling `read_pool()`.
+/// Write operations are available by calling `acquire_writer()` which lazily initializes WAL mode
+/// on first use.
 ///
 /// # Example
 ///
@@ -66,7 +67,7 @@ impl SqliteDatabase {
    /// If the database is already connected, returns the existing connection.
    /// Multiple calls with the same path will return the same database instance.
    ///
-   /// The database is created if it doesn't exist. WAL mode is optionally enabled when
+   /// The database is created if it doesn't exist. WAL mode is enabled when
    /// `acquire_writer()` is first called.
    ///
    /// # Arguments
@@ -131,7 +132,8 @@ impl SqliteDatabase {
          // Why do we need to manually create the database file? We could just let the connection
          // create it if it doesn't exist, using `create_if_missing(true)`, right? Not if we called
          // connect and then our very first query was a read-only query, like `PRAGMA user_version;`,
-         // for example. That would fail because the read pool cannot create the file
+         // for example. That would fail because the read pool connections are read-only and cannot
+         // create the file
          if !db_exists && !is_memory_database(&path) {
             let create_options = SqliteConnectOptions::new()
                .filename(&path)
@@ -174,7 +176,7 @@ impl SqliteDatabase {
       .await
    }
 
-   /// Get a reference to the connection pool for executing SELECT queries
+   /// Get a reference to the connection pool for executing read queries
    ///
    /// Use this for concurrent read operations. Multiple readers can access
    /// the pool simultaneously.
@@ -240,6 +242,11 @@ impl SqliteDatabase {
             .execute(&mut *conn)
             .await?;
 
+         // https://www.sqlite.org/wal.html#performance_considerations
+         sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&mut *conn)
+            .await?;
+
          self.wal_initialized.store(true, Ordering::SeqCst);
       }
 
@@ -273,11 +280,7 @@ impl SqliteDatabase {
 
       // Remove from registry
       if let Err(e) = uncache_database(&self.path).await {
-         // TODO: Investigate use of "tracing" crate to log this error
-         #[cfg(debug_assertions)]
-         eprintln!("Failed to remove database from cache: {}", e);
-         #[cfg(not(debug_assertions))]
-         let _ = e; // Suppress unused variable warning
+         error!("Failed to remove database from cache: {}", e);
       }
 
       // This will await all readers to be returned
@@ -370,6 +373,7 @@ mod tests {
                .fetch_one(db.read_pool().unwrap())
                .await
                .unwrap();
+
             assert_eq!(count, 12);
          }));
       }
@@ -564,6 +568,17 @@ mod tests {
          "Journal mode should be WAL after first acquire_writer"
       );
 
+      // Check sync setting
+      let (sync,): (i32,) = sqlx::query_as("PRAGMA synchronous")
+         .fetch_one(&mut *writer)
+         .await
+         .unwrap();
+
+      assert_eq!(
+         sync, 1,
+         "Sync mode should be NORMAL after first acquire_writer"
+      );
+
       drop(writer);
 
       db.remove().await.unwrap();
@@ -676,6 +691,7 @@ mod tests {
                .fetch_all(db_clone.read_pool().unwrap())
                .await
                .unwrap();
+
             assert!(rows.len() > 0);
          }));
       }
@@ -703,6 +719,7 @@ mod tests {
          .fetch_one(db.read_pool().unwrap())
          .await
          .unwrap();
+
       assert_eq!(count.0, 2);
 
       db.remove().await.unwrap();

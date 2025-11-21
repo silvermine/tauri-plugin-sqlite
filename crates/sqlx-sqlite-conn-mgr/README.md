@@ -154,6 +154,14 @@ queries.
    * Idle timeout: 30 seconds by default (configurable via `custom_config`)
    * Only customize `SqliteDatabaseConfig` when defaults don't meet your needs
 
+## Tracing and Logging
+
+This crate uses the [`tracing`](https://crates.io/crates/tracing) ecosystem for internal
+instrumentation. It is built with the `release_max_level_off` feature so that all
+`tracing` log statements are compiled out of release builds. To see its logs during
+development, the host application must install a `tracing-subscriber` and enable the
+desired log level; no extra configuration is required in this crate.
+
 ## Error Handling
 
 ```rust

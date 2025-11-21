@@ -56,7 +56,7 @@
 //! - Uses sqlx's `SqlitePoolOptions` for all pool configuration
 //! - Uses sqlx's `SqliteConnectOptions` for connection flags and configuration
 //! - Minimal custom logic - delegates to sqlx wherever possible
-//! - Global registry caches new database instances (with their pools) and returns existing ones
+//! - Global registry caches new database instances and returns existing ones
 //! - WAL mode is enabled lazily only when writes are needed
 //!
 mod config;

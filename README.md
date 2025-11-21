@@ -81,7 +81,7 @@ Run Rust tests:
 cargo test
 ```
 
-### Linting and standards checks
+### Linting and Standards Checks
 
 ```bash
 npm run standards
@@ -108,6 +108,51 @@ fn main() {
         .expect("error while running tauri application");
 }
 ```
+
+### Tracing and Logging
+
+This plugin and its connection manager crate use the
+[`tracing`](https://crates.io/crates/tracing) ecosystem for internal logging. They are
+configured with the `release_max_level_off` feature so that **all log statements are
+compiled out of release builds**. This guarantees that logging from this plugin will never
+reach production binaries unless you explicitly change that configuration.
+
+To see logs during development, initialize a `tracing-subscriber` in your Tauri
+application crate and keep it behind a `debug_assertions` guard, for example:
+
+```toml
+[dependencies]
+tracing = { version = "0.1.41", default-features = false, features = ["std", "release_max_level_off"] }
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
+```
+
+```rust
+#[cfg(debug_assertions)]
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("trace"));
+
+    fmt().with_env_filter(filter).compact().init();
+}
+
+#[cfg(not(debug_assertions))]
+fn init_tracing() {}
+
+fn main() {
+    init_tracing();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_sqlite::init())
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+```
+
+With this setup, `tauri dev` shows all plugin and app logs, while `tauri build` produces
+a release binary that contains no logging from this plugin or your app-level `tracing`
+calls.
 
 ### JavaScript/TypeScript API
 
