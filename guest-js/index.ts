@@ -12,10 +12,17 @@ import { invoke } from '@tauri-apps/api/core'
  */
 export type SqlValue = string | number | boolean | null | Uint8Array
 
-export interface QueryResult {
-   /** The number of rows affected by the query. */
+/**
+ * Result returned from write operations (INSERT, UPDATE, DELETE, etc.).
+ */
+export interface WriteQueryResult {
+   /** The number of rows affected by the write operation. */
    rowsAffected: number
-   /** The last inserted row ID (SQLite ROWID). */
+   /**
+    * The last inserted row ID (SQLite ROWID).
+    * Only set for INSERT operations on tables with a ROWID.
+    * Tables created with WITHOUT ROWID will not set this value (returns 0).
+    */
    lastInsertId: number
 }
 
@@ -107,11 +114,9 @@ export default class Database {
     * **execute**
     *
     * Executes a write query against the database (INSERT, UPDATE, DELETE, etc.).
-    * This method is specifically for mutations that modify data.
+    * This method is for mutations that modify data.
     *
-    * **Important:** Do NOT use this for SELECT queries. Use `fetchX()` instead.
-    * Using `execute()` for read queries will trigger an error to prevent unnecessary
-    * write mode initialization.
+    * For SELECT queries, use `fetchAll()` or `fetchOne()` instead.
     *
     * SQLite uses `$1`, `$2`, etc. for parameter binding.
     *
@@ -132,7 +137,7 @@ export default class Database {
     * );
     * ```
     */
-   async execute(query: string, bindValues?: SqlValue[]): Promise<QueryResult> {
+   async execute(query: string, bindValues?: SqlValue[]): Promise<WriteQueryResult> {
       const [rowsAffected, lastInsertId] = await invoke<[number, number]>(
          'plugin:sqlite|execute',
          {
@@ -145,6 +150,50 @@ export default class Database {
          lastInsertId,
          rowsAffected
       }
+   }
+
+   /**
+    * **executeTransaction**
+    *
+    * Executes multiple write statements atomically within a transaction.
+    * All statements either succeed together or fail together.
+    *
+    * The function automatically:
+    * - Begins a transaction (BEGIN)
+    * - Executes all statements in order
+    * - Commits on success (COMMIT)
+    * - Rolls back on any error (ROLLBACK)
+    *
+    * @param statements - Array of [query, values?] tuples to execute
+    * @returns Promise that resolves with results for each statement when all complete successfully
+    * @throws SqliteError if any statement fails (after rollback)
+    *
+    * @example
+    * ```ts
+    * // Execute multiple inserts atomically
+    * const results = await db.executeTransaction([
+    *    ['INSERT INTO users (name, email) VALUES ($1, $2)', ['Alice', 'alice@example.com']],
+    *    ['INSERT INTO audit_log (action, user) VALUES ($1, $2)', ['user_created', 'Alice']]
+    * ]);
+    * console.log(`User ID: ${results[0].lastInsertId}`);
+    * console.log(`Log rows affected: ${results[1].rowsAffected}`);
+    *
+    * // Mixed operations
+    * const results = await db.executeTransaction([
+    *    ['UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, 1]],
+    *    ['UPDATE accounts SET balance = balance + $1 WHERE id = $2', [100, 2]],
+    *    ['INSERT INTO transfers (from_id, to_id, amount) VALUES ($1, $2, $3)', [1, 2, 100]]
+    * ]);
+    * ```
+    */
+   async executeTransaction(statements: Array<[string, SqlValue[]?]>): Promise<WriteQueryResult[]> {
+      return await invoke<WriteQueryResult[]>('plugin:sqlite|execute_transaction', {
+         db: this.path,
+         statements: statements.map(([query, values]) => ({
+            query,
+            values: values ?? []
+         }))
+      })
    }
 
    /**
@@ -209,78 +258,6 @@ export default class Database {
       })
 
       return result
-   }
-
-   /**
-    * **beginTransaction**
-    *
-    * Begins a new database transaction. All subsequent operations will be
-    * part of this transaction until `commitTransaction()` or `rollbackTransaction()`
-    * is called.
-    *
-    * Transactions provide atomicity - either all operations succeed or all are rolled back.
-    *
-    * @example
-    * ```ts
-    * await db.beginTransaction();
-    * try {
-    *    await db.execute('INSERT INTO users (name) VALUES ($1)', ['Alice']);
-    *    await db.execute('INSERT INTO logs (action) VALUES ($1)', ['user_created']);
-    *    await db.commitTransaction();
-    * } catch (error) {
-    *    await db.rollbackTransaction();
-    *    throw error;
-    * }
-    * ```
-    */
-   async beginTransaction(): Promise<void> {
-      await invoke('plugin:sqlite|begin_transaction', {
-         db: this.path
-      })
-   }
-
-   /**
-    * **commitTransaction**
-    *
-    * Commits the current transaction, making all changes permanent.
-    *
-    * @example
-    * ```ts
-    * await db.beginTransaction();
-    * await db.execute('INSERT INTO users (name) VALUES ($1)', ['Alice']);
-    * await db.execute('INSERT INTO logs (action) VALUES ($1)', ['user_created']);
-    * await db.commitTransaction();
-    * ```
-    */
-   async commitTransaction(): Promise<void> {
-      await invoke('plugin:sqlite|commit_transaction', {
-         db: this.path
-      })
-   }
-
-   /**
-    * **rollbackTransaction**
-    *
-    * Rolls back the current transaction, discarding all changes made since
-    * `beginTransaction()` was called.
-    *
-    * @example
-    * ```ts
-    * await db.beginTransaction();
-    * try {
-    *    await db.execute('INSERT INTO users (name) VALUES ($1)', ['Alice']);
-    *    await db.execute('INSERT INTO logs (action) VALUES ($1)', ['user_created']);
-    *    await db.commitTransaction();
-    * } catch (error) {
-    *    await db.rollbackTransaction();
-    *    throw error;
-    * }
-    * ```
-    */
-   async rollbackTransaction(): Promise<void> {
-      await invoke('plugin:sqlite|rollback_transaction', {
-         db: this.path
-      })
    }
 
    /**

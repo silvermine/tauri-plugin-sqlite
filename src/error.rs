@@ -41,10 +41,6 @@ pub enum Error {
    #[error("io error: {0}")]
    Io(#[from] std::io::Error),
 
-   /// Read-only query executed with execute command.
-   #[error("execute() should not be used for read-only queries. Use fetchX() instead.")]
-   ReadOnlyQueryInExecute,
-
    /// Multiple rows returned from fetchOne query.
    #[error("fetchOne() query returned {0} rows, expected 0 or 1")]
    MultipleRowsReturned(usize),
@@ -69,7 +65,6 @@ impl Error {
          Error::DatabaseNotLoaded(_) => "DATABASE_NOT_LOADED".to_string(),
          Error::UnsupportedDatatype(_) => "UNSUPPORTED_DATATYPE".to_string(),
          Error::Io(_) => "IO_ERROR".to_string(),
-         Error::ReadOnlyQueryInExecute => "READ_ONLY_QUERY_IN_EXECUTE".to_string(),
          Error::MultipleRowsReturned(_) => "MULTIPLE_ROWS_RETURNED".to_string(),
       }
    }
@@ -85,5 +80,85 @@ impl Serialize for Error {
          message: self.to_string(),
       };
       response.serialize(serializer)
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn test_error_code_database_not_loaded() {
+      let err = Error::DatabaseNotLoaded("test.db".into());
+      assert_eq!(err.error_code(), "DATABASE_NOT_LOADED");
+   }
+
+   #[test]
+   fn test_error_code_invalid_path() {
+      let err = Error::InvalidPath("/bad/path".into());
+      assert_eq!(err.error_code(), "INVALID_PATH");
+   }
+
+   #[test]
+   fn test_error_code_unsupported_datatype() {
+      let err = Error::UnsupportedDatatype("WEIRD_TYPE".into());
+      assert_eq!(err.error_code(), "UNSUPPORTED_DATATYPE");
+   }
+
+   #[test]
+   fn test_error_code_multiple_rows() {
+      let err = Error::MultipleRowsReturned(5);
+      assert_eq!(err.error_code(), "MULTIPLE_ROWS_RETURNED");
+   }
+
+   #[test]
+   fn test_error_serialization_structure() {
+      let err = Error::DatabaseNotLoaded("mydb.db".into());
+      let json = serde_json::to_value(&err).unwrap();
+
+      // Verify structure has both code and message fields
+      assert!(json.is_object());
+      assert!(json.get("code").is_some());
+      assert!(json.get("message").is_some());
+   }
+
+   #[test]
+   fn test_error_serialization_database_not_loaded() {
+      let err = Error::DatabaseNotLoaded("mydb.db".into());
+      let json = serde_json::to_value(&err).unwrap();
+
+      assert_eq!(json["code"], "DATABASE_NOT_LOADED");
+      assert!(json["message"].as_str().unwrap().contains("mydb.db"));
+      assert!(json["message"].as_str().unwrap().contains("not loaded"));
+   }
+
+   #[test]
+   fn test_error_serialization_invalid_path() {
+      let err = Error::InvalidPath("/bad/path".into());
+      let json = serde_json::to_value(&err).unwrap();
+
+      assert_eq!(json["code"], "INVALID_PATH");
+      assert!(json["message"].as_str().unwrap().contains("/bad/path"));
+   }
+
+   #[test]
+   fn test_error_serialization_multiple_rows() {
+      let err = Error::MultipleRowsReturned(3);
+      let json = serde_json::to_value(&err).unwrap();
+
+      assert_eq!(json["code"], "MULTIPLE_ROWS_RETURNED");
+      let message = json["message"].as_str().unwrap();
+      assert!(message.contains("3 rows"));
+      assert!(message.contains("0 or 1"));
+   }
+
+   #[test]
+   fn test_error_message_format() {
+      // Verify error messages are descriptive
+      let err = Error::MultipleRowsReturned(5);
+      let message = err.to_string();
+      assert!(message.contains("fetchOne()"));
+      assert!(message.contains("5 rows"));
+      assert!(message.contains("expected 0 or 1"));
    }
 }
