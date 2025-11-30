@@ -265,7 +265,6 @@ Common error codes include:
    * `INVALID_PATH` - Invalid database path
    * `IO_ERROR` - File system error
    * `MIGRATION_ERROR` - Migration failed
-   * `READ_ONLY_QUERY_IN_EXECUTE` - Attempted to use execute() for a read-only query
    * `MULTIPLE_ROWS_RETURNED` - `fetchOne()` query returned multiple rows
 
 ### Executing SELECT Queries
@@ -304,45 +303,35 @@ if (user) {
 
 ### Using Transactions
 
-Transactions ensure that multiple operations either all succeed or all fail together,
-maintaining data consistency:
+Execute multiple database operations atomically using `executeTransaction()`. All
+statements either succeed together or fail together, maintaining data consistency:
 
 ```typescript
-// Begin a transaction
-await db.beginTransaction();
+// Execute multiple inserts atomically
+const results = await db.executeTransaction([
+   ['INSERT INTO users (name, email) VALUES ($1, $2)', ['Alice', 'alice@example.com']],
+   ['INSERT INTO audit_log (action, user) VALUES ($1, $2)', ['user_created', 'Alice']]
+]);
+console.log(`User ID: ${results[0].lastInsertId}`);
+console.log(`Log rows affected: ${results[1].rowsAffected}`);
 
-try {
-   // Execute multiple operations atomically
-   await db.execute(
-      'INSERT INTO users (name, email) VALUES ($1, $2)',
-      ['Alice', 'alice@example.com']
-   );
-
-   await db.execute(
-      'INSERT INTO audit_log (action, user) VALUES ($1, $2)',
-      ['user_created', 'Alice']
-   );
-
-   // Commit if all operations succeed
-   await db.commitTransaction();
-   console.log('Transaction completed successfully');
-
-} catch (error) {
-   // Rollback if any operation fails
-   await db.rollbackTransaction();
-   console.error('Transaction failed, rolled back:', error);
-   throw error;
-}
+// Bank transfer example - all operations succeed or all fail
+const results = await db.executeTransaction([
+   ['UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, 1]],
+   ['UPDATE accounts SET balance = balance + $1 WHERE id = $2', [100, 2]],
+   ['INSERT INTO transfers (from_id, to_id, amount) VALUES ($1, $2, $3)', [1, 2, 100]]
+]);
+console.log(`Transfer ID: ${results[2].lastInsertId}`);
 ```
 
-**Important Notes:**
+**How it works:**
 
-   * All operations between `beginTransaction()` and
-     `commitTransaction()`/`rollbackTransaction()` are executed as a single atomic unit
-   * If an error occurs, call `rollbackTransaction()` to discard all changes
-   * Nested transactions are not supported
-   * Always ensure transactions are either committed or rolled back to avoid locking
-     issues
+   * Automatically executes `BEGIN` before running statements
+   * Executes all statements in order
+   * Commits with `COMMIT` if all statements succeed
+   * Rolls back with `ROLLBACK` if any statement fails
+   * The write connection is held for the entire transaction, ensuring atomicity
+   * Errors are thrown after rollback, preserving the original error message
 
 ### Closing Connections
 
@@ -465,8 +454,8 @@ const filtered = await db.fetchAll<User[]>(
 )
 ```
 
-> **Important:** Do NOT use `execute()` for read-only queries. It will return
-> an error. Always use `fetchAll()` or `fetchOne()` for reads.
+> **Note:** Use `execute()` and `executeTransaction()` for write operations.
+> For SELECT queries, use `fetchAll()` or `fetchOne()`.
 
 ## Configuration
 
@@ -541,7 +530,7 @@ await Database.closeAll()
 
 #### Instance Methods
 
-##### `execute(query: string, bindValues?: unknown[]): Promise<QueryResult>`
+##### `execute(query: string, bindValues?: unknown[]): Promise<WriteQueryResult>`
 
 Execute a write query (INSERT, UPDATE, DELETE, CREATE, etc.).
 
@@ -602,9 +591,9 @@ await db.remove()
 ### TypeScript Interfaces
 
 ```typescript
-interface QueryResult {
+interface WriteQueryResult {
    rowsAffected: number  // Number of rows modified
-   lastInsertId: number  // ROWID of last inserted row
+   lastInsertId: number  // ROWID of last inserted row (not set for WITHOUT ROWID tables, returns 0)
 }
 
 interface CustomConfig {
