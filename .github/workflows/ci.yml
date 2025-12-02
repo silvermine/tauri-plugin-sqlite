@@ -59,5 +59,8 @@ jobs:
          - name: Run cargo check
            run: cargo check --workspace --all-targets
 
-         - name: Run cargo tests
+         - name: Run Rust tests
            run: cargo test --workspace
+
+         - name: Run TypeScript tests
+           run: npm test

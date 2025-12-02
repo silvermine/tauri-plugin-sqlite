@@ -33,3 +33,7 @@ sqlx-sqlite-conn-mgr = { path = "crates/sqlx-sqlite-conn-mgr" }
 
 [build-dependencies]
 tauri-plugin = { version = "2.5.1", features = ["build"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
