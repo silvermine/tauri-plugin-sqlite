@@ -12,6 +12,20 @@ license = "MIT"
 edition = "2024"
 rust-version = "1.89"
 links = "tauri-plugin-sqlite"
+repository = "https://github.com/silvermine/tauri-plugin-sqlite"
+homepage = "https://github.com/silvermine/tauri-plugin-sqlite"
+documentation = "https://docs.rs/tauri-plugin-sqlite"
+keywords = ["tauri", "plugin", "sqlite", "database"]
+categories = ["database", "gui"]
+readme = "README.md"
+include = [
+   "/src",
+   "/permissions",
+   "/build.rs",
+   "/Cargo.toml",
+   "/LICENSE",
+   "/README.md"
+]
 
 [dependencies]
 tauri = "2.9.3"
