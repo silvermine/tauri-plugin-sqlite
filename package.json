@@ -34,6 +34,17 @@
       "type": "git",
       "url": "https://github.com/silvermine/tauri-plugin-sqlite.git"
    },
+   "keywords": [
+      "tauri",
+      "plugin",
+      "sqlite",
+      "database",
+      "tauri-plugin"
+   ],
+   "homepage": "https://github.com/silvermine/tauri-plugin-sqlite#readme",
+   "bugs": {
+      "url": "https://github.com/silvermine/tauri-plugin-sqlite/issues"
+   },
    "devDependencies": {
       "@rollup/plugin-node-resolve": "16.0.3",
       "@rollup/plugin-terser": "0.4.4",
