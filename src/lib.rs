@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use tauri::{Manager, Runtime, plugin::Builder as PluginBuilder};
+use tauri::{Manager, RunEvent, Runtime, plugin::Builder as PluginBuilder};
 use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 mod commands;
 mod decode;
@@ -57,9 +58,54 @@ impl Builder {
          ])
          .setup(|app, _api| {
             app.manage(DbInstances::default());
+            debug!("SQLite plugin initialized");
             // Future PR: Possibly handle migrations here
-            // Future PR: Cleanup on app exit
             Ok(())
+         })
+         .on_event(|app, event| {
+            match event {
+               RunEvent::ExitRequested { api, code, .. } => {
+                  info!("App exit requested (code: {:?}) - closing databases before exit", code);
+
+                  // Prevent immediate exit so we can close connections and checkpoint WAL
+                  api.prevent_exit();
+
+                  let instances = app.state::<DbInstances>();
+                  let app_handle = app.clone();
+
+                  tokio::task::block_in_place(|| {
+                     tokio::runtime::Handle::current().block_on(async {
+                        let mut instances = instances.0.write().await;
+                        let wrappers: Vec<DatabaseWrapper> = instances.drain().map(|(_, v)| v).collect();
+
+                        for wrapper in wrappers {
+                           if let Err(e) = wrapper.close().await {
+                              warn!("Error closing database during exit: {:?}", e);
+                           }
+                        }
+
+                        debug!("All databases closed, calling exit()...");
+                     })
+                  });
+
+                  app_handle.exit(code.unwrap_or(0));
+               }
+               RunEvent::Exit => {
+                  // ExitRequested should have already closed all databases
+                  // This is just a safety check
+                  let instances = app.state::<DbInstances>();
+                  if let Ok(instances) = instances.0.try_read() {
+                     if !instances.is_empty() {
+                        warn!("Exit event fired with {} database(s) still open - cleanup may have been skipped", instances.len());
+                     } else {
+                        debug!("Exit event: all databases already closed");
+                     }
+                  }
+               }
+               _ => {
+                  // Other events don't require action
+               }
+            }
          })
          .build()
    }

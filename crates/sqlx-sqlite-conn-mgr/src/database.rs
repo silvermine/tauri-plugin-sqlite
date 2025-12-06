@@ -144,8 +144,16 @@ impl SqliteDatabase {
             drop(conn); // Close immediately after creating the file
          }
 
+         // Enable PRAGMA optimize on close as recommended by SQLite for long-lived databases.
+         // SQLite recommends analysis_limit values between 100-1000 for older versions;
+         // SQLite 3.46.0+ handles limits automatically.
+         // https://www.sqlite.org/lang_analyze.html#recommended_usage_pattern
+         //
          // Create read pool with read-only connections
-         let read_options = SqliteConnectOptions::new().filename(&path).read_only(true);
+         let read_options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .optimize_on_close(true, 400);
 
          let read_pool = SqlitePoolOptions::new()
             .max_connections(config.max_read_connections)
@@ -157,7 +165,10 @@ impl SqliteDatabase {
             .await?;
 
          // Create write pool with a single read-write connection
-         let write_options = SqliteConnectOptions::new().filename(&path).read_only(false);
+         let write_options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(false)
+            .optimize_on_close(true, 400);
 
          let write_conn = SqlitePoolOptions::new()
             .max_connections(1)

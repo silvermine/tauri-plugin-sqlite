@@ -4,7 +4,7 @@
 
 SQLite database interface for Tauri applications using
 [sqlx](https://github.com/launchbadge/sqlx) and
-[sqlx-sqlite-conn-mgr](https://github.com/silvermine/sqlx-sqlite-conn-mgr).
+[sqlx-sqlite-conn-mgr](crates/sqlx-sqlite-conn-mgr/README.md).
 
 This plugin provides a SQLite-focused database interface with optimized connection
 pooling, write serialization, and proper resource management.
