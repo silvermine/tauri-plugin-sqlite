@@ -49,6 +49,44 @@ export interface CustomConfig {
 }
 
 /**
+ * Event payload emitted during database migration operations.
+ *
+ * Listen for these events to track migration progress:
+ *
+ * @example
+ * ```ts
+ * import { listen } from '@tauri-apps/api/event'
+ * import type { MigrationEvent } from '@silvermine/tauri-plugin-sqlite'
+ *
+ * await listen<MigrationEvent>('sqlite:migration', (event) => {
+ *    const { dbPath, status, migrationCount, error } = event.payload
+ *
+ *    switch (status) {
+ *       case 'running':
+ *          console.log(`Running migrations for ${dbPath}`)
+ *          break
+ *       case 'completed':
+ *          console.log(`Completed ${migrationCount} migrations for ${dbPath}`)
+ *          break
+ *       case 'failed':
+ *          console.error(`Migration failed for ${dbPath}: ${error}`)
+ *          break
+ *    }
+ * })
+ * ```
+ */
+export interface MigrationEvent {
+   /** Database path (relative, as registered with the plugin) */
+   dbPath: string
+   /** Status: "running", "completed", "failed" */
+   status: 'running' | 'completed' | 'failed'
+   /** Total number of migrations in the migrator (on "completed"), not just newly applied */
+   migrationCount?: number
+   /** Error message (on "failed") */
+   error?: string
+}
+
+/**
  * **Database**
  *
  * The `Database` class serves as the primary interface for
@@ -325,5 +363,36 @@ export default class Database {
          db: this.path
       })
       return success
+   }
+
+   /**
+    * **getMigrationEvents**
+    *
+    * Retrieves all cached migration events for this database.
+    *
+    * This method solves the race condition where migrations complete before the
+    * frontend can register an event listener. Events are cached on the backend
+    * and can be retrieved at any time.
+    *
+    * @returns Array of all migration events that have occurred for this database
+    *
+    * @example
+    * ```ts
+    * const db = await Database.load('mydb.db')
+    *
+    * // Get all migration events (including ones that happened before we could listen)
+    * const events = await db.getMigrationEvents()
+    * for (const event of events) {
+    *    console.log(`${event.status}: ${event.dbPath}`)
+    *    if (event.status === 'failed') {
+    *       console.error(`Migration error: ${event.error}`)
+    *    }
+    * }
+    * ```
+    */
+   async getMigrationEvents(): Promise<MigrationEvent[]> {
+      return await invoke<MigrationEvent[]>('plugin:sqlite|get_migration_events', {
+         db: this.path
+      })
    }
 }

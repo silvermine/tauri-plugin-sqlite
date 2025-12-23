@@ -66,6 +66,32 @@ let config = SqliteDatabaseConfig {
 let db = SqliteDatabase::connect("example.db", Some(config)).await?;
 ```
 
+### Migrations
+
+Run [SQLx migrations][sqlx-migrate] directly:
+
+[sqlx-migrate]: https://docs.rs/sqlx/latest/sqlx/macro.migrate.html
+
+```rust
+use sqlx_sqlite_conn_mgr::SqliteDatabase;
+
+// Embed migrations at compile time (reads ./migrations/*.sql)
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+async fn run() -> Result<(), sqlx_sqlite_conn_mgr::Error> {
+    let db = SqliteDatabase::connect("example.db", None).await?;
+    db.run_migrations(&MIGRATOR).await?;
+    Ok(())
+}
+```
+
+Migrations are tracked in `_sqlx_migrations` — calling `run_migrations()` multiple
+times is safe (already-applied migrations are skipped).
+
+> **Note:** When using the Tauri plugin, migrations are handled automatically via
+> `Builder::add_migrations()`. The plugin starts migrations at setup and waits for
+> completion when `load()` is called.
+
 ## API Reference
 
 ### `SqliteDatabase`
@@ -75,8 +101,9 @@ let db = SqliteDatabase::connect("example.db", Some(config)).await?;
 | `connect(path, config)` | Connect/create database, returns cached `Arc` if already open |
 | `read_pool()` | Get read-only pool reference |
 | `acquire_writer()` | Acquire exclusive `WriteGuard` (enables WAL on first call) |
+| `run_migrations(migrator)` | Run pending migrations from a `Migrator` |
 | `close()` | Close and remove from cache |
-| `close_and_remove()` | Close and delete database files (.db, .db-wal, .db-shm) |
+| `remove()` | Close and delete database files (.db, .db-wal, .db-shm) |
 
 ### `WriteGuard`
 

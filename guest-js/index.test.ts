@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks'
-import Database from './index'
+import Database, { MigrationEvent } from './index'
 
 let lastCmd = ''
 let lastArgs: Record<string, unknown> = {}
@@ -74,10 +74,60 @@ describe('Database commands', () => {
       expect(lastArgs.db).toBe('t.db')
    })
 
+   it('getMigrationEvents', async () => {
+      const mockEvents: MigrationEvent[] = [
+         { dbPath: 't.db', status: 'running' },
+         { dbPath: 't.db', status: 'completed', migrationCount: 5 }
+      ]
+      mockIPC((cmd, args) => {
+         lastCmd = cmd
+         lastArgs = args as Record<string, unknown>
+         if (cmd === 'plugin:sqlite|get_migration_events') return mockEvents
+         return undefined
+      })
+
+      const events = await Database.get('t.db').getMigrationEvents()
+      expect(lastCmd).toBe('plugin:sqlite|get_migration_events')
+      expect(lastArgs.db).toBe('t.db')
+      expect(events).toEqual(mockEvents)
+   })
+
    it('handles errors from backend', async () => {
       mockIPC(() => {
          throw new Error('Database error')
       })
       await expect(Database.get('t.db').execute('SELECT 1', [])).rejects.toThrow('Database error')
+   })
+})
+
+describe('MigrationEvent type', () => {
+   it('accepts running status', () => {
+      const event: MigrationEvent = {
+         dbPath: 'test.db',
+         status: 'running',
+      }
+      expect(event.status).toBe('running')
+      expect(event.migrationCount).toBeUndefined()
+      expect(event.error).toBeUndefined()
+   })
+
+   it('accepts completed status with migrationCount', () => {
+      const event: MigrationEvent = {
+         dbPath: 'test.db',
+         status: 'completed',
+         migrationCount: 3,
+      }
+      expect(event.status).toBe('completed')
+      expect(event.migrationCount).toBe(3)
+   })
+
+   it('accepts failed status with error', () => {
+      const event: MigrationEvent = {
+         dbPath: 'test.db',
+         status: 'failed',
+         error: 'Migration failed: syntax error',
+      }
+      expect(event.status).toBe('failed')
+      expect(event.error).toBe('Migration failed: syntax error')
    })
 })

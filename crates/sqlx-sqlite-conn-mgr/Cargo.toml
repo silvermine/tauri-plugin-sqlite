@@ -7,8 +7,11 @@ edition = "2024"
 rust-version = "1.89"
 
 [dependencies]
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "migrate"] }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
 tracing = { version = "0.1.41", default-features = false, features = ["std", "release_max_level_off"] }
 serde = { version = "1.0.228", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"

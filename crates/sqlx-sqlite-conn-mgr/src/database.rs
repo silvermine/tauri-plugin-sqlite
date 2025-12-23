@@ -268,6 +268,44 @@ impl SqliteDatabase {
       Ok(WriteGuard::new(conn))
    }
 
+   /// Run database migrations using the provided migrator
+   ///
+   /// This method runs all pending migrations from the provided `Migrator`.
+   /// Migrations are executed using the write connection to ensure exclusive access.
+   /// WAL mode is enabled automatically before running migrations.
+   ///
+   /// SQLx tracks applied migrations in a `_sqlx_migrations` table, so calling
+   /// this method multiple times is safe - already-applied migrations are skipped.
+   ///
+   /// # Arguments
+   ///
+   /// * `migrator` - A reference to a `Migrator` containing the migrations to run.
+   ///   Typically created using `sqlx::migrate!()` macro.
+   ///
+   /// # Example
+   ///
+   /// ```ignore
+   /// use sqlx_sqlite_conn_mgr::SqliteDatabase;
+   ///
+   /// // sqlx::migrate! is evaluated at compile time
+   /// static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+   ///
+   /// let db = SqliteDatabase::connect("test.db", None).await?;
+   /// db.run_migrations(&MIGRATOR).await?;
+   /// ```
+   pub async fn run_migrations(&self, migrator: &sqlx::migrate::Migrator) -> Result<()> {
+      // Ensure WAL mode is initialized via acquire_writer
+      // (WriteGuard dropped immediately, returning connection to pool)
+      {
+         let _writer = self.acquire_writer().await?;
+      }
+
+      // Migrator acquires its own connection from the write pool
+      migrator.run(&self.write_conn).await?;
+
+      Ok(())
+   }
+
    /// Close the database and clean up resources
    ///
    /// This closes all connections in the pool and removes the database from the cache.

@@ -19,8 +19,8 @@ SQLite database interface for Tauri applications using
      > "_SQLite ... will only allow one writer at any instant in time._"
    * **WAL Mode**: Enabled automatically on first write operation
    * **Type Safety**: Full TypeScript bindings
-   * **Migration Support**: SQLx's migration framework (coming soon)
-   * **Resource Management**: Proper cleanup on application exit (coming soon)
+   * **Migration Support**: SQLx's migration framework
+   * **Resource Management**: Proper cleanup on application exit
 
 ## Architecture
 
@@ -94,6 +94,74 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+```
+
+### Migrations
+
+This plugin uses [SQLx's migration system][sqlx-migrate]. Create numbered `.sql`
+files in a migrations directory:
+
+[sqlx-migrate]: https://docs.rs/sqlx/latest/sqlx/macro.migrate.html
+
+```text
+src-tauri/migrations/
+├── 0001_create_users.sql
+├── 0002_add_email_column.sql
+└── 0003_create_posts.sql
+```
+
+Register migrations using SQLx's `migrate!()` macro, which embeds them at compile time:
+
+```rust
+use tauri_plugin_sqlite::Builder;
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(
+            Builder::new()
+                .add_migrations("main.db", sqlx::migrate!("./migrations"))
+                .build()
+        )
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+```
+
+**Timing:** Migrations start automatically at plugin setup (non-blocking). When
+TypeScript calls `Database.load()`, it waits for migrations to complete before
+returning. If migrations fail, `load()` returns an error. Applied migrations are
+tracked in `_sqlx_migrations` — re-running is safe and idempotent.
+
+#### Retrieving Migration Events
+
+Use `getMigrationEvents()` to retrieve cached events:
+
+```typescript
+import Database from '@silvermine/tauri-plugin-sqlite'
+
+const db = await Database.load('mydb.db')
+
+// Get all migration events (including ones emitted before listener could be registered)
+const events = await db.getMigrationEvents()
+for (const event of events) {
+   console.log(`${event.status}: ${event.dbPath}`)
+   if (event.status === 'failed') {
+      console.error(`Migration error: ${event.error}`)
+   }
+}
+```
+
+**Optional:** Listen for real-time events, globally. May miss early events due the Rust
+layer completing some or all migrations before the frontend subscription initializes.
+
+```typescript
+import { listen } from '@tauri-apps/api/event'
+import type { MigrationEvent } from '@silvermine/tauri-plugin-sqlite'
+
+await listen<MigrationEvent>('sqlite:migration', (event) => {
+   const { dbPath, status, migrationCount, error } = event.payload
+   // status: 'running' | 'completed' | 'failed'
+})
 ```
 
 ### Connecting

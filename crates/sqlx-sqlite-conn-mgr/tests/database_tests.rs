@@ -1,5 +1,7 @@
+use sqlx::migrate::Migrator;
 use sqlx_sqlite_conn_mgr::{Error, SqliteDatabase, SqliteDatabaseConfig};
 use std::sync::Arc;
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn test_concurrent_reads() {
@@ -30,6 +32,7 @@ async fn test_concurrent_reads() {
                .fetch_one(db.read_pool().unwrap())
                .await
                .unwrap();
+
             assert_eq!(count, 12);
 
             active.fetch_sub(1, Ordering::SeqCst);
@@ -292,6 +295,7 @@ async fn test_write_serialization() {
                .execute(&mut *w)
                .await
                .unwrap();
+
             active.fetch_sub(1, Ordering::SeqCst);
          })
       })
@@ -348,6 +352,7 @@ async fn test_concurrent_reads_and_writes() {
             .execute(&mut *w)
             .await
             .unwrap();
+
          write_active.store(false, Ordering::SeqCst);
       })
    };
@@ -366,6 +371,7 @@ async fn test_concurrent_reads_and_writes() {
             .fetch_one(db.read_pool().unwrap())
             .await
             .unwrap();
+
          if write_active.load(Ordering::SeqCst) {
             read_during_write.store(true, Ordering::SeqCst);
          }
@@ -380,6 +386,158 @@ async fn test_concurrent_reads_and_writes() {
       read_during_write.load(Ordering::SeqCst),
       "Read did not overlap with write (WAL mode should allow this)"
    );
+
+   db.remove().await.unwrap();
+}
+
+/// Helper to create a temp directory with migration files.
+/// Returns (TempDir, Migrator) - TempDir must be kept alive for Migrator to work.
+async fn create_migrations(migrations: &[(&str, &str)]) -> (TempDir, Migrator) {
+   let dir = TempDir::new().unwrap();
+
+   for (i, (name, sql)) in migrations.iter().enumerate() {
+      let filename = format!("{:04}_{}.sql", i + 1, name.replace(' ', "_"));
+      std::fs::write(dir.path().join(filename), sql).unwrap();
+   }
+
+   let migrator = Migrator::new(dir.path()).await.unwrap();
+   (dir, migrator)
+}
+
+#[tokio::test]
+async fn test_run_migrations_creates_schema() {
+   let path = std::env::current_dir()
+      .unwrap()
+      .join("test_migrations_multi.db");
+
+   let db = SqliteDatabase::connect(&path, None).await.unwrap();
+
+   let (_dir, migrator) = create_migrations(&[
+      (
+         "create_users",
+         "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+      ),
+      (
+         "create_posts",
+         "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER);",
+      ),
+      (
+         "add_index",
+         "CREATE INDEX idx_posts_user ON posts(user_id);",
+      ),
+   ])
+   .await;
+
+   db.run_migrations(&migrator).await.unwrap();
+
+   // Verify all migrations applied
+   let (count,): (i64,) = sqlx::query_as(
+      "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_sqlx_%'",
+   )
+   .fetch_one(db.read_pool().unwrap())
+   .await
+   .unwrap();
+
+   assert_eq!(count, 3, "should have 2 tables + 1 index");
+
+   db.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_run_migrations_idempotent() {
+   let path = std::env::current_dir()
+      .unwrap()
+      .join("test_migrations_idempotent.db");
+
+   let db = SqliteDatabase::connect(&path, None).await.unwrap();
+
+   let (_dir, migrator) = create_migrations(&[(
+      "create_items",
+      "CREATE TABLE items (id INTEGER PRIMARY KEY);",
+   )])
+   .await;
+
+   // Run twice - second should be no-op
+   db.run_migrations(&migrator).await.unwrap();
+   db.run_migrations(&migrator).await.unwrap();
+
+   // Verify table exists (no duplicate error)
+   let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE name = 'items'")
+      .fetch_one(db.read_pool().unwrap())
+      .await
+      .unwrap();
+
+   assert_eq!(count, 1);
+
+   db.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_run_migrations_tracks_in_sqlx_table() {
+   let path = std::env::current_dir()
+      .unwrap()
+      .join("test_migrations_tracking.db");
+
+   let db = SqliteDatabase::connect(&path, None).await.unwrap();
+
+   let (_dir, migrator) = create_migrations(&[
+      ("first", "CREATE TABLE t1 (id INTEGER);"),
+      ("second", "CREATE TABLE t2 (id INTEGER);"),
+   ])
+   .await;
+
+   db.run_migrations(&migrator).await.unwrap();
+
+   // Verify _sqlx_migrations table has 2 records
+   let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
+      .fetch_one(db.read_pool().unwrap())
+      .await
+      .unwrap();
+
+   assert_eq!(count, 2, "should track 2 applied migrations");
+
+   db.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_run_migrations_on_closed_db_errors() {
+   let path = std::env::current_dir()
+      .unwrap()
+      .join("test_migrations_closed.db");
+
+   let db = SqliteDatabase::connect(&path, None).await.unwrap();
+   let db_ref = Arc::clone(&db);
+
+   db.close().await.unwrap();
+
+   let (_dir, migrator) = create_migrations(&[("noop", "SELECT 1;")]).await;
+   let result = db_ref.run_migrations(&migrator).await;
+
+   assert!(result.is_err());
+   assert!(matches!(result.unwrap_err(), Error::DatabaseClosed));
+
+   let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn test_run_migrations_with_invalid_sql_fails() {
+   let path = std::env::current_dir()
+      .unwrap()
+      .join("test_migrations_invalid.db");
+
+   let db = SqliteDatabase::connect(&path, None).await.unwrap();
+
+   // Create migration with invalid SQL syntax
+   let (_dir, migrator) = create_migrations(&[
+      ("valid", "CREATE TABLE users (id INTEGER PRIMARY KEY);"),
+      ("invalid", "THIS IS NOT VALID SQL SYNTAX"),
+   ])
+   .await;
+
+   let result = db.run_migrations(&migrator).await;
+
+   assert!(result.is_err());
+   assert!(matches!(result.unwrap_err(), Error::Migration(_)));
 
    db.remove().await.unwrap();
 }

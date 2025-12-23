@@ -8,6 +8,7 @@
 //! - **[`SqliteDatabase`]**: Main database type with separate read and write connection pools
 //! - **[`SqliteDatabaseConfig`]**: Configuration for connection pool settings
 //! - **[`WriteGuard`]**: RAII guard ensuring exclusive write access
+//! - **[`Migrator`]**: Re-exported from sqlx for running database migrations
 //! - **[`Error`]**: Error type for database operations
 //!
 //! ## Architecture
@@ -70,6 +71,9 @@ pub use config::SqliteDatabaseConfig;
 pub use database::SqliteDatabase;
 pub use error::Error;
 pub use write_guard::WriteGuard;
+
+// Re-export sqlx migrate types for convenience
+pub use sqlx::migrate::Migrator;
 
 /// A type alias for Results with our custom Error type
 pub type Result<T> = std::result::Result<T, Error>;

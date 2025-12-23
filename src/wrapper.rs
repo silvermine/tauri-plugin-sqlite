@@ -44,7 +44,11 @@ impl DatabaseWrapper {
    /// Connect to a SQLite database with an absolute path.
    ///
    /// This is the core connection method used by `connect()`. It's also
-   /// exposed for testing purposes where we don't have a Tauri AppHandle.
+   /// used by the migration task during plugin setup.
+   ///
+   /// Note: `SqliteDatabase::connect()` caches instances in a global registry.
+   /// Multiple calls with the same path return the same underlying database,
+   /// so this wrapper is lightweight - the actual connection pools are shared.
    pub async fn connect_with_path(
       abs_path: &std::path::Path,
       custom_config: Option<SqliteDatabaseConfig>,
@@ -205,6 +209,18 @@ impl DatabaseWrapper {
             Err(Error::MultipleRowsReturned(count))
          }
       }
+   }
+
+   /// Run database migrations
+   ///
+   /// Runs all pending migrations from the provided migrator.
+   /// SQLx tracks applied migrations, so this is safe to call multiple times.
+   pub async fn run_migrations(
+      &self,
+      migrator: &sqlx_sqlite_conn_mgr::Migrator,
+   ) -> Result<(), Error> {
+      self.inner.run_migrations(migrator).await?;
+      Ok(())
    }
 
    /// Close the database connection
