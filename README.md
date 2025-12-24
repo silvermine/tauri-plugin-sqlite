@@ -238,7 +238,7 @@ const user = await db.fetchOne<User>(
 
 ### Transactions
 
-Execute multiple statements atomically:
+For most cases, use `executeTransaction()` to run multiple statements atomically:
 
 ```typescript
 const results = await db.executeTransaction([
@@ -249,6 +249,49 @@ const results = await db.executeTransaction([
 ```
 
 Transactions use `BEGIN IMMEDIATE`, commit on success, and rollback on any failure.
+
+#### Interruptible Transactions
+
+**Use interruptible transactions when you need to read data mid-transaction to
+decide how to proceed.** For example, inserting a record, reading back its
+generated ID or other computed values, then using that data in subsequent writes.
+
+```typescript
+// Begin transaction with initial insert
+const tx = await db.executeInterruptibleTransaction([
+   ['INSERT INTO orders (user_id, total) VALUES ($1, $2)', [userId, 0]]
+])
+
+// Read the uncommitted data to get the generated order ID
+const orders = await tx.read<Array<{ id: number }>>(
+   'SELECT id FROM orders WHERE user_id = $1 ORDER BY id DESC LIMIT 1',
+   [userId]
+)
+const orderId = orders[0].id
+
+// Continue transaction with the order ID
+const tx2 = await tx.continue([
+   ['INSERT INTO order_items (order_id, product_id) VALUES ($1, $2)', [orderId, productId]],
+   ['UPDATE orders SET total = $1 WHERE id = $2', [itemTotal, orderId]]
+])
+
+// Commit the transaction
+await tx2.commit()
+```
+
+**Important:**
+
+   * Only one interruptible transaction can be active per database at a time
+   * The write lock is held for the entire duration - keep transactions short
+   * Uncommitted writes are visible only within the transaction's `read()` method
+   * Always commit or rollback - abandoned transactions will rollback automatically
+     on app exit
+
+To rollback instead of committing:
+
+```typescript
+await tx.rollback()
+```
 
 ### Error Handling
 
@@ -296,11 +339,21 @@ await db.remove()          // Close and DELETE database file(s) - irreversible!
 | Method | Description |
 | ------ | ----------- |
 | `execute(query, values?)` | Execute write query, returns `{ rowsAffected, lastInsertId }` |
-| `executeTransaction(statements)` | Execute statements atomically |
+| `executeTransaction(statements)` | Execute statements atomically (use for batch writes) |
+| `executeInterruptibleTransaction(statements)` | Begin interruptible transaction, returns `InterruptibleTransaction` |
 | `fetchAll<T>(query, values?)` | Execute SELECT, return all rows |
 | `fetchOne<T>(query, values?)` | Execute SELECT, return single row or `undefined` |
 | `close()` | Close connection, returns `true` if was loaded |
 | `remove()` | Close and delete database file(s), returns `true` if was loaded |
+
+### InterruptibleTransaction Methods
+
+| Method | Description |
+| ------ | ----------- |
+| `read<T>(query, values?)` | Read uncommitted data within this transaction |
+| `continue(statements)` | Execute additional statements, returns new `InterruptibleTransaction` |
+| `commit()` | Commit transaction and release write lock |
+| `rollback()` | Rollback transaction and release write lock |
 
 ### Types
 

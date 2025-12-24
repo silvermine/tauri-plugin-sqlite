@@ -24,6 +24,7 @@ tokio = { version = "1.48.0", features = ["rt", "sync", "time"] }
 indexmap = { version = "2.12.1", features = ["serde"] }
 base64 = "0.22.1"
 tracing = { version = "0.1.41", default-features = false, features = ["std", "release_max_level_off"] }
+uuid = { version = "1.11.0", features = ["v4"] }
 
 # SQLx for types and queries (time feature enables datetime type decoding)
 sqlx = { version = "0.8.6", features = ["sqlite", "json", "time", "runtime-tokio"] }

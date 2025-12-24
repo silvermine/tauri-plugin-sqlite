@@ -4,21 +4,36 @@
 //! Each command manages database connections through the DbInstances state.
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx_sqlite_conn_mgr::SqliteDatabaseConfig;
 use tauri::{AppHandle, Runtime, State};
+use uuid::Uuid;
 
 use crate::{
    DbInstances, Error, MigrationEvent, MigrationStates, MigrationStatus, Result, WriteQueryResult,
+   transactions::{
+      ActiveInterruptibleTransaction, ActiveInterruptibleTransactions, ActiveRegularTransactions,
+      Statement,
+   },
    wrapper::DatabaseWrapper,
 };
 
-/// Statement in a transaction with query and bind values
+/// Token representing an active interruptible transaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionToken {
+   pub db_path: String,
+   pub transaction_id: String,
+}
+
+/// Actions that can be taken on a pausable transaction
 #[derive(Debug, Deserialize)]
-pub struct Statement {
-   query: String,
-   values: Vec<JsonValue>,
+#[serde(tag = "type")]
+pub enum TransactionAction {
+   Continue { statements: Vec<Statement> },
+   Commit,
+   Rollback,
 }
 
 /// Load/connect to a database and store it in plugin state.
@@ -133,6 +148,7 @@ pub async fn execute(
 #[tauri::command]
 pub async fn execute_transaction(
    db_instances: State<'_, DbInstances>,
+   regular_txs: State<'_, ActiveRegularTransactions>,
    db: String,
    statements: Vec<Statement>,
 ) -> Result<Vec<WriteQueryResult>> {
@@ -148,9 +164,42 @@ pub async fn execute_transaction(
       .map(|s| (s.query, s.values))
       .collect();
 
-   let results = wrapper.execute_transaction(stmt_tuples).await?;
+   // Generate unique key for tracking this transaction
+   let tx_key = format!("{}:{}", db, Uuid::new_v4());
 
-   Ok(results)
+   // Spawn transaction execution with abort handle for cleanup on exit
+   let wrapper_clone = wrapper.clone();
+   let tx_key_clone = tx_key.clone();
+   let regular_txs_clone = regular_txs.inner().clone();
+
+   let handle = tokio::spawn(async move {
+      let result = wrapper_clone.execute_transaction(stmt_tuples).await;
+
+      // Remove from tracking when complete (even if result is Err)
+      regular_txs_clone.remove(&tx_key_clone).await;
+
+      result
+   });
+
+   // Track abort handle for cleanup on app exit
+   regular_txs
+      .insert(tx_key.clone(), handle.abort_handle())
+      .await;
+
+   // Wait for transaction to complete
+   match handle.await {
+      Ok(result) => result,
+      Err(e) => {
+         // Task panicked or was aborted - ensure cleanup
+         regular_txs.remove(&tx_key).await;
+
+         if e.is_cancelled() {
+            Err(Error::Other("Transaction aborted due to app exit".into()))
+         } else {
+            Err(Error::Other(format!("Transaction task panicked: {}", e)))
+         }
+      }
+   }
 }
 
 /// Execute a SELECT query returning all matching rows
@@ -255,5 +304,150 @@ pub async fn get_migration_events(
    match states.get(&db) {
       Some(state) => Ok(state.events.clone()),
       None => Ok(Vec::new()),
+   }
+}
+
+/// Execute initial statements in an interruptible transaction and return a token.
+///
+/// This begins a transaction, executes the initial statements, and returns a token
+/// that can be used to continue, commit, or rollback the transaction.
+/// The writer connection is held for the entire transaction duration.
+#[tauri::command]
+pub async fn execute_interruptible_transaction(
+   db_instances: State<'_, DbInstances>,
+   active_txs: State<'_, ActiveInterruptibleTransactions>,
+   db: String,
+   initial_statements: Vec<Statement>,
+) -> Result<TransactionToken> {
+   let instances = db_instances.0.read().await;
+
+   let wrapper = instances
+      .get(&db)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+
+   // Generate unique transaction ID
+   let transaction_id = Uuid::new_v4().to_string();
+
+   // Acquire writer for the entire transaction
+   let mut writer = wrapper.acquire_writer().await?;
+
+   // Begin transaction
+   sqlx::query("BEGIN IMMEDIATE").execute(&mut *writer).await?;
+
+   // Execute initial statements
+   for statement in initial_statements {
+      let mut q = sqlx::query(&statement.query);
+      for value in statement.values {
+         q = crate::wrapper::bind_value(q, value);
+      }
+      q.execute(&mut *writer).await?;
+   }
+
+   // Create abort handle for transaction cleanup on app exit
+   let abort_handle = tokio::spawn(std::future::pending::<()>()).abort_handle();
+
+   // Store transaction state
+   let tx =
+      ActiveInterruptibleTransaction::new(db.clone(), transaction_id.clone(), writer, abort_handle);
+
+   active_txs.insert(db.clone(), tx).await?;
+
+   Ok(TransactionToken {
+      db_path: db,
+      transaction_id,
+   })
+}
+
+/// Continue, commit, or rollback an interruptible transaction.
+///
+/// Returns a new token if continuing with more statements, or None if committed/rolled back.
+#[tauri::command]
+pub async fn transaction_continue(
+   active_txs: State<'_, ActiveInterruptibleTransactions>,
+   token: TransactionToken,
+   action: TransactionAction,
+) -> Result<Option<TransactionToken>> {
+   match action {
+      TransactionAction::Continue { statements } => {
+         // Remove transaction to get mutable access
+         let mut tx = active_txs
+            .remove(&token.db_path, &token.transaction_id)
+            .await?;
+
+         // Execute statements on the transaction
+         match tx.execute_statements(statements).await {
+            Ok(()) => {
+               // Re-insert transaction - if this fails, tx is dropped and auto-rolled back
+               match active_txs.insert(token.db_path.clone(), tx).await {
+                  Ok(()) => Ok(Some(token)),
+                  Err(e) => {
+                     // Transaction lost but will auto-rollback via Drop
+                     Err(e)
+                  }
+               }
+            }
+            Err(e) => {
+               // Execution failed, explicitly rollback before returning error
+               let _ = tx.rollback().await;
+               Err(e)
+            }
+         }
+      }
+
+      TransactionAction::Commit => {
+         // Remove transaction and commit
+         let tx = active_txs
+            .remove(&token.db_path, &token.transaction_id)
+            .await?;
+
+         tx.commit().await?;
+         Ok(None)
+      }
+
+      TransactionAction::Rollback => {
+         // Remove transaction and rollback
+         let tx = active_txs
+            .remove(&token.db_path, &token.transaction_id)
+            .await?;
+
+         tx.rollback().await?;
+         Ok(None)
+      }
+   }
+}
+
+/// Read from database within an interruptible transaction to see uncommitted writes.
+///
+/// This executes a SELECT query on the same connection as the transaction,
+/// allowing you to see uncommitted data.
+#[tauri::command]
+pub async fn transaction_read(
+   active_txs: State<'_, ActiveInterruptibleTransactions>,
+   token: TransactionToken,
+   query: String,
+   values: Vec<JsonValue>,
+) -> Result<Vec<IndexMap<String, JsonValue>>> {
+   // Remove transaction to get mutable access
+   let mut tx = active_txs
+      .remove(&token.db_path, &token.transaction_id)
+      .await?;
+
+   // Execute read on the transaction
+   match tx.read(query, values).await {
+      Ok(results) => {
+         // Re-insert transaction - if this fails, tx is dropped and auto-rolled back
+         match active_txs.insert(token.db_path.clone(), tx).await {
+            Ok(()) => Ok(results),
+            Err(e) => {
+               // Transaction lost but will auto-rollback via Drop
+               Err(e)
+            }
+         }
+      }
+      Err(e) => {
+         // Read failed, explicitly rollback before returning error
+         let _ = tx.rollback().await;
+         Err(e)
+      }
    }
 }

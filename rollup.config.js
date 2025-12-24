@@ -25,11 +25,13 @@ export default [
       output: [
          {
             file: pkg.exports.import,
-            format: 'esm'
+            format: 'esm',
+            exports: 'named'
          },
          {
             file: pkg.exports.require,
-            format: 'cjs'
+            format: 'cjs',
+            exports: 'named'
          }
       ],
       plugins: [
@@ -60,7 +62,8 @@ export default [
          banner: "if ('__TAURI__' in window) {",
          // the last `}` closes the if in the banner
          footer: `Object.defineProperty(window.__TAURI__, '${pluginJsName}', { value: ${iifeVarName} }) }`,
-         file: 'api-iife.js'
+         file: 'api-iife.js',
+         exports: 'named'
       },
       plugins: [
          typescript({
