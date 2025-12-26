@@ -10,10 +10,12 @@ use tracing::{debug, error, info, trace, warn};
 mod commands;
 mod decode;
 mod error;
+mod transactions;
 mod wrapper;
 
 pub use error::{Error, Result};
 pub use sqlx_sqlite_conn_mgr::Migrator as SqliteMigrator;
+pub use transactions::{ActiveInterruptibleTransactions, ActiveRegularTransactions};
 pub use wrapper::{DatabaseWrapper, WriteQueryResult};
 
 /// Database instances managed by the plugin.
@@ -159,6 +161,9 @@ impl Builder {
             commands::load,
             commands::execute,
             commands::execute_transaction,
+            commands::execute_interruptible_transaction,
+            commands::transaction_continue,
+            commands::transaction_read,
             commands::fetch_all,
             commands::fetch_one,
             commands::close,
@@ -169,6 +174,8 @@ impl Builder {
          .setup(move |app, _api| {
             app.manage(DbInstances::default());
             app.manage(MigrationStates::default());
+            app.manage(ActiveInterruptibleTransactions::default());
+            app.manage(ActiveRegularTransactions::default());
 
             // Initialize migration states as Pending for all registered databases
             let migration_states = app.state::<MigrationStates>();
@@ -200,7 +207,7 @@ impl Builder {
          .on_event(|app, event| {
             match event {
                RunEvent::ExitRequested { api, code, .. } => {
-                  info!("App exit requested (code: {:?}) - closing databases before exit", code);
+                  info!("App exit requested (code: {:?}) - cleaning up transactions and databases", code);
 
                   // Prevent immediate exit so we can close connections and checkpoint WAL
                   api.prevent_exit();
@@ -210,19 +217,26 @@ impl Builder {
                   let handle = match tokio::runtime::Handle::try_current() {
                      Ok(h) => h,
                      Err(_) => {
-                        warn!("No tokio runtime available for database cleanup");
+                        warn!("No tokio runtime available for cleanup");
                         app_handle.exit(code.unwrap_or(0));
                         return;
                      }
                   };
 
-                  let instances = app.state::<DbInstances>().inner().clone();
+                  let instances_clone = app.state::<DbInstances>().inner().clone();
+                  let interruptible_txs_clone = app.state::<ActiveInterruptibleTransactions>().inner().clone();
+                  let regular_txs_clone = app.state::<ActiveRegularTransactions>().inner().clone();
 
-                  // Spawn a blocking thread to close databases
+                  // Spawn a blocking thread to abort transactions and close databases
                   // (block_in_place panics on current_thread runtime)
                   let cleanup_result = std::thread::spawn(move || {
                      handle.block_on(async {
-                        let mut guard = instances.0.write().await;
+                        // First, abort all active transactions
+                        debug!("Aborting active transactions");
+                        transactions::cleanup_all_transactions(&interruptible_txs_clone, &regular_txs_clone).await;
+
+                        // Then close databases
+                        let mut guard = instances_clone.0.write().await;
                         let wrappers: Vec<DatabaseWrapper> =
                            guard.drain().map(|(_, v)| v).collect();
 

@@ -15,11 +15,23 @@ beforeEach(() => {
       if (cmd === 'plugin:sqlite|load') return (args as { db: string }).db
       if (cmd === 'plugin:sqlite|execute') return [1, 1]
       if (cmd === 'plugin:sqlite|execute_transaction') return []
+      if (cmd === 'plugin:sqlite|execute_interruptible_transaction') {
+         return { dbPath: (args as { db: string }).db, transactionId: 'test-tx-id' }
+      }
+      if (cmd === 'plugin:sqlite|transaction_continue') {
+         const action = (args as { action: { type: string } }).action
+         if (action.type === 'Continue') {
+            return { dbPath: 'test.db', transactionId: 'test-tx-id' }
+         }
+         return undefined
+      }
+      if (cmd === 'plugin:sqlite|transaction_read') return []
       if (cmd === 'plugin:sqlite|fetch_all') return []
       if (cmd === 'plugin:sqlite|fetch_one') return null
       if (cmd === 'plugin:sqlite|close') return true
       if (cmd === 'plugin:sqlite|close_all') return undefined
       if (cmd === 'plugin:sqlite|remove') return true
+      if (cmd === 'plugin:sqlite|get_migration_events') return []
       return undefined
    })
 })
@@ -90,6 +102,69 @@ describe('Database commands', () => {
       expect(lastCmd).toBe('plugin:sqlite|get_migration_events')
       expect(lastArgs.db).toBe('t.db')
       expect(events).toEqual(mockEvents)
+   })
+
+   it('getMigrationEvents - empty array', async () => {
+      const events = await Database.get('test.db').getMigrationEvents()
+      expect(lastCmd).toBe('plugin:sqlite|get_migration_events')
+      expect(lastArgs.db).toBe('test.db')
+      expect(events).toEqual([])
+   })
+
+   it('executeInterruptibleTransaction', async () => {
+      const tx = await Database.get('t.db').executeInterruptibleTransaction([
+         ['INSERT INTO users (name) VALUES ($1)', ['Alice']]
+      ])
+      expect(lastCmd).toBe('plugin:sqlite|execute_interruptible_transaction')
+      expect(lastArgs.db).toBe('t.db')
+      expect(lastArgs.initialStatements).toEqual([
+         { query: 'INSERT INTO users (name) VALUES ($1)', values: ['Alice'] }
+      ])
+      expect(tx).toBeInstanceOf(Object)
+   })
+
+   it('InterruptibleTransaction.continue()', async () => {
+      const tx = await Database.get('test.db').executeInterruptibleTransaction([
+         ['INSERT INTO users (name) VALUES ($1)', ['Alice']]
+      ])
+      const tx2 = await tx.continue([
+         ['INSERT INTO users (name) VALUES ($1)', ['Bob']]
+      ])
+      expect(lastCmd).toBe('plugin:sqlite|transaction_continue')
+      expect(lastArgs.token).toEqual({ dbPath: 'test.db', transactionId: 'test-tx-id' })
+      expect((lastArgs.action as { type: string }).type).toBe('Continue')
+      expect(tx2).toBeInstanceOf(Object)
+   })
+
+   it('InterruptibleTransaction.commit()', async () => {
+      const tx = await Database.get('test.db').executeInterruptibleTransaction([
+         ['INSERT INTO users (name) VALUES ($1)', ['Alice']]
+      ])
+      await tx.commit()
+      expect(lastCmd).toBe('plugin:sqlite|transaction_continue')
+      expect(lastArgs.token).toEqual({ dbPath: 'test.db', transactionId: 'test-tx-id' })
+      expect((lastArgs.action as { type: string }).type).toBe('Commit')
+   })
+
+   it('InterruptibleTransaction.rollback()', async () => {
+      const tx = await Database.get('test.db').executeInterruptibleTransaction([
+         ['INSERT INTO users (name) VALUES ($1)', ['Alice']]
+      ])
+      await tx.rollback()
+      expect(lastCmd).toBe('plugin:sqlite|transaction_continue')
+      expect(lastArgs.token).toEqual({ dbPath: 'test.db', transactionId: 'test-tx-id' })
+      expect((lastArgs.action as { type: string }).type).toBe('Rollback')
+   })
+
+   it('InterruptibleTransaction.read()', async () => {
+      const tx = await Database.get('test.db').executeInterruptibleTransaction([
+         ['INSERT INTO users (name) VALUES ($1)', ['Alice']]
+      ])
+      await tx.read('SELECT * FROM users WHERE name = $1', ['Alice'])
+      expect(lastCmd).toBe('plugin:sqlite|transaction_read')
+      expect(lastArgs.token).toEqual({ dbPath: 'test.db', transactionId: 'test-tx-id' })
+      expect(lastArgs.query).toBe('SELECT * FROM users WHERE name = $1')
+      expect(lastArgs.values).toEqual(['Alice'])
    })
 
    it('handles errors from backend', async () => {

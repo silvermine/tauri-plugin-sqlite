@@ -39,6 +39,122 @@ export interface SqliteError {
 }
 
 /**
+ * **InterruptibleTransaction**
+ *
+ * Represents an active interruptible transaction that can be continued, committed, or rolled back.
+ * Provides methods to read uncommitted data and execute additional statements.
+ */
+export class InterruptibleTransaction {
+   constructor(
+      private readonly dbPath: string,
+      private readonly transactionId: string
+   ) {}
+
+   /**
+    * **read**
+    *
+    * Read data from the database within this transaction context.
+    * This allows you to see uncommitted writes from the current transaction.
+    *
+    * The query executes on the same connection as the transaction, so you can
+    * read data that hasn't been committed yet.
+    *
+    * @param query - SELECT query to execute
+    * @param bindValues - Optional parameter values
+    * @returns Promise that resolves with query results
+    *
+    * @example
+    * ```ts
+    * const tx = await db.executeInterruptibleTransaction([
+    *    ['INSERT INTO users (name) VALUES ($1)', ['Alice']]
+    * ]);
+    *
+    * const users = await tx.read<User[]>(
+    *    'SELECT * FROM users WHERE name = $1',
+    *    ['Alice']
+    * );
+    * ```
+    */
+   async read<T>(query: string, bindValues?: SqlValue[]): Promise<T> {
+      return await invoke<T>('plugin:sqlite|transaction_read', {
+         token: { dbPath: this.dbPath, transactionId: this.transactionId },
+         query,
+         values: bindValues ?? []
+      })
+   }
+
+   /**
+    * **continue**
+    *
+    * Execute additional statements within this transaction and return a new transaction handle.
+    *
+    * @param statements - Array of [query, values?] tuples to execute
+    * @returns Promise that resolves with a new transaction handle
+    *
+    * @example
+    * ```ts
+    * const tx = await db.executeInterruptibleTransaction([...]);
+    * const tx2 = await tx.continue([
+    *    ['INSERT INTO users (name) VALUES ($1)', ['Bob']]
+    * ]);
+    * await tx2.commit();
+    * ```
+    */
+   async continue(statements: Array<[string, SqlValue[]?]>): Promise<InterruptibleTransaction> {
+      const token = await invoke<{ dbPath: string; transactionId: string }>(
+         'plugin:sqlite|transaction_continue',
+         {
+            token: { dbPath: this.dbPath, transactionId: this.transactionId },
+            action: {
+               type: 'Continue',
+               statements: statements.map(([query, values]) => ({
+                  query,
+                  values: values ?? []
+               }))
+            }
+         }
+      )
+      return new InterruptibleTransaction(token.dbPath, token.transactionId)
+   }
+
+   /**
+    * **commit**
+    *
+    * Commit this transaction and release the write lock.
+    *
+    * @example
+    * ```ts
+    * const tx = await db.executeInterruptibleTransaction([...]);
+    * await tx.commit();
+    * ```
+    */
+   async commit(): Promise<void> {
+      await invoke<void>('plugin:sqlite|transaction_continue', {
+         token: { dbPath: this.dbPath, transactionId: this.transactionId },
+         action: { type: 'Commit' }
+      })
+   }
+
+   /**
+    * **rollback**
+    *
+    * Rollback this transaction and release the write lock.
+    *
+    * @example
+    * ```ts
+    * const tx = await db.executeInterruptibleTransaction([...]);
+    * await tx.rollback();
+    * ```
+    */
+   async rollback(): Promise<void> {
+      await invoke<void>('plugin:sqlite|transaction_continue', {
+         token: { dbPath: this.dbPath, transactionId: this.transactionId },
+         action: { type: 'Rollback' }
+      })
+   }
+}
+
+/**
  * Custom configuration for SQLite database connection
  */
 export interface CustomConfig {
@@ -195,6 +311,10 @@ export default class Database {
     *
     * Executes multiple write statements atomically within a transaction.
     * All statements either succeed together or fail together.
+    *
+    * **Use this method** when you have a batch of writes to execute and don't need to
+    * read data mid-transaction. For transactions that require reading uncommitted data
+    * to decide how to proceed, use `executeInterruptibleTransaction()` instead.
     *
     * The function automatically:
     * - Begins a transaction (BEGIN)
@@ -363,6 +483,69 @@ export default class Database {
          db: this.path
       })
       return success
+   }
+
+   /**
+    * **executeInterruptibleTransaction**
+    *
+    * Begins an interruptible transaction for cases where you need to **read data mid-transaction
+    * to decide how to proceed**. For example, inserting a record and then reading its
+    * generated ID or computed values before continuing with related writes.
+    *
+    * The transaction remains open, holding a write lock on the database, until you
+    * call `commit()` or `rollback()` on the returned transaction handle.
+    *
+    * **Use this method when:**
+    * - You need to read back generated IDs (e.g., AUTOINCREMENT columns)
+    * - You need to see computed values (e.g., triggers, default values)
+    * - Your next writes depend on data from earlier writes in the same transaction
+    *
+    * **Use `executeTransaction()` instead when:**
+    * - You just need to execute a batch of writes atomically
+    * - You know all the data upfront and don't need to read mid-transaction
+    *
+    * **Important:** Only one transaction can be active per database at a time. The
+    * writer connection is held for the entire duration - keep transactions short.
+    *
+    * @param initialStatements - Array of [query, values?] tuples to execute initially
+    * @returns Promise that resolves with an InterruptibleTransaction handle
+    *
+    * @example
+    * ```ts
+    * // Insert an order and read back its ID
+    * const tx = await db.executeInterruptibleTransaction([
+    *    ['INSERT INTO orders (user_id, total) VALUES ($1, $2)', [userId, 0]]
+    * ]);
+    *
+    * // Read the generated order ID
+    * const orders = await tx.read<Array<{ id: number }>>(
+    *    'SELECT id FROM orders WHERE user_id = $1 ORDER BY id DESC LIMIT 1',
+    *    [userId]
+    * );
+    * const orderId = orders[0].id;
+    *
+    * // Use the ID in subsequent writes
+    * const tx2 = await tx.continue([
+    *    ['INSERT INTO order_items (order_id, product_id) VALUES ($1, $2)', [orderId, productId]]
+    * ]);
+    *
+    * await tx2.commit();
+    * ```
+    */
+   async executeInterruptibleTransaction(
+      initialStatements: Array<[string, SqlValue[]?]>
+   ): Promise<InterruptibleTransaction> {
+      const token = await invoke<{ dbPath: string; transactionId: string }>(
+         'plugin:sqlite|execute_interruptible_transaction',
+         {
+            db: this.path,
+            initialStatements: initialStatements.map(([query, values]) => ({
+               query,
+               values: values ?? []
+            }))
+         }
+      )
+      return new InterruptibleTransaction(token.dbPath, token.transactionId)
    }
 
    /**

@@ -24,11 +24,17 @@ pub struct WriteQueryResult {
 }
 
 /// Wrapper around SqliteDatabase that adapts it for the plugin interface
+#[derive(Clone)]
 pub struct DatabaseWrapper {
    inner: Arc<SqliteDatabase>,
 }
 
 impl DatabaseWrapper {
+   /// Acquire writer connection (for pausable transactions)
+   pub async fn acquire_writer(&self) -> Result<sqlx_sqlite_conn_mgr::WriteGuard, Error> {
+      Ok(self.inner.acquire_writer().await?)
+   }
+
    /// Connect to a SQLite database via the connection manager
    pub async fn connect<R: Runtime>(
       path: &str,
@@ -239,7 +245,7 @@ impl DatabaseWrapper {
 }
 
 /// Helper function to bind a JSON value to a SQLx query
-fn bind_value<'a>(
+pub(crate) fn bind_value<'a>(
    query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
    value: JsonValue,
 ) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {

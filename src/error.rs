@@ -51,6 +51,22 @@ pub enum Error {
       transaction_error: String,
       rollback_error: String,
    },
+
+   /// Transaction already active for this database.
+   #[error("transaction already active for database: {0}")]
+   TransactionAlreadyActive(String),
+
+   /// No active transaction for this database.
+   #[error("no active transaction for database: {0}")]
+   NoActiveTransaction(String),
+
+   /// Invalid transaction token provided.
+   #[error("invalid transaction token")]
+   InvalidTransactionToken,
+
+   /// Generic error for operations that don't fit other categories.
+   #[error("{0}")]
+   Other(String),
 }
 
 impl Error {
@@ -74,6 +90,10 @@ impl Error {
          Error::Io(_) => "IO_ERROR".to_string(),
          Error::MultipleRowsReturned(_) => "MULTIPLE_ROWS_RETURNED".to_string(),
          Error::TransactionRollbackFailed { .. } => "TRANSACTION_ROLLBACK_FAILED".to_string(),
+         Error::TransactionAlreadyActive(_) => "TRANSACTION_ALREADY_ACTIVE".to_string(),
+         Error::NoActiveTransaction(_) => "NO_ACTIVE_TRANSACTION".to_string(),
+         Error::InvalidTransactionToken => "INVALID_TRANSACTION_TOKEN".to_string(),
+         Error::Other(_) => "ERROR".to_string(),
       }
    }
 }
