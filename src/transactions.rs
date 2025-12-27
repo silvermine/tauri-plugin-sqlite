@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -20,23 +19,14 @@ pub struct ActiveInterruptibleTransaction {
    db_path: String,
    transaction_id: String,
    writer: WriteGuard,
-   abort_handle: AbortHandle,
-   created_at: Instant,
 }
 
 impl ActiveInterruptibleTransaction {
-   pub fn new(
-      db_path: String,
-      transaction_id: String,
-      writer: WriteGuard,
-      abort_handle: AbortHandle,
-   ) -> Self {
+   pub fn new(db_path: String, transaction_id: String, writer: WriteGuard) -> Self {
       Self {
          db_path,
          transaction_id,
          writer,
-         abort_handle,
-         created_at: Instant::now(),
       }
    }
 
@@ -46,10 +36,6 @@ impl ActiveInterruptibleTransaction {
 
    pub fn transaction_id(&self) -> &str {
       &self.transaction_id
-   }
-
-   pub fn created_at(&self) -> Instant {
-      self.created_at
    }
 
    pub fn validate_token(&self, token_id: &str) -> Result<()> {
@@ -157,15 +143,15 @@ impl ActiveInterruptibleTransactions {
       let mut txs = self.0.write().await;
       debug!("Aborting {} active interruptible transaction(s)", txs.len());
 
-      for (db_path, tx) in txs.iter() {
+      for db_path in txs.keys() {
          debug!(
-            "Aborting interruptible transaction for database: {}",
+            "Dropping interruptible transaction for database: {}",
             db_path
          );
-         tx.abort_handle.abort();
       }
 
       // Clear all transactions to drop WriteGuards and release locks
+      // Dropping triggers auto-rollback via Drop trait
       txs.clear();
    }
 

@@ -177,6 +177,8 @@ impl DatabaseWrapper {
    }
 
    /// Execute a SELECT query expecting zero or one result
+   ///
+   /// Returns an error if the query returns more than one row.
    pub async fn fetch_one(
       &self,
       query: String,
@@ -185,11 +187,7 @@ impl DatabaseWrapper {
       // Use read pool for queries
       let pool = self.inner.read_pool()?;
 
-      // Add LIMIT 2 to detect if query returns multiple rows
-      // We only need to fetch up to 2 rows to know if there's more than 1
-      let limited_query = format!("{} LIMIT 2", query.trim_end_matches(';'));
-
-      let mut q = sqlx::query(&limited_query);
+      let mut q = sqlx::query(&query);
       for value in values {
          q = bind_value(q, value);
       }
@@ -274,7 +272,10 @@ pub(crate) fn bind_value<'a>(
    }
 }
 
-/// Resolve database file path relative to app config directory
+/// Resolve database file path relative to app config directory.
+///
+/// Paths are joined to `app_config_dir()` (e.g., `Library/Application Support/${bundleIdentifier}` on iOS).
+/// Special paths like `:memory:` are passed through unchanged.
 fn resolve_database_path<R: Runtime>(path: &str, app: &AppHandle<R>) -> Result<PathBuf, Error> {
    let app_path = app
       .path()

@@ -27,7 +27,7 @@ pub struct TransactionToken {
    pub transaction_id: String,
 }
 
-/// Actions that can be taken on a pausable transaction
+/// Actions that can be taken on an interruptible transaction
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum TransactionAction {
@@ -264,12 +264,18 @@ pub async fn close_all(db_instances: State<'_, DbInstances>) -> Result<()> {
    // Collect all wrappers to close
    let wrappers: Vec<DatabaseWrapper> = instances.drain().map(|(_, v)| v).collect();
 
-   // Close each connection
+   // Close each connection, continuing on errors to ensure all get closed
+   let mut last_error = None;
    for wrapper in wrappers {
-      wrapper.close().await?;
+      if let Err(e) = wrapper.close().await {
+         last_error = Some(e);
+      }
    }
 
-   Ok(())
+   match last_error {
+      Some(e) => Err(e),
+      None => Ok(()),
+   }
 }
 
 /// Close database connection and remove all database files
@@ -343,12 +349,8 @@ pub async fn execute_interruptible_transaction(
       q.execute(&mut *writer).await?;
    }
 
-   // Create abort handle for transaction cleanup on app exit
-   let abort_handle = tokio::spawn(std::future::pending::<()>()).abort_handle();
-
    // Store transaction state
-   let tx =
-      ActiveInterruptibleTransaction::new(db.clone(), transaction_id.clone(), writer, abort_handle);
+   let tx = ActiveInterruptibleTransaction::new(db.clone(), transaction_id.clone(), writer);
 
    active_txs.insert(db.clone(), tx).await?;
 

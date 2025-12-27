@@ -76,7 +76,7 @@ pub struct MigrationEvent {
    pub db_path: String,
    /// Status: "running", "completed", "failed"
    pub status: String,
-   /// Total number of migrations in the migrator (on "completed"), not just newly applied
+   /// Total number of migrations defined in the migrator (on "completed"), not just newly applied
    #[serde(skip_serializing_if = "Option::is_none")]
    pub migration_count: Option<usize>,
    /// Error message (on "failed")

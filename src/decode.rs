@@ -9,6 +9,9 @@ use crate::Error;
 ///
 /// This function handles the type conversion from SQLite's native types
 /// to JSON-compatible representations.
+///
+/// Note: BLOB values are returned as base64-encoded strings since JSON
+/// has no native binary type. Boolean values are stored as INTEGER in SQLite.
 pub fn to_json(value: SqliteValueRef) -> Result<JsonValue, Error> {
    if value.is_null() {
       return Ok(JsonValue::Null);

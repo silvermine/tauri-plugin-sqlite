@@ -12,6 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::error;
 
+/// Analysis limit for PRAGMA optimize on close.
+/// SQLite recommends 100-1000 for older versions; 3.46.0+ handles automatically.
+/// See: https://www.sqlite.org/lang_analyze.html#recommended_usage_pattern
+const OPTIMIZE_ANALYSIS_LIMIT: u32 = 400;
+
 /// SQLite database with connection pooling for concurrent reads and optional exclusive writes.
 ///
 /// Once the database is opened it can be used for read-only operations by calling `read_pool()`.
@@ -144,16 +149,11 @@ impl SqliteDatabase {
             drop(conn); // Close immediately after creating the file
          }
 
-         // Enable PRAGMA optimize on close as recommended by SQLite for long-lived databases.
-         // SQLite recommends analysis_limit values between 100-1000 for older versions;
-         // SQLite 3.46.0+ handles limits automatically.
-         // https://www.sqlite.org/lang_analyze.html#recommended_usage_pattern
-         //
          // Create read pool with read-only connections
          let read_options = SqliteConnectOptions::new()
             .filename(&path)
             .read_only(true)
-            .optimize_on_close(true, 400);
+            .optimize_on_close(true, OPTIMIZE_ANALYSIS_LIMIT);
 
          let read_pool = SqlitePoolOptions::new()
             .max_connections(config.max_read_connections)
@@ -168,7 +168,7 @@ impl SqliteDatabase {
          let write_options = SqliteConnectOptions::new()
             .filename(&path)
             .read_only(false)
-            .optimize_on_close(true, 400);
+            .optimize_on_close(true, OPTIMIZE_ANALYSIS_LIMIT);
 
          let write_conn = SqlitePoolOptions::new()
             .max_connections(1)
@@ -250,8 +250,12 @@ impl SqliteDatabase {
       // Acquire connection from pool (max=1 ensures exclusive access)
       let mut conn = self.write_conn.acquire().await?;
 
-      // Initialize WAL mode on first use (idempotent and safe)
-      if !self.wal_initialized.load(Ordering::SeqCst) {
+      // Initialize WAL mode on first use (atomic check-and-set)
+      if self
+         .wal_initialized
+         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+         .is_ok()
+      {
          sqlx::query("PRAGMA journal_mode = WAL")
             .execute(&mut *conn)
             .await?;
@@ -260,8 +264,6 @@ impl SqliteDatabase {
          sqlx::query("PRAGMA synchronous = NORMAL")
             .execute(&mut *conn)
             .await?;
-
-         self.wal_initialized.store(true, Ordering::SeqCst);
       }
 
       // Return WriteGuard wrapping the pool connection
