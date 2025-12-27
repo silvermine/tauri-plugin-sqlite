@@ -264,12 +264,18 @@ pub async fn close_all(db_instances: State<'_, DbInstances>) -> Result<()> {
    // Collect all wrappers to close
    let wrappers: Vec<DatabaseWrapper> = instances.drain().map(|(_, v)| v).collect();
 
-   // Close each connection
+   // Close each connection, continuing on errors to ensure all get closed
+   let mut last_error = None;
    for wrapper in wrappers {
-      wrapper.close().await?;
+      if let Err(e) = wrapper.close().await {
+         last_error = Some(e);
+      }
    }
 
-   Ok(())
+   match last_error {
+      Some(e) => Err(e),
+      None => Ok(()),
+   }
 }
 
 /// Close database connection and remove all database files
