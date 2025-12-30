@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-transaction-continue"
+description = "Enables the transaction_continue command without any pre-configured scope."
+commands.allow = ["transaction_continue"]
+
+[[permission]]
+identifier = "deny-transaction-continue"
+description = "Denies the transaction_continue command without any pre-configured scope."
+commands.deny = ["transaction_continue"]

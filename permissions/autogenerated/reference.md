@@ -7,6 +7,9 @@ Default permissions for the sqlite plugin - allows all database operations
 - `allow-load`
 - `allow-execute`
 - `allow-execute-transaction`
+- `allow-execute-interruptible-transaction`
+- `allow-transaction-continue`
+- `allow-transaction-read`
 - `allow-fetch-all`
 - `allow-fetch-one`
 - `allow-close`
@@ -96,6 +99,32 @@ Enables the execute command without any pre-configured scope.
 <td>
 
 Denies the execute command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:allow-execute-interruptible-transaction`
+
+</td>
+<td>
+
+Enables the execute_interruptible_transaction command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-execute-interruptible-transaction`
+
+</td>
+<td>
+
+Denies the execute_interruptible_transaction command without any pre-configured scope.
 
 </td>
 </tr>
@@ -252,6 +281,58 @@ Enables the remove command without any pre-configured scope.
 <td>
 
 Denies the remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:allow-transaction-continue`
+
+</td>
+<td>
+
+Enables the transaction_continue command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-transaction-continue`
+
+</td>
+<td>
+
+Denies the transaction_continue command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:allow-transaction-read`
+
+</td>
+<td>
+
+Enables the transaction_read command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-transaction-read`
+
+</td>
+<td>
+
+Denies the transaction_read command without any pre-configured scope.
 
 </td>
 </tr>
