@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-transaction-read"
+description = "Enables the transaction_read command without any pre-configured scope."
+commands.allow = ["transaction_read"]
+
+[[permission]]
+identifier = "deny-transaction-read"
+description = "Denies the transaction_read command without any pre-configured scope."
+commands.deny = ["transaction_read"]
