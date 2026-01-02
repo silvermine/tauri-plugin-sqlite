@@ -69,12 +69,9 @@ Or specify individual permissions:
 {
    "permissions": [
       "sqlite:allow-load",
-      "sqlite:allow-select",
-      "sqlite:allow-select-one",
-      "sqlite:allow-execute-write",
-      "sqlite:allow-close",
-      "sqlite:allow-close-all",
-      "sqlite:allow-remove"
+      "sqlite:allow-fetch-one",
+      "sqlite:allow-fetch-all",
+      // etc.
    ]
 }
 ```
