@@ -15,6 +15,7 @@ use tracing::debug;
 use crate::{Error, Result};
 
 /// Active transaction state holding the writer and metadata
+#[must_use = "if unused, the transaction is immediately rolled back"]
 pub struct ActiveInterruptibleTransaction {
    db_path: String,
    transaction_id: String,

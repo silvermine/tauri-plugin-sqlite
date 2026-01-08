@@ -21,4 +21,18 @@ pub enum Error {
    /// Database has been closed and cannot be used
    #[error("Database has been closed")]
    DatabaseClosed,
+
+   /// Cannot attach a database as read-write to a read-only connection
+   #[error("Cannot attach database as read-write to a read-only connection")]
+   CannotAttachReadWriteToReader,
+
+   /// Invalid schema name provided for attached database
+   #[error(
+      "Invalid schema name '{0}': must contain only alphanumeric characters and underscores, and cannot start with a digit"
+   )]
+   InvalidSchemaName(String),
+
+   /// Attempted to attach the same database multiple times
+   #[error("Database '{0}' appears multiple times in attachment list (would cause deadlock)")]
+   DuplicateDatabaseAttachment(String),
 }

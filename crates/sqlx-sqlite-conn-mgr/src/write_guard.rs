@@ -31,6 +31,7 @@ use std::ops::{Deref, DerefMut};
 /// # Ok(())
 /// # }
 /// ```
+#[must_use = "if unused, the write lock is immediately released"]
 #[derive(Debug)]
 pub struct WriteGuard {
    conn: PoolConnection<Sqlite>,

@@ -67,6 +67,15 @@ pub struct SqliteDatabase {
 }
 
 impl SqliteDatabase {
+   /// Get the database file path as a string
+   ///
+   /// Used internally for ATTACH DATABASE statements
+   pub(crate) fn path_str(&self) -> String {
+      self.path.to_string_lossy().to_string()
+   }
+}
+
+impl SqliteDatabase {
    /// Connect to a SQLite database
    ///
    /// If the database is already connected, returns the existing connection.

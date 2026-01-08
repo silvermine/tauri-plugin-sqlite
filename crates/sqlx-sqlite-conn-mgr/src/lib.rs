@@ -60,6 +60,7 @@
 //! - Global registry caches new database instances and returns existing ones
 //! - WAL mode is enabled lazily only when writes are needed
 //!
+mod attached;
 mod config;
 mod database;
 mod error;
@@ -67,6 +68,10 @@ mod registry;
 mod write_guard;
 
 // Re-export public types
+pub use attached::{
+   AttachedMode, AttachedReadConnection, AttachedSpec, AttachedWriteGuard,
+   acquire_reader_with_attached, acquire_writer_with_attached,
+};
 pub use config::SqliteDatabaseConfig;
 pub use database::SqliteDatabase;
 pub use error::Error;

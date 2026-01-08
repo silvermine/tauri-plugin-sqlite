@@ -92,6 +92,67 @@ times is safe (already-applied migrations are skipped).
 > `Builder::add_migrations()`. The plugin starts migrations at setup and waits for
 > completion when `load()` is called.
 
+### Attached Databases
+
+Attach other SQLite databases to enable cross-database queries. Attachments are
+connection-scoped and automatically detached when the guard is dropped.
+
+```rust
+use sqlx_sqlite_conn_mgr::{SqliteDatabase, AttachedSpec, AttachedMode, acquire_reader_with_attached};
+use sqlx::query;
+use std::sync::Arc;
+
+async fn example() -> Result<(), sqlx_sqlite_conn_mgr::Error> {
+    // You must first connect to the main database and any database(s) you intend to
+    // attach.
+    let main_db = SqliteDatabase::connect("main.db", None).await?;
+    let orders_db = SqliteDatabase::connect("orders.db", None).await?;
+
+    // Attach orders database for read-only access
+    let specs = vec![AttachedSpec {
+        database: orders_db,
+        schema_name: "orders".to_string(),
+        mode: AttachedMode::ReadOnly,
+    }];
+
+    let mut conn = acquire_reader_with_attached(&main_db, specs).await?;
+
+    // Cross-database query
+    let rows = query(
+        "SELECT u.name, o.total
+         FROM main.users u
+         JOIN orders.orders o ON u.id = o.user_id"
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+
+    // Attached database automatically detached when conn is dropped
+    Ok(())
+}
+```
+
+#### Attached Modes
+
+   * **`AttachedMode::ReadOnly`**: Attach for read access only. Can be used with
+     both reader and writer connections.
+   * **`AttachedMode::ReadWrite`**: Attach for write access. Can only be used with
+     writer connections. Acquires the attached database's writer lock to ensure
+     exclusive access.
+
+#### Safety Guarantees
+
+   1. **Lock ordering**: Multiple attachments are acquired in alphabetical order by
+      schema name to prevent deadlocks
+   2. **Mode validation**: Read-only connections cannot attach databases in
+      read-write mode (returns `CannotAttachReadWriteToReader` error)
+   3. **Automatic cleanup**: SQLite automatically detaches databases when connections
+      close; no manual cleanup required
+
+> **Caution:** Do not bypass this API by executing raw
+> `ATTACH DATABASE '/path/to/db.db' AS alias` SQL commands directly. Doing so
+> circumvents the connection manager's policies and will result in
+> unpredictable behavior, including potential deadlocks.
+
 ## API Reference
 
 ### `SqliteDatabase`
@@ -109,6 +170,16 @@ times is safe (already-applied migrations are skipped).
 
 RAII guard for exclusive write access. Derefs to `SqliteConnection`. Connection
 returned to pool on drop.
+
+### Attached Database Functions
+
+| Function | Description |
+| -------- | ----------- |
+| `acquire_reader_with_attached(db, specs)` | Acquire read connection with attached databases |
+| `acquire_writer_with_attached(db, specs)` | Acquire writer connection with attached databases |
+
+Returns `AttachedConnection` or `AttachedWriteGuard` respectively. Both guards
+deref to `SqliteConnection` and automatically detach databases on drop.
 
 ## Design Details
 

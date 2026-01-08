@@ -71,7 +71,6 @@ Or specify individual permissions:
       "sqlite:allow-load",
       "sqlite:allow-fetch-one",
       "sqlite:allow-fetch-all",
-      // etc.
    ]
 }
 ```
@@ -187,14 +186,14 @@ All query methods use `$1`, `$2`, etc. syntax with `SqlValue` types:
 type SqlValue = string | number | boolean | null | Uint8Array
 ```
 
-| SQLite Type | TypeScript Type | Notes |
-| ----------- | --------------- | ----- |
-| TEXT        | `string`        | Also for DATE, TIME, DATETIME |
-| INTEGER     | `number`        | Integers preserved up to i64 range |
-| REAL        | `number`        | Floating point |
-| BOOLEAN     | `boolean`       | |
-| NULL        | `null`          | |
-| BLOB        | `Uint8Array`    | Binary data |
+| SQLite Type | TypeScript Type | Notes                               |
+| ----------- | --------------- | ----------------------------------- |
+| TEXT        | `string`        | Also for DATE, TIME, DATETIME       |
+| INTEGER     | `number`        | Integers preserved up to i64 range  |
+| REAL        | `number`        | Floating point                      |
+| BOOLEAN     | `boolean`       |                                     |
+| NULL        | `null`          |                                     |
+| BLOB        | `Uint8Array`    | Binary data                         |
 
 > **Note:** JavaScript safely represents integers up to ±2^53 - 1. The plugin binds
 > integers as SQLite's INTEGER type (i64), maintaining full precision within that range.
@@ -255,7 +254,7 @@ generated ID or other computed values, then using that data in subsequent writes
 
 ```typescript
 // Begin transaction with initial insert
-const tx = await db.executeInterruptibleTransaction([
+let tx = await db.executeInterruptibleTransaction([
    ['INSERT INTO orders (user_id, total) VALUES ($1, $2)', [userId, 0]]
 ])
 
@@ -267,13 +266,13 @@ const orders = await tx.read<Array<{ id: number }>>(
 const orderId = orders[0].id
 
 // Continue transaction with the order ID
-const tx2 = await tx.continue([
+tx = await tx.continue([
    ['INSERT INTO order_items (order_id, product_id) VALUES ($1, $2)', [orderId, productId]],
    ['UPDATE orders SET total = $1 WHERE id = $2', [itemTotal, orderId]]
 ])
 
 // Commit the transaction
-await tx2.commit()
+await tx.commit()
 ```
 
 **Important:**
@@ -390,6 +389,7 @@ fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("trace"));
+
     fmt().with_env_filter(filter).compact().init();
 }
 
