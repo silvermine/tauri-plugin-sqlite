@@ -7,6 +7,7 @@ use tauri::{Emitter, Manager, RunEvent, Runtime, plugin::Builder as PluginBuilde
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
+mod builders;
 mod commands;
 mod decode;
 mod error;

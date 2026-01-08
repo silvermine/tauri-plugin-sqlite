@@ -94,7 +94,7 @@ times is safe (already-applied migrations are skipped).
 
 ### Attached Databases
 
-Attach other SQLite databases to enable cross-database queries. Attachments are
+Attach other SQLite databases to enable cross-database queries. Attached databases are
 connection-scoped and automatically detached when the guard is dropped.
 
 ```rust
@@ -175,8 +175,8 @@ returned to pool on drop.
 
 | Function | Description |
 | -------- | ----------- |
-| `acquire_reader_with_attached(db, specs)` | Acquire read connection with attached databases |
-| `acquire_writer_with_attached(db, specs)` | Acquire writer connection with attached databases |
+| `acquire_reader_with_attached(db, specs)` | Acquire read connection with attached database(s) |
+| `acquire_writer_with_attached(db, specs)` | Acquire writer connection with attached database(s) |
 
 Returns `AttachedConnection` or `AttachedWriteGuard` respectively. Both guards
 deref to `SqliteConnection` and automatically detach databases on drop.

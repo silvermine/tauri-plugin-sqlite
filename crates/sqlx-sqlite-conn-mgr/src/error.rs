@@ -33,6 +33,8 @@ pub enum Error {
    InvalidSchemaName(String),
 
    /// Attempted to attach the same database multiple times
-   #[error("Database '{0}' appears multiple times in attachment list (would cause deadlock)")]
-   DuplicateDatabaseAttachment(String),
+   #[error(
+      "Database '{0}' appears multiple times in attached database list (would cause deadlock)"
+   )]
+   DuplicateAttachedDatabase(String),
 }

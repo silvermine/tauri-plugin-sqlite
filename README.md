@@ -289,6 +289,67 @@ To rollback instead of committing:
 await tx.rollback()
 ```
 
+### Cross-Database Queries
+
+Attach other SQLite databases to run queries across multiple database files.
+Each attached database gets a schema name that acts as a namespace for its
+tables.
+
+**Builder Pattern:** All query methods (`execute`, `executeTransaction`,
+`fetchAll`, `fetchOne`) return builders that support `.attach()` for
+cross-database operations.
+
+```typescript
+// Join data from multiple databases
+const results = await db.fetchAll(
+   'SELECT u.name, o.total FROM users u JOIN orders.orders o ON u.id = o.user_id',
+   []
+).attach([
+   {
+      databasePath: 'orders.db',
+      schemaName: 'orders',
+      mode: 'readOnly'
+   }
+])
+
+// Update main database using data from attached database
+await db.execute(
+   'UPDATE todos SET status = $1 WHERE id IN (SELECT todo_id FROM archive.completed)',
+   ['archived']
+).attach([
+   {
+      databasePath: 'archive.db',
+      schemaName: 'archive',
+      mode: 'readOnly'
+   }
+])
+
+// Atomic writes across multiple databases
+await db.executeTransaction([
+   ['INSERT INTO main.orders (user_id, total) VALUES ($1, $2)', [userId, total]],
+   ['UPDATE stats.order_count SET count = count + 1', []]
+]).attach([
+   {
+      databasePath: 'stats.db',
+      schemaName: 'stats',
+      mode: 'readWrite'
+   }
+])
+```
+
+**Attached Database Modes:**
+
+   * `readOnly` - Read-only access (can be used with read or write operations)
+   * `readWrite` - Read-write access (requires write operation, holds write
+     lock)
+
+**Important:**
+
+   * Attached database(s) automatically detached after query completion
+   * Read-write attachments acquire write locks on all involved databases
+   * Attachments are connection-scoped and don't persist across queries
+   * Main database is always accessible without a schema prefix
+
 ### Error Handling
 
 ```typescript
@@ -315,9 +376,9 @@ Common error codes:
 ### Closing and Removing
 
 ```typescript
-await db.close()           // Close this connection
-await Database.closeAll()  // Close all connections
-await db.remove()          // Close and DELETE database file(s) - irreversible!
+await db.close()            // Close this connection
+await Database.close_all()  // Close all connections
+await db.remove()           // Close and DELETE database file(s) - irreversible!
 ```
 
 ## API Reference
@@ -328,7 +389,7 @@ await db.remove()          // Close and DELETE database file(s) - irreversible!
 | ------ | ----------- |
 | `Database.load(path, config?)` | Connect and return Database instance (or existing) |
 | `Database.get(path)` | Get instance without connecting (lazy init) |
-| `Database.closeAll()` | Close all database connections |
+| `Database.close_all()` | Close all database connections |
 
 ### Instance Methods
 
@@ -341,6 +402,16 @@ await db.remove()          // Close and DELETE database file(s) - irreversible!
 | `fetchOne<T>(query, values?)` | Execute SELECT, return single row or `undefined` |
 | `close()` | Close connection, returns `true` if was loaded |
 | `remove()` | Close and delete database file(s), returns `true` if was loaded |
+
+### Builder Methods
+
+All query methods (`execute`, `executeTransaction`, `fetchAll`, `fetchOne`)
+return builders that are directly awaitable and support method chaining:
+
+| Method | Description |
+| ------ | ----------- |
+| `attach(specs)` | Attach databases for cross-database queries, returns `this` |
+| `await builder` | Execute the query (builders implement `PromiseLike`) |
 
 ### InterruptibleTransaction Methods
 
@@ -362,6 +433,12 @@ interface WriteQueryResult {
 interface CustomConfig {
    maxReadConnections?: number  // default: 6
    idleTimeoutSecs?: number     // default: 30
+}
+
+interface AttachedDatabaseSpec {
+   databasePath: string  // Path relative to app config directory
+   schemaName: string    // Schema name for accessing tables (e.g., 'orders')
+   mode: 'readOnly' | 'readWrite'
 }
 
 interface SqliteError {

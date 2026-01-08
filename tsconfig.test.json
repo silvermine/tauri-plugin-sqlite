@@ -1,0 +1,31 @@
+{
+   "extends": "@silvermine/typescript-config/tsconfig.esm.json",
+   "references": [
+      {
+         "path": "./tsconfig.src.json"
+      }
+   ],
+   "include": [
+      "./*.ts",
+      "tests/**/*.ts",
+      "src/**/*.ts",
+      "guest-js/**/*.test.ts"
+   ],
+   "exclude": [
+      "./node_modules"
+   ],
+   "compilerOptions": {
+      "composite": true,
+      "noEmit": true,
+      "module": "ES2020",
+      "skipLibCheck": true,
+      "moduleResolution": "bundler",
+      "lib": [
+         "ES2020"
+      ],
+      "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+      "types": [
+         "vitest"
+      ]
+   }
+}

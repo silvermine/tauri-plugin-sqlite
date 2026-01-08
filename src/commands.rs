@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx_sqlite_conn_mgr::SqliteDatabaseConfig;
+use std::sync::Arc;
 use tauri::{AppHandle, Runtime, State};
 use uuid::Uuid;
 
@@ -34,6 +35,53 @@ pub enum TransactionAction {
    Continue { statements: Vec<Statement> },
    Commit,
    Rollback,
+}
+
+/// Serializable attached database specification for TypeScript interface
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedDatabaseSpec {
+   /// Path to the database to attach (must be loaded via `load()` first)
+   pub database_path: String,
+   /// Schema name to use for the attached database in queries
+   pub schema_name: String,
+   /// Access mode: "readOnly" or "readWrite"
+   pub mode: AttachedDatabaseMode,
+}
+
+/// Access mode for attached databases
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AttachedDatabaseMode {
+   ReadOnly,
+   ReadWrite,
+}
+
+/// Convert serializable specs to internal specs by resolving database references
+fn resolve_attached_specs(
+   specs: Vec<AttachedDatabaseSpec>,
+   db_instances: &std::collections::HashMap<String, DatabaseWrapper>,
+) -> Result<Vec<sqlx_sqlite_conn_mgr::AttachedSpec>> {
+   let mut resolved = Vec::new();
+
+   for spec in specs {
+      let wrapper = db_instances
+         .get(&spec.database_path)
+         .ok_or_else(|| Error::DatabaseNotLoaded(spec.database_path.clone()))?;
+
+      let mode = match spec.mode {
+         AttachedDatabaseMode::ReadOnly => sqlx_sqlite_conn_mgr::AttachedMode::ReadOnly,
+         AttachedDatabaseMode::ReadWrite => sqlx_sqlite_conn_mgr::AttachedMode::ReadWrite,
+      };
+
+      resolved.push(sqlx_sqlite_conn_mgr::AttachedSpec {
+         database: Arc::clone(wrapper.inner()),
+         schema_name: spec.schema_name,
+         mode,
+      });
+   }
+
+   Ok(resolved)
 }
 
 /// Load/connect to a database and store it in plugin state.
@@ -132,6 +180,7 @@ pub async fn execute(
    db: String,
    query: String,
    values: Vec<JsonValue>,
+   attached: Option<Vec<AttachedDatabaseSpec>>,
 ) -> Result<(u64, i64)> {
    let instances = db_instances.0.read().await;
 
@@ -139,7 +188,14 @@ pub async fn execute(
       .get(&db)
       .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
 
-   let result = wrapper.execute(query, values).await?;
+   let mut builder = wrapper.execute(query, values);
+
+   if let Some(specs) = attached {
+      let resolved_specs = resolve_attached_specs(specs, &instances)?;
+      builder = builder.attach(resolved_specs);
+   }
+
+   let result = builder.execute().await?;
 
    Ok((result.rows_affected, result.last_insert_id))
 }
@@ -151,6 +207,7 @@ pub async fn execute_transaction(
    regular_txs: State<'_, ActiveRegularTransactions>,
    db: String,
    statements: Vec<Statement>,
+   attached: Option<Vec<AttachedDatabaseSpec>>,
 ) -> Result<Vec<WriteQueryResult>> {
    let instances = db_instances.0.read().await;
 
@@ -167,13 +224,26 @@ pub async fn execute_transaction(
    // Generate unique key for tracking this transaction
    let tx_key = format!("{}:{}", db, Uuid::new_v4());
 
+   // Resolve attached specs if provided
+   let resolved_specs = if let Some(specs) = attached {
+      Some(resolve_attached_specs(specs, &instances)?)
+   } else {
+      None
+   };
+
    // Spawn transaction execution with abort handle for cleanup on exit
    let wrapper_clone = wrapper.clone();
    let tx_key_clone = tx_key.clone();
    let regular_txs_clone = regular_txs.inner().clone();
 
    let handle = tokio::spawn(async move {
-      let result = wrapper_clone.execute_transaction(stmt_tuples).await;
+      let mut builder = wrapper_clone.execute_transaction(stmt_tuples);
+
+      if let Some(specs) = resolved_specs {
+         builder = builder.attach(specs);
+      }
+
+      let result = builder.execute().await;
 
       // Remove from tracking when complete (even if result is Err)
       regular_txs_clone.remove(&tx_key_clone).await;
@@ -209,6 +279,7 @@ pub async fn fetch_all(
    db: String,
    query: String,
    values: Vec<JsonValue>,
+   attached: Option<Vec<AttachedDatabaseSpec>>,
 ) -> Result<Vec<IndexMap<String, JsonValue>>> {
    let instances = db_instances.0.read().await;
 
@@ -216,9 +287,16 @@ pub async fn fetch_all(
       .get(&db)
       .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
 
-   let rows = wrapper.fetch_all(query, values).await?;
+   let mut builder = wrapper.fetch_all(query, values);
 
-   Ok(rows)
+   if let Some(specs) = attached {
+      let resolved_specs = resolve_attached_specs(specs, &instances)?;
+      builder = builder.attach(resolved_specs);
+   }
+
+   let result = builder.execute().await?;
+
+   Ok(result)
 }
 
 /// Execute a SELECT query expecting zero or one result
@@ -228,6 +306,7 @@ pub async fn fetch_one(
    db: String,
    query: String,
    values: Vec<JsonValue>,
+   attached: Option<Vec<AttachedDatabaseSpec>>,
 ) -> Result<Option<IndexMap<String, JsonValue>>> {
    let instances = db_instances.0.read().await;
 
@@ -235,9 +314,16 @@ pub async fn fetch_one(
       .get(&db)
       .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
 
-   let row = wrapper.fetch_one(query, values).await?;
+   let mut builder = wrapper.fetch_one(query, values);
 
-   Ok(row)
+   if let Some(specs) = attached {
+      let resolved_specs = resolve_attached_specs(specs, &instances)?;
+      builder = builder.attach(resolved_specs);
+   }
+
+   let result = builder.execute().await?;
+
+   Ok(result)
 }
 
 /// Close a specific database connection
