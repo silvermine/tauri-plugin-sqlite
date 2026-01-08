@@ -292,6 +292,7 @@ async fn test_column_order_preserved() {
    db.execute("CREATE TABLE t (z TEXT, a TEXT, m TEXT)".into(), vec![])
       .await
       .unwrap();
+
    db.execute(
       "INSERT INTO t VALUES ($1, $2, $3)".into(),
       vec![json!("z"), json!("a"), json!("m")],

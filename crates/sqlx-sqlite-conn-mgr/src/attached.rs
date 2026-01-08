@@ -30,9 +30,9 @@ pub enum AttachedMode {
    ReadWrite,
 }
 
-/// Guard holding a read connection with attached databases
+/// Guard holding a read connection with attached database(s)
 ///
-/// **Important**: Call `detach_all()` before dropping to properly clean up attached databases.
+/// **Important**: Call `detach_all()` before dropping to properly clean up attached database(s).
 /// Without explicit cleanup, attached databases persist on the pooled connection until
 /// it's eventually closed. Derefs to `SqliteConnection` for executing queries.
 #[must_use = "if unused, the attached connection and locks are immediately dropped"]
@@ -100,7 +100,7 @@ impl Drop for AttachedReadConnection {
    }
 }
 
-/// Guard holding a write connection with attached databases
+/// Guard holding a write connection with attached database(s)
 ///
 /// **Important**: Call `detach_all()` before dropping to properly clean up attached databases.
 /// Without explicit cleanup, attached databases persist on the pooled connection until
@@ -189,7 +189,7 @@ fn is_valid_schema_name(name: &str) -> bool {
       && !name.chars().next().unwrap().is_ascii_digit()
 }
 
-/// Acquire a read connection with attached databases
+/// Acquire a read connection with attached database(s)
 ///
 /// This function:
 /// 1. Acquires a read connection from the main database's read pool
@@ -231,7 +231,7 @@ pub async fn acquire_reader_with_attached(
    for spec in &specs {
       let path = spec.database.path_str();
       if !seen_paths.insert(path.clone()) {
-         return Err(Error::DuplicateDatabaseAttachment(path));
+         return Err(Error::DuplicateAttachedDatabase(path));
       }
    }
 
@@ -261,7 +261,7 @@ pub async fn acquire_reader_with_attached(
    Ok(AttachedReadConnection::new(conn, Vec::new(), schema_names))
 }
 
-/// Acquire a write connection with attached databases
+/// Acquire a write connection with attached database(s)
 ///
 /// This function:
 /// 1. Acquires the write connection from the main database
@@ -320,7 +320,7 @@ pub async fn acquire_writer_with_attached(
    let mut seen_paths = HashSet::new();
    for (path, _) in &db_entries {
       if !seen_paths.insert(path.as_str()) {
-         return Err(Error::DuplicateDatabaseAttachment(path.clone()));
+         return Err(Error::DuplicateAttachedDatabase(path.clone()));
       }
    }
 
@@ -517,6 +517,7 @@ mod tests {
          .fetch_one(&mut *conn)
          .await
          .unwrap();
+
       let value1: String = row1.get(0);
       assert_eq!(value1, "test_data");
 
@@ -524,12 +525,13 @@ mod tests {
          .fetch_one(&mut *conn)
          .await
          .unwrap();
+
       let value2: String = row2.get(0);
       assert_eq!(value2, "test_data");
    }
 
    #[tokio::test]
-   async fn test_readwrite_attachment_holds_writer_lock() {
+   async fn test_attached_database_in_readwrite_mode_holds_writer_lock() {
       let temp_dir = TempDir::new().unwrap();
       let main_db = create_test_db("main.db", &temp_dir).await;
       let other_db = create_test_db("other.db", &temp_dir).await;
@@ -541,7 +543,7 @@ mod tests {
       }];
 
       // Acquire writer with attached database (holds other_db's writer)
-      let _attached_writer = acquire_writer_with_attached(&main_db, specs).await.unwrap();
+      let _guard = acquire_writer_with_attached(&main_db, specs).await.unwrap();
 
       // Try to acquire other_db's writer directly - should block/timeout
       let acquire_result = tokio::time::timeout(
@@ -571,7 +573,7 @@ mod tests {
 
       // Acquire and drop
       {
-         let _attached_writer = acquire_writer_with_attached(&main_db, specs).await.unwrap();
+         let _ = acquire_writer_with_attached(&main_db, specs).await.unwrap();
          // Dropped at end of scope
       }
 
@@ -646,7 +648,7 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn test_attached_sorting_prevents_deadlock() {
+   async fn test_sorting_attached_databases_prevents_deadlock() {
       let temp_dir = TempDir::new().unwrap();
       let main_db = create_test_db("main.db", &temp_dir).await;
       let db_a = create_test_db("a.db", &temp_dir).await;
@@ -675,7 +677,7 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn test_cross_database_attachment_no_deadlock() {
+   async fn test_attaching_same_databases_in_different_order_concurrently_no_deadlock() {
       // This test verifies the fix for the deadlock scenario:
       // Thread 1: main=A, attach B
       // Thread 2: main=B, attach A
@@ -765,7 +767,7 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn test_duplicate_database_rejected() {
+   async fn test_duplicate_attached_database_rejected() {
       let temp_dir = TempDir::new().unwrap();
       let main_db = create_test_db("main.db", &temp_dir).await;
       let other_db = create_test_db("other.db", &temp_dir).await;
@@ -786,8 +788,8 @@ mod tests {
 
       let result = acquire_writer_with_attached(&main_db, specs).await;
       assert!(
-         matches!(result, Err(Error::DuplicateDatabaseAttachment(_))),
-         "Should reject duplicate database attachment"
+         matches!(result, Err(Error::DuplicateAttachedDatabase(_))),
+         "Should reject duplicate attached database"
       );
    }
 
@@ -805,7 +807,7 @@ mod tests {
 
       let result = acquire_writer_with_attached(&main_db, specs).await;
       assert!(
-         matches!(result, Err(Error::DuplicateDatabaseAttachment(_))),
+         matches!(result, Err(Error::DuplicateAttachedDatabase(_))),
          "Should reject attaching main database to itself"
       );
    }

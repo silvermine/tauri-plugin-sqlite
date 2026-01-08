@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@tauri-apps/api/core';
 
 /**
  * Valid SQLite parameter binding value types.
@@ -10,20 +10,49 @@ import { invoke } from '@tauri-apps/api/core'
  * - `null` - NULL
  * - `Uint8Array` - BLOB (binary data)
  */
-export type SqlValue = string | number | boolean | null | Uint8Array
+export type SqlValue = string | number | boolean | null | Uint8Array;
+
+/**
+ * Access mode for attached database
+ */
+export type AttachedDatabaseMode = 'readOnly' | 'readWrite';
+
+/**
+ * Specification for attaching a database to a query
+ */
+export interface AttachedDatabaseSpec {
+
+   /**
+    * Path to the database to attach (must be loaded via `Database.load()` first)
+    */
+   databasePath: string;
+
+   /**
+    * Schema name to use for the attached database in queries
+    * (e.g., "orders" to query as "SELECT * FROM orders.table_name")
+    */
+   schemaName: string;
+
+   /**
+    * Access mode: "readOnly" or "readWrite"
+    */
+   mode: AttachedDatabaseMode;
+}
 
 /**
  * Result returned from write operations (INSERT, UPDATE, DELETE, etc.).
  */
 export interface WriteQueryResult {
+
    /** The number of rows affected by the write operation. */
-   rowsAffected: number
+   rowsAffected: number;
+
    /**
     * The last inserted row ID (SQLite ROWID).
     * Only set for INSERT operations on tables with a ROWID.
     * Tables created with WITHOUT ROWID will not set this value (returns 0).
     */
-   lastInsertId: number
+   lastInsertId: number;
 }
 
 /**
@@ -32,23 +61,29 @@ export interface WriteQueryResult {
  * All errors thrown by the plugin will have this structure.
  */
 export interface SqliteError {
+
    /** Machine-readable error code (e.g., "SQLITE_CONSTRAINT", "DATABASE_NOT_LOADED") */
-   code: string
+   code: string;
+
    /** Human-readable error message */
-   message: string
+   message: string;
 }
 
 /**
  * **InterruptibleTransaction**
  *
- * Represents an active interruptible transaction that can be continued, committed, or rolled back.
+ * Represents an active interruptible transaction that can be continued,
+ * committed, or rolled back.
  * Provides methods to read uncommitted data and execute additional statements.
  */
 export class InterruptibleTransaction {
-   constructor(
-      private readonly dbPath: string,
-      private readonly transactionId: string
-   ) {}
+   private readonly _dbPath: string;
+   private readonly _transactionId: string;
+
+   public constructor(dbPath: string, transactionId: string) {
+      this._dbPath = dbPath;
+      this._transactionId = transactionId;
+   }
 
    /**
     * **read**
@@ -65,7 +100,7 @@ export class InterruptibleTransaction {
     *
     * @example
     * ```ts
-    * const tx = await db.executeInterruptibleTransaction([
+    * let tx = await db.executeInterruptibleTransaction([
     *    ['INSERT INTO users (name) VALUES ($1)', ['Alice']]
     * ]);
     *
@@ -75,46 +110,50 @@ export class InterruptibleTransaction {
     * );
     * ```
     */
-   async read<T>(query: string, bindValues?: SqlValue[]): Promise<T> {
+   public async read<T>(query: string, bindValues?: SqlValue[]): Promise<T> {
       return await invoke<T>('plugin:sqlite|transaction_read', {
-         token: { dbPath: this.dbPath, transactionId: this.transactionId },
+         token: { dbPath: this._dbPath, transactionId: this._transactionId },
          query,
-         values: bindValues ?? []
-      })
+         values: bindValues ?? [],
+      });
    }
 
    /**
     * **continue**
     *
-    * Execute additional statements within this transaction and return a new transaction handle.
+    * Execute additional statements within this transaction and return a new
+    * transaction handle.
     *
     * @param statements - Array of [query, values?] tuples to execute
     * @returns Promise that resolves with a new transaction handle
     *
     * @example
     * ```ts
-    * const tx = await db.executeInterruptibleTransaction([...]);
-    * const tx2 = await tx.continue([
+    * let tx = await db.executeInterruptibleTransaction([...]);
+    * tx = await tx.continue([
     *    ['INSERT INTO users (name) VALUES ($1)', ['Bob']]
     * ]);
-    * await tx2.commit();
+    * await tx.commit();
     * ```
     */
-   async continue(statements: Array<[string, SqlValue[]?]>): Promise<InterruptibleTransaction> {
+   public async continue(statements: Array<[string, SqlValue[]?]>): Promise<InterruptibleTransaction> {
       const token = await invoke<{ dbPath: string; transactionId: string }>(
          'plugin:sqlite|transaction_continue',
          {
-            token: { dbPath: this.dbPath, transactionId: this.transactionId },
+            token: { dbPath: this._dbPath, transactionId: this._transactionId },
             action: {
                type: 'Continue',
-               statements: statements.map(([query, values]) => ({
-                  query,
-                  values: values ?? []
-               }))
-            }
+               statements: statements.map(([ query, values ]) => {
+                  return {
+                     query,
+                     values: values ?? [],
+                  };
+               }),
+            },
          }
-      )
-      return new InterruptibleTransaction(token.dbPath, token.transactionId)
+      );
+
+      return new InterruptibleTransaction(token.dbPath, token.transactionId);
    }
 
    /**
@@ -124,15 +163,16 @@ export class InterruptibleTransaction {
     *
     * @example
     * ```ts
-    * const tx = await db.executeInterruptibleTransaction([...]);
+    * let tx = await db.executeInterruptibleTransaction([...]);
+    * [...]
     * await tx.commit();
     * ```
     */
-   async commit(): Promise<void> {
+   public async commit(): Promise<void> {
       await invoke<void>('plugin:sqlite|transaction_continue', {
-         token: { dbPath: this.dbPath, transactionId: this.transactionId },
-         action: { type: 'Commit' }
-      })
+         token: { dbPath: this._dbPath, transactionId: this._transactionId },
+         action: { type: 'Commit' },
+      });
    }
 
    /**
@@ -142,15 +182,16 @@ export class InterruptibleTransaction {
     *
     * @example
     * ```ts
-    * const tx = await db.executeInterruptibleTransaction([...]);
+    * let tx = await db.executeInterruptibleTransaction([...]);
+    * [...]
     * await tx.rollback();
     * ```
     */
-   async rollback(): Promise<void> {
+   public async rollback(): Promise<void> {
       await invoke<void>('plugin:sqlite|transaction_continue', {
-         token: { dbPath: this.dbPath, transactionId: this.transactionId },
-         action: { type: 'Rollback' }
-      })
+         token: { dbPath: this._dbPath, transactionId: this._transactionId },
+         action: { type: 'Rollback' },
+      });
    }
 }
 
@@ -158,10 +199,12 @@ export class InterruptibleTransaction {
  * Custom configuration for SQLite database connection
  */
 export interface CustomConfig {
+
    /** Maximum number of concurrent read connections. Default: 6 */
-   maxReadConnections?: number
+   maxReadConnections?: number;
+
    /** Idle timeout in seconds for connections. Default: 30 */
-   idleTimeoutSecs?: number
+   idleTimeoutSecs?: number;
 }
 
 /**
@@ -174,6 +217,18 @@ export interface CustomConfig {
  * import { listen } from '@tauri-apps/api/event'
  * import type { MigrationEvent } from '@silvermine/tauri-plugin-sqlite'
  *
+ * // Get all migration events (including ones emitted before registering listener)
+ * const events = await db.getMigrationEvents()
+ * for (const event of events) {
+ *    console.log(`${event.status}: ${event.dbPath}`)
+ *    if (event.status === 'failed') {
+ *       console.error(`Migration error: ${event.error}`)
+ *    }
+ * }
+ *
+ * // Or...
+ *
+ * // Listen for real-time events (may miss early events)
  * await listen<MigrationEvent>('sqlite:migration', (event) => {
  *    const { dbPath, status, migrationCount, error } = event.payload
  *
@@ -192,14 +247,226 @@ export interface CustomConfig {
  * ```
  */
 export interface MigrationEvent {
+
    /** Database path (relative, as registered with the plugin) */
-   dbPath: string
+   dbPath: string;
+
    /** Status: "running", "completed", "failed" */
-   status: 'running' | 'completed' | 'failed'
-   /** Total number of migrations in the migrator (on "completed"), not just newly applied */
-   migrationCount?: number
+   status: 'running' | 'completed' | 'failed';
+
+   /**
+    * Total number of migrations in the migrator (on "completed"),
+    * not just newly applied
+    */
+   migrationCount?: number;
+
    /** Error message (on "failed") */
-   error?: string
+   error?: string;
+}
+
+/**
+ * Builder for SELECT queries returning multiple rows
+ */
+class FetchAllBuilder<T> implements PromiseLike<T> {
+   private readonly _db: Database;
+   private readonly _query: string;
+   private readonly _bindValues: SqlValue[];
+   private _attached: AttachedDatabaseSpec[];
+
+   public constructor(
+      db: Database,
+      query: string,
+      bindValues: SqlValue[],
+      attached: AttachedDatabaseSpec[] = []
+   ) {
+      this._db = db;
+      this._query = query;
+      this._bindValues = bindValues;
+      this._attached = attached;
+   }
+
+   /**
+    * Attach databases for cross-database queries
+    */
+   public attach(specs: AttachedDatabaseSpec[]): this {
+      this._attached = specs;
+      return this;
+   }
+
+   /**
+    * Make the builder directly awaitable
+    */
+   public then<TResult1 = T, TResult2 = never>(
+      onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+      onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
+   ): PromiseLike<TResult1 | TResult2> {
+      return this._execute().then(onfulfilled, onrejected);
+   }
+
+   private async _execute(): Promise<T> {
+      return await invoke<T>('plugin:sqlite|fetch_all', {
+         db: this._db.path,
+         query: this._query,
+         values: this._bindValues,
+         attached: this._attached.length > 0 ? this._attached : null,
+      });
+   }
+}
+
+/**
+ * Builder for SELECT queries returning zero or one row
+ */
+class FetchOneBuilder<T> implements PromiseLike<T | undefined> {
+   private readonly _db: Database;
+   private readonly _query: string;
+   private readonly _bindValues: SqlValue[];
+   private _attached: AttachedDatabaseSpec[];
+
+   public constructor(
+      db: Database,
+      query: string,
+      bindValues: SqlValue[],
+      attached: AttachedDatabaseSpec[] = []
+   ) {
+      this._db = db;
+      this._query = query;
+      this._bindValues = bindValues;
+      this._attached = attached;
+   }
+
+   /**
+    * Attach databases for cross-database queries
+    */
+   public attach(specs: AttachedDatabaseSpec[]): this {
+      this._attached = specs;
+      return this;
+   }
+
+   /**
+    * Make the builder directly awaitable
+    */
+   public then<TResult1 = T | undefined, TResult2 = never>(
+      onfulfilled?: ((value: T | undefined) => TResult1 | PromiseLike<TResult1>) | null,
+      onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
+   ): PromiseLike<TResult1 | TResult2> {
+      return this._execute().then(onfulfilled, onrejected);
+   }
+
+   private async _execute(): Promise<T | undefined> {
+      return await invoke<T | undefined>('plugin:sqlite|fetch_one', {
+         db: this._db.path,
+         query: this._query,
+         values: this._bindValues,
+         attached: this._attached.length > 0 ? this._attached : null,
+      });
+   }
+}
+
+/**
+ * Builder for write queries (INSERT, UPDATE, DELETE)
+ */
+class ExecuteBuilder implements PromiseLike<WriteQueryResult> {
+   private readonly _db: Database;
+   private readonly _query: string;
+   private readonly _bindValues: SqlValue[];
+   private _attached: AttachedDatabaseSpec[];
+
+   public constructor(
+      db: Database,
+      query: string,
+      bindValues: SqlValue[],
+      attached: AttachedDatabaseSpec[] = []
+   ) {
+      this._db = db;
+      this._query = query;
+      this._bindValues = bindValues;
+      this._attached = attached;
+   }
+
+   /**
+    * Attach databases for cross-database writes
+    */
+   public attach(specs: AttachedDatabaseSpec[]): this {
+      this._attached = specs;
+      return this;
+   }
+
+   /**
+    * Make the builder directly awaitable
+    */
+   public then<TResult1 = WriteQueryResult, TResult2 = never>(
+      onfulfilled?: ((value: WriteQueryResult) => TResult1 | PromiseLike<TResult1>) | null,
+      onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
+   ): PromiseLike<TResult1 | TResult2> {
+      return this._execute().then(onfulfilled, onrejected);
+   }
+
+   private async _execute(): Promise<WriteQueryResult> {
+      const [ rowsAffected, lastInsertId ] = await invoke<[number, number]>(
+         'plugin:sqlite|execute',
+         {
+            db: this._db.path,
+            query: this._query,
+            values: this._bindValues,
+            attached: this._attached.length > 0 ? this._attached : null,
+         }
+      );
+
+      return {
+         lastInsertId,
+         rowsAffected,
+      };
+   }
+}
+
+/**
+ * Builder for transaction operations
+ */
+class TransactionBuilder implements PromiseLike<WriteQueryResult[]> {
+   private readonly _db: Database;
+   private readonly _statements: Array<[string, SqlValue[]?]>;
+   private _attached: AttachedDatabaseSpec[];
+
+   public constructor(
+      db: Database,
+      statements: Array<[string, SqlValue[]?]>,
+      attached: AttachedDatabaseSpec[] = []
+   ) {
+      this._db = db;
+      this._statements = statements;
+      this._attached = attached;
+   }
+
+   /**
+    * Attach databases for cross-database transactions
+    */
+   public attach(specs: AttachedDatabaseSpec[]): this {
+      this._attached = specs;
+      return this;
+   }
+
+   /**
+    * Make the builder directly awaitable
+    */
+   public then<TResult1 = WriteQueryResult[], TResult2 = never>(
+      onfulfilled?: ((value: WriteQueryResult[]) => TResult1 | PromiseLike<TResult1>) | null,
+      onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
+   ): PromiseLike<TResult1 | TResult2> {
+      return this._execute().then(onfulfilled, onrejected);
+   }
+
+   private async _execute(): Promise<WriteQueryResult[]> {
+      return await invoke<WriteQueryResult[]>('plugin:sqlite|execute_transaction', {
+         db: this._db.path,
+         statements: this._statements.map(([ query, values ]) => {
+            return {
+               query,
+               values: values ?? [],
+            };
+         }),
+         attached: this._attached.length > 0 ? this._attached : null,
+      });
+   }
 }
 
 /**
@@ -209,9 +476,10 @@ export interface MigrationEvent {
  * communicating with SQLite databases through the plugin.
  */
 export default class Database {
-   path: string
-   constructor(path: string) {
-      this.path = path
+   public path: string;
+
+   public constructor(path: string) {
+      this.path = path;
    }
 
    /**
@@ -237,13 +505,16 @@ export default class Database {
     * });
     * ```
     */
-   static async load(path: string, customConfig?: CustomConfig): Promise<Database> {
-      const _path = await invoke<string>('plugin:sqlite|load', {
+   public static async load(
+      path: string,
+      customConfig?: CustomConfig
+   ): Promise<Database> {
+      const resolvedPath = await invoke<string>('plugin:sqlite|load', {
          db: path,
-         customConfig
-      })
+         customConfig,
+      });
 
-      return new Database(_path)
+      return new Database(resolvedPath);
    }
 
    /**
@@ -260,162 +531,181 @@ export default class Database {
     * const db = Database.get("test.db");
     * ```
     */
-   static get(path: string): Database {
-      return new Database(path)
+   public static get(path: string): Database {
+      return new Database(path);
+   }
+
+   /**
+    * **close_all**
+    *
+    * Closes connection pools for all databases.
+    *
+    * @example
+    * ```ts
+    * await Database.close_all()
+    * ```
+    */
+   public static async close_all(): Promise<void> {
+      await invoke<void>('plugin:sqlite|close_all');
    }
 
    /**
     * **execute**
     *
-    * Executes a write query against the database (INSERT, UPDATE, DELETE, etc.).
-    * This method is for mutations that modify data.
+    * Creates a builder for write queries (INSERT, UPDATE, DELETE, etc.).
+    * Returns a builder that can optionally attach databases before executing.
     *
     * For SELECT queries, use `fetchAll()` or `fetchOne()` instead.
     *
     * SQLite uses `$1`, `$2`, etc. for parameter binding.
     *
+    * @param query - SQL query to execute
+    * @param bindValues - Optional parameter values
+    *
     * @example
     * ```ts
-    * // INSERT example
+    * // Simple INSERT - directly awaitable
     * const result = await db.execute(
     *    "INSERT INTO todos (id, title, status) VALUES ($1, $2, $3)",
-    *    [todos.id, todos.title, todos.status]
+    *    [ todos.id, todos.title, todos.status ]
     * );
     * console.log(`Inserted ${result.rowsAffected} rows`);
-    * console.log(`Last insert ID: ${result.lastInsertId}`);
     *
-    * // UPDATE example
+    * // Cross-database UPDATE with attached database
     * const result = await db.execute(
-    *    "UPDATE todos SET title = $1, status = $2 WHERE id = $3",
-    *    [todos.title, todos.status, todos.id]
-    * );
+    *    "UPDATE todos SET status = $1 WHERE id IN " +
+    *    "(SELECT todo_id FROM archive.completed)",
+    *    [ "archived" ]
+    * ).attach([{
+    *    databasePath: "archive.db",
+    *    schemaName: "archive",
+    *    mode: "readOnly"
+    * }]);
     * ```
     */
-   async execute(query: string, bindValues?: SqlValue[]): Promise<WriteQueryResult> {
-      const [rowsAffected, lastInsertId] = await invoke<[number, number]>(
-         'plugin:sqlite|execute',
-         {
-            db: this.path,
-            query,
-            values: bindValues ?? []
-         }
-      )
-      return {
-         lastInsertId,
-         rowsAffected
-      }
+   public execute(query: string, bindValues?: SqlValue[]): ExecuteBuilder {
+      return new ExecuteBuilder(this, query, bindValues ?? []);
    }
 
    /**
     * **executeTransaction**
     *
-    * Executes multiple write statements atomically within a transaction.
+    * Creates a builder for executing multiple write statements atomically
+    * within a transaction.
     * All statements either succeed together or fail together.
     *
-    * **Use this method** when you have a batch of writes to execute and don't need to
-    * read data mid-transaction. For transactions that require reading uncommitted data
-    * to decide how to proceed, use `executeInterruptibleTransaction()` instead.
+    * **Use this method** when you have a batch of writes to execute and
+    * don't need to read data mid-transaction. For transactions that
+    * require reading uncommitted data to decide how to proceed, use
+    * `executeInterruptibleTransaction()` instead.
     *
     * The function automatically:
-    * - Begins a transaction (BEGIN)
+    * - Begins a transaction (BEGIN IMMEDIATE)
     * - Executes all statements in order
     * - Commits on success (COMMIT)
     * - Rolls back on any error (ROLLBACK)
     *
     * @param statements - Array of [query, values?] tuples to execute
-    * @returns Promise that resolves with results for each statement when all complete successfully
+    * @returns Builder that can attach databases and execute the transaction
     * @throws SqliteError if any statement fails (after rollback)
     *
     * @example
     * ```ts
-    * // Execute multiple inserts atomically
+    * // Execute multiple inserts atomically - directly awaitable
     * const results = await db.executeTransaction([
-    *    ['INSERT INTO users (name, email) VALUES ($1, $2)', ['Alice', 'alice@example.com']],
-    *    ['INSERT INTO audit_log (action, user) VALUES ($1, $2)', ['user_created', 'Alice']]
+    *    [
+    *       'INSERT INTO users (name, email) VALUES ($1, $2)',
+    *       [ 'Alice', 'alice@example.com' ],
+    *    ],
+    *    [
+    *       'INSERT INTO audit_log (action, user) VALUES ($1, $2)',
+    *       [ 'user_created', 'Alice' ],
+    *    ]
     * ]);
     * console.log(`User ID: ${results[0].lastInsertId}`);
-    * console.log(`Log rows affected: ${results[1].rowsAffected}`);
     *
-    * // Mixed operations
+    * // Cross-database transaction with attached database
     * const results = await db.executeTransaction([
-    *    ['UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, 1]],
-    *    ['UPDATE accounts SET balance = balance + $1 WHERE id = $2', [100, 2]],
-    *    ['INSERT INTO transfers (from_id, to_id, amount) VALUES ($1, $2, $3)', [1, 2, 100]]
-    * ]);
+    *    ['INSERT INTO main.orders (user_id, total) VALUES ($1, $2)', [userId, total]],
+    *    ['UPDATE archive.stats SET order_count = order_count + 1', []]
+    * ]).attach([{
+    *    databasePath: "archive.db",
+    *    schemaName: "archive",
+    *    mode: "readWrite"
+    * }]);
     * ```
     */
-   async executeTransaction(statements: Array<[string, SqlValue[]?]>): Promise<WriteQueryResult[]> {
-      return await invoke<WriteQueryResult[]>('plugin:sqlite|execute_transaction', {
-         db: this.path,
-         statements: statements.map(([query, values]) => ({
-            query,
-            values: values ?? []
-         }))
-      })
+   public executeTransaction(statements: Array<[string, SqlValue[]?]>): TransactionBuilder {
+      return new TransactionBuilder(this, statements);
    }
 
    /**
     * **fetchAll**
     *
-    * Passes in a SELECT query to the database for execution.
-    * Returns all matching rows as an array.
+    * Creates a builder for SELECT queries returning multiple rows.
+    * Returns a builder that can optionally attach databases before executing.
     *
     * SQLite uses `$1`, `$2`, etc. for parameter binding.
     *
+    * @param query - SQL SELECT query
+    * @param bindValues - Optional parameter values
+    *
     * @example
     * ```ts
+    * // Simple query - directly awaitable
     * const todos = await db.fetchAll<Todo[]>(
     *    "SELECT * FROM todos WHERE id = $1",
     *    [id]
     * );
     *
-    * // Multiple parameters
-    * const result = await db.fetchAll(
-    *    "SELECT * FROM todos WHERE status = $1 AND priority > $2",
-    *    ["active", 5]
-    * );
+    * // Cross-database query with attached database
+    * const results = await db.fetchAll(
+    *    "SELECT u.name, o.total FROM users u JOIN orders.orders o ON u.id = o.user_id",
+    *    []
+    * ).attach([{
+    *    databasePath: "orders.db",
+    *    schemaName: "orders",
+    *    mode: "readOnly"
+    * }]);
     * ```
     */
-   async fetchAll<T>(query: string, bindValues?: SqlValue[]): Promise<T> {
-      const result = await invoke<T>('plugin:sqlite|fetch_all', {
-         db: this.path,
-         query,
-         values: bindValues ?? []
-      })
-
-      return result
+   public fetchAll<T>(query: string, bindValues?: SqlValue[]): FetchAllBuilder<T> {
+      return new FetchAllBuilder<T>(this, query, bindValues ?? []);
    }
 
    /**
     * **fetchOne**
     *
-    * Passes in a SELECT query expecting zero or one result.
+    * Creates a builder for SELECT queries expecting zero or one result.
     * Returns `undefined` if no rows match the query.
+    * Returns a builder that can optionally attach databases before executing.
     *
     * SQLite uses `$1`, `$2`, etc. for parameter binding.
     *
+    * @param query - SQL SELECT query
+    * @param bindValues - Optional parameter values
+    *
     * @example
     * ```ts
+    * // Simple query - directly awaitable
     * const todo = await db.fetchOne<Todo>(
     *    "SELECT * FROM todos WHERE id = $1",
     *    [id]
     * );
     *
-    * if (todo) {
-    *    console.log(todo.title);
-    * } else {
-    *    console.log("Todo not found");
-    * }
+    * // Cross-database query with attached database
+    * const summary = await db.fetchOne(
+    *    "SELECT COUNT(*) as total FROM users u JOIN orders.orders o ON u.id = o.user_id",
+    *    []
+    * ).attach([{
+    *    databasePath: "orders.db",
+    *    schemaName: "orders",
+    *    mode: "readOnly"
+    * }]);
     * ```
     */
-   async fetchOne<T>(query: string, bindValues?: SqlValue[]): Promise<T | undefined> {
-      const result = await invoke<T | undefined>('plugin:sqlite|fetch_one', {
-         db: this.path,
-         query,
-         values: bindValues ?? []
-      })
-
-      return result
+   public fetchOne<T>(query: string, bindValues?: SqlValue[]): FetchOneBuilder<T> {
+      return new FetchOneBuilder<T>(this, query, bindValues ?? []);
    }
 
    /**
@@ -436,25 +726,12 @@ export default class Database {
     * }
     * ```
     */
-   async close(): Promise<boolean> {
+   public async close(): Promise<boolean> {
       const success = await invoke<boolean>('plugin:sqlite|close', {
-         db: this.path
-      })
-      return success
-   }
+         db: this.path,
+      });
 
-   /**
-    * **closeAll**
-    *
-    * Closes connection pools for all databases.
-    *
-    * @example
-    * ```ts
-    * await Database.closeAll()
-    * ```
-    */
-   static async closeAll(): Promise<void> {
-      await invoke<void>('plugin:sqlite|close_all')
+      return success;
    }
 
    /**
@@ -463,7 +740,8 @@ export default class Database {
     * Closes the database connection pool and deletes all database files
     * (including the main database file, and any WAL/SHM files).
     *
-    * **Warning:** This permanently deletes the database files from disk. Use with caution!
+    * **Warning:** This permanently deletes the database files from disk.
+    * Use with caution!
     *
     * @returns `true` if the database was loaded and successfully removed,
     *          `false` if the database was not loaded (nothing to remove)
@@ -478,19 +756,21 @@ export default class Database {
     * }
     * ```
     */
-   async remove(): Promise<boolean> {
+   public async remove(): Promise<boolean> {
       const success = await invoke<boolean>('plugin:sqlite|remove', {
-         db: this.path
-      })
-      return success
+         db: this.path,
+      });
+
+      return success;
    }
 
    /**
     * **executeInterruptibleTransaction**
     *
-    * Begins an interruptible transaction for cases where you need to **read data mid-transaction
-    * to decide how to proceed**. For example, inserting a record and then reading its
-    * generated ID or computed values before continuing with related writes.
+    * Begins an interruptible transaction for cases where you need to
+    * **read data mid-transaction to decide how to proceed**. For example,
+    * inserting a record and then reading its generated ID or computed
+    * values before continuing with related writes.
     *
     * The transaction remains open, holding a write lock on the database, until you
     * call `commit()` or `rollback()` on the returned transaction handle.
@@ -513,7 +793,7 @@ export default class Database {
     * @example
     * ```ts
     * // Insert an order and read back its ID
-    * const tx = await db.executeInterruptibleTransaction([
+    * let tx = await db.executeInterruptibleTransaction([
     *    ['INSERT INTO orders (user_id, total) VALUES ($1, $2)', [userId, 0]]
     * ]);
     *
@@ -525,27 +805,33 @@ export default class Database {
     * const orderId = orders[0].id;
     *
     * // Use the ID in subsequent writes
-    * const tx2 = await tx.continue([
-    *    ['INSERT INTO order_items (order_id, product_id) VALUES ($1, $2)', [orderId, productId]]
+    * tx = await tx.continue([
+    *    [
+    *       'INSERT INTO order_items (order_id, product_id) VALUES ($1, $2)',
+    *       [ orderId, productId ],
+    *    ]
     * ]);
     *
-    * await tx2.commit();
+    * await tx.commit();
     * ```
     */
-   async executeInterruptibleTransaction(
+   public async executeInterruptibleTransaction(
       initialStatements: Array<[string, SqlValue[]?]>
    ): Promise<InterruptibleTransaction> {
       const token = await invoke<{ dbPath: string; transactionId: string }>(
          'plugin:sqlite|execute_interruptible_transaction',
          {
             db: this.path,
-            initialStatements: initialStatements.map(([query, values]) => ({
-               query,
-               values: values ?? []
-            }))
+            initialStatements: initialStatements.map(([ query, values ]) => {
+               return {
+                  query,
+                  values: values ?? [],
+               };
+            }),
          }
-      )
-      return new InterruptibleTransaction(token.dbPath, token.transactionId)
+      );
+
+      return new InterruptibleTransaction(token.dbPath, token.transactionId);
    }
 
    /**
@@ -573,9 +859,9 @@ export default class Database {
     * }
     * ```
     */
-   async getMigrationEvents(): Promise<MigrationEvent[]> {
+   public async getMigrationEvents(): Promise<MigrationEvent[]> {
       return await invoke<MigrationEvent[]>('plugin:sqlite|get_migration_events', {
-         db: this.path
-      })
+         db: this.path,
+      });
    }
 }

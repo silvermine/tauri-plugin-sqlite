@@ -2,10 +2,8 @@ use std::fs::create_dir_all;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx::{Column, Executor, Row};
 use sqlx_sqlite_conn_mgr::{SqliteDatabase, SqliteDatabaseConfig};
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -30,6 +28,11 @@ pub struct DatabaseWrapper {
 }
 
 impl DatabaseWrapper {
+   /// Get the inner Arc<SqliteDatabase> for advanced usage
+   pub(crate) fn inner(&self) -> &Arc<SqliteDatabase> {
+      &self.inner
+   }
+
    /// Acquire writer connection (for pausable transactions)
    pub async fn acquire_writer(&self) -> Result<sqlx_sqlite_conn_mgr::WriteGuard, Error> {
       Ok(self.inner.acquire_writer().await?)
@@ -65,28 +68,28 @@ impl DatabaseWrapper {
       Ok(Self { inner: db })
    }
 
-   /// Execute a write query (INSERT/UPDATE/DELETE)
-   pub async fn execute(
-      &self,
-      query: String,
-      values: Vec<JsonValue>,
-   ) -> Result<WriteQueryResult, Error> {
-      // Acquire writer for mutations
-      let mut writer = self.inner.acquire_writer().await?;
-
-      let mut q = sqlx::query(&query);
-      for value in values {
-         q = bind_value(q, value);
-      }
-
-      let result = q.execute(&mut *writer).await?;
-      Ok(WriteQueryResult {
-         rows_affected: result.rows_affected(),
-         last_insert_id: result.last_insert_rowid(),
-      })
+   /// Create a builder for write queries (INSERT/UPDATE/DELETE)
+   ///
+   /// Returns a builder that can optionally attach databases before executing.
+   ///
+   /// # Example
+   ///
+   /// ```ignore
+   /// // Without attached databases
+   /// db.execute(sql, params).await?;
+   ///
+   /// // With attached database(s)
+   /// db.execute(sql, params)
+   ///   .attach(vec![spec1, spec2])
+   ///   .await?;
+   /// ```
+   pub fn execute(&self, query: String, values: Vec<JsonValue>) -> crate::builders::ExecuteBuilder {
+      crate::builders::ExecuteBuilder::new(Arc::clone(&self.inner), query, values)
    }
 
-   /// Execute multiple write statements atomically within a transaction.
+   /// Create a builder for transaction execution
+   ///
+   /// Returns a builder that can optionally attach databases before executing.
    ///
    /// This method:
    /// 1. Begins a transaction (BEGIN)
@@ -95,124 +98,71 @@ impl DatabaseWrapper {
    /// 4. Rolls back on any error (ROLLBACK)
    ///
    /// The writer is held for the entire transaction, ensuring atomicity.
-   /// Returns the result of each statement execution.
-   pub async fn execute_transaction(
+   ///
+   /// # Example
+   ///
+   /// ```ignore
+   /// // Without attached databases
+   /// db.execute_transaction(statements).await?;
+   ///
+   /// // With attached database(s)
+   /// db.execute_transaction(statements)
+   ///   .attach(vec![spec1, spec2])
+   ///   .await?;
+   /// ```
+   pub fn execute_transaction(
       &self,
       statements: Vec<(String, Vec<JsonValue>)>,
-   ) -> Result<Vec<WriteQueryResult>, Error> {
-      // Acquire writer for the entire transaction
-      let mut writer = self.inner.acquire_writer().await?;
-
-      // Begin transaction
-      sqlx::query("BEGIN IMMEDIATE").execute(&mut *writer).await?;
-
-      // Execute all statements, collecting results and rolling back on error
-      let result = async {
-         let mut results = Vec::new();
-         for (query, values) in statements {
-            let mut q = sqlx::query(&query);
-            for value in values {
-               q = bind_value(q, value);
-            }
-            let exec_result = q.execute(&mut *writer).await?;
-            results.push(WriteQueryResult {
-               rows_affected: exec_result.rows_affected(),
-               last_insert_id: exec_result.last_insert_rowid(),
-            });
-         }
-         Ok::<Vec<WriteQueryResult>, Error>(results)
-      }
-      .await;
-
-      // Commit or rollback based on result
-      match result {
-         Ok(results) => {
-            sqlx::query("COMMIT").execute(&mut *writer).await?;
-            Ok(results)
-         }
-         Err(e) => {
-            match sqlx::query("ROLLBACK").execute(&mut *writer).await {
-               // Rollback succeeded, return original error
-               Ok(_) => Err(e),
-
-               // Rollback also failed, return the rollback error and the original error
-               Err(rollback_err) => Err(Error::TransactionRollbackFailed {
-                  transaction_error: e.to_string(),
-                  rollback_error: rollback_err.to_string(),
-               }),
-            }
-         }
-      }
+   ) -> crate::builders::TransactionBuilder {
+      crate::builders::TransactionBuilder::new(Arc::clone(&self.inner), statements)
    }
 
-   /// Execute a SELECT query, possibly returning multiple rows
-   pub async fn fetch_all(
+   /// Create a builder for SELECT queries returning multiple rows
+   ///
+   /// Returns a builder that can optionally attach databases before executing.
+   ///
+   /// # Example
+   ///
+   /// ```ignore
+   /// // Without attached databases
+   /// db.fetch_all(sql, params).await?;
+   ///
+   /// // With attached database(s)
+   /// db.fetch_all(sql, params)
+   ///   .attach(vec![spec1, spec2])
+   ///   .await?;
+   /// ```
+   pub fn fetch_all(
       &self,
       query: String,
       values: Vec<JsonValue>,
-   ) -> Result<Vec<IndexMap<String, JsonValue>>, Error> {
-      // Use read pool for queries
-      let pool = self.inner.read_pool()?;
-
-      let mut q = sqlx::query(&query);
-      for value in values {
-         q = bind_value(q, value);
-      }
-
-      let rows = pool.fetch_all(q).await?;
-
-      // Decode rows to JSON
-      let mut values = Vec::new();
-      for row in rows {
-         let mut value = IndexMap::default();
-         for (i, column) in row.columns().iter().enumerate() {
-            let v = row.try_get_raw(i)?;
-            let v = crate::decode::to_json(v)?;
-            value.insert(column.name().to_string(), v);
-         }
-         values.push(value);
-      }
-
-      Ok(values)
+   ) -> crate::builders::FetchAllBuilder {
+      crate::builders::FetchAllBuilder::new(Arc::clone(&self.inner), query, values)
    }
 
-   /// Execute a SELECT query expecting zero or one result
+   /// Create a builder for SELECT queries returning zero or one row
+   ///
+   /// Returns a builder that can optionally attach databases before executing.
    ///
    /// Returns an error if the query returns more than one row.
-   pub async fn fetch_one(
+   ///
+   /// # Example
+   ///
+   /// ```ignore
+   /// // Without attached databases
+   /// db.fetch_one(sql, params).await?;
+   ///
+   /// // With attached database(s)
+   /// db.fetch_one(sql, params)
+   ///   .attach(vec![spec1, spec2])
+   ///   .await?;
+   /// ```
+   pub fn fetch_one(
       &self,
       query: String,
       values: Vec<JsonValue>,
-   ) -> Result<Option<IndexMap<String, JsonValue>>, Error> {
-      // Use read pool for queries
-      let pool = self.inner.read_pool()?;
-
-      let mut q = sqlx::query(&query);
-      for value in values {
-         q = bind_value(q, value);
-      }
-
-      let rows = pool.fetch_all(q).await?;
-
-      // Validate row count
-      match rows.len() {
-         0 => Ok(None),
-         1 => {
-            // Decode single row to JSON
-            let row = &rows[0];
-            let mut value = IndexMap::default();
-            for (i, column) in row.columns().iter().enumerate() {
-               let v = row.try_get_raw(i)?;
-               let v = crate::decode::to_json(v)?;
-               value.insert(column.name().to_string(), v);
-            }
-            Ok(Some(value))
-         }
-         count => {
-            // Multiple rows returned - this is an error
-            Err(Error::MultipleRowsReturned(count))
-         }
-      }
+   ) -> crate::builders::FetchOneBuilder {
+      crate::builders::FetchOneBuilder::new(Arc::clone(&self.inner), query, values)
    }
 
    /// Run database migrations
