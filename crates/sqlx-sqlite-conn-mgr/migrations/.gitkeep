@@ -1,0 +1,2 @@
+# Placeholder migrations directory for doctest compilation
+# sqlx::migrate! requires a migrations directory to exist at compile time

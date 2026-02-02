@@ -15,7 +15,9 @@ mod transactions;
 mod wrapper;
 
 pub use error::{Error, Result};
-pub use sqlx_sqlite_conn_mgr::Migrator as SqliteMigrator;
+pub use sqlx_sqlite_conn_mgr::{
+   AttachedMode, AttachedSpec, Migrator as SqliteMigrator, SqliteDatabaseConfig,
+};
 pub use transactions::{ActiveInterruptibleTransactions, ActiveRegularTransactions, Statement};
 pub use wrapper::{
    DatabaseWrapper, InterruptibleTransaction, InterruptibleTransactionBuilder,

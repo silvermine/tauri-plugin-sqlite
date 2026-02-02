@@ -571,35 +571,50 @@ tx.commit().await?;
 
 ### Cross-Database Operations
 
-Attach other databases for cross-database queries:
+Attach other databases for cross-database queries. For Rust API usage, you need to load
+both databases first, then create `AttachedSpec` instances using their inner database
+references:
 
 ```rust
-use tauri_plugin_sqlite::AttachedDatabaseSpec;
+use tauri_plugin_sqlite::{DatabaseWrapper, AttachedSpec, AttachedMode};
+use std::sync::Arc;
+
+// Load both databases
+let main_db = DatabaseWrapper::load("/path/to/main.db".into(), None).await?;
+let stats_db = DatabaseWrapper::load("/path/to/stats.db".into(), None).await?;
+
+// Create attached spec using the inner database reference
+let stats_spec = AttachedSpec {
+    database: Arc::clone(stats_db.inner()),
+    schema_name: "stats".to_string(),
+    mode: AttachedMode::ReadWrite,
+};
 
 // Simple transaction with attached database
-let results = db.execute_transaction(vec![
+let results = main_db.execute_transaction(vec![
     ("INSERT INTO main.orders (user_id) VALUES (?)", vec![json!(1)]),
     ("UPDATE stats.order_count SET count = count + 1", vec![]),
 ])
-.attach(vec![AttachedDatabaseSpec {
-    database_path: "stats.db".into(),
-    schema_name: "stats".into(),
-    mode: tauri_plugin_sqlite::AttachedDatabaseMode::ReadWrite,
-}])
+.attach(vec![stats_spec])
 .await?;
-
 println!("Cross-database transaction completed: {} statements", results.len());
 
 // Interruptible transaction with attached database
+// Load the inventory database
+let inventory_db = DatabaseWrapper::load("/path/to/inventory.db".into(), None).await?;
+
+// Create spec for inventory database
+let inv_spec = AttachedSpec {
+    database: Arc::clone(inventory_db.inner()),
+    schema_name: "inv".to_string(),
+    mode: AttachedMode::ReadWrite,
+};
+
 // Assuming product_id is defined in your application context
 let product_id = 789;
 
-let _tx = db.begin_interruptible_transaction()
-    .attach(vec![AttachedDatabaseSpec {
-        database_path: "inventory.db".into(),
-        schema_name: "inv".into(),
-        mode: tauri_plugin_sqlite::AttachedDatabaseMode::ReadWrite,
-    }])
+let _tx = main_db.begin_interruptible_transaction()
+    .attach(vec![inv_spec])
     .execute(vec![
         ("UPDATE inv.stock SET quantity = quantity - ? WHERE product_id = ?", vec![json!(1), json!(product_id)]),
     ])

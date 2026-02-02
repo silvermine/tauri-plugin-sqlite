@@ -29,7 +29,28 @@ pub struct DatabaseWrapper {
 
 impl DatabaseWrapper {
    /// Get the inner Arc<SqliteDatabase> for advanced usage
-   pub(crate) fn inner(&self) -> &Arc<SqliteDatabase> {
+   ///
+   /// This is useful when you need to create `AttachedSpec` instances for cross-database
+   /// operations with interruptible transactions.
+   ///
+   /// # Example
+   ///
+   /// ```no_run
+   /// # use tauri_plugin_sqlite::{DatabaseWrapper, AttachedSpec, AttachedMode};
+   /// # use std::sync::Arc;
+   /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+   /// # let db1: DatabaseWrapper = todo!();
+   /// # let db2: DatabaseWrapper = todo!();
+   /// // Create an attached spec using the inner database reference
+   /// let spec = AttachedSpec {
+   ///     database: Arc::clone(db2.inner()),
+   ///     schema_name: "other".to_string(),
+   ///     mode: AttachedMode::ReadOnly,
+   /// };
+   /// # Ok(())
+   /// # }
+   /// ```
+   pub fn inner(&self) -> &Arc<SqliteDatabase> {
       &self.inner
    }
 
@@ -50,7 +71,7 @@ impl DatabaseWrapper {
    /// # Example
    ///
    /// ```no_run
-   /// # use tauri_plugin_sqlite::DatabaseWrapper;
+   /// # use tauri_plugin_sqlite::{DatabaseWrapper, Statement};
    /// # use serde_json::json;
    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
    /// # let db: DatabaseWrapper = todo!();
@@ -64,7 +85,7 @@ impl DatabaseWrapper {
    ///
    /// // Continue with more work
    /// let results = tx.continue_with(vec![
-   ///    crate::transactions::Statement {
+   ///    Statement {
    ///       query: "INSERT INTO items (name) VALUES (?)".to_string(),
    ///       values: vec![json!("item1")],
    ///    }
