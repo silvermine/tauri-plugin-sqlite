@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
    "crates/sqlx-sqlite-conn-mgr",
+   "crates/sqlx-sqlite-observer",
 ]
 
 [package]
