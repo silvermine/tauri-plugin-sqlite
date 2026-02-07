@@ -95,6 +95,8 @@ This ensures subscribers **only receive notifications for committed changes**.
 ### Core Types
 
    * **`TableChange`**: Notification of a change to a database table
+   * **`TableChangeEvent`**: Event yielded by `TableChangeStream` —
+     either `Change(TableChange)` or `Lagged(u64)`
    * **`ChangeOperation`**: Insert, Update, or Delete
    * **`ColumnValue`**: Typed column value (Null, Integer, Real, Text, Blob)
    * **`ObserverConfig`**: Configuration for table filtering and channel
@@ -111,7 +113,7 @@ This ensures subscribers **only receive notifications for committed changes**.
    * **`TableChangeStreamExt`**: Extension trait for converting receivers to
      streams
 
-### SQLx SQLite Connection Manager Integration (feature: `conn-mgr`) <!-- COMING SOON -->
+### SQLx SQLite Connection Manager Integration (feature: `conn-mgr`)
 
    * **`ObservableSqliteDatabase`**: Wrapper for `SqliteDatabase` with observation
    * **`ObservableWriteGuard`**: Write guard with hooks registered
@@ -179,7 +181,7 @@ meaningful/correct for non-integer or composite primary keys.
 
 ### Basic Usage
 
-```rust,no_run
+```rust
 use sqlx::SqlitePool;
 use sqlx_sqlite_observer::{SqliteObserver, ObserverConfig, ColumnValue};
 
@@ -219,10 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Stream API
 
-```rust,no_run
+```rust
 use futures::StreamExt;
 use sqlx::SqlitePool;
-use sqlx_sqlite_observer::{SqliteObserver, ObserverConfig};
+use sqlx_sqlite_observer::{
+    SqliteObserver, ObserverConfig, TableChangeEvent,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -232,13 +236,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = observer.subscribe_stream(["users"]);
 
-    while let Some(change) = stream.next().await {
-        println!(
-            "Table {} row {} was {:?}",
-            change.table,
-            change.rowid.unwrap_or(-1),
-            change.operation
-        );
+    while let Some(event) = stream.next().await {
+        match event {
+            TableChangeEvent::Change(change) => {
+                println!(
+                    "Table {} row {} was {:?}",
+                    change.table,
+                    change.rowid.unwrap_or(-1),
+                    change.operation
+                );
+            }
+            TableChangeEvent::Lagged(n) => {
+                eprintln!("Missed {} notifications", n);
+            }
+        }
     }
 
     Ok(())
@@ -247,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Value Capture
 
-```rust,no_run
+```rust
 use sqlx::SqlitePool;
 use sqlx_sqlite_observer::{SqliteObserver, ObserverConfig, ColumnValue};
 
@@ -284,7 +295,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### SQLx SQLite Connection Manager Integration
 
-<!-- TODO: Add example showing ObservableSqliteDatabase usage -->
+```rust
+use std::sync::Arc;
+use sqlx_sqlite_conn_mgr::SqliteDatabase;
+use sqlx_sqlite_observer::{
+    ObservableSqliteDatabase, ObserverConfig,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = SqliteDatabase::connect("mydb.db", None).await?;
+    let config = ObserverConfig::new().with_tables(["users"]);
+    let observable = ObservableSqliteDatabase::new(db, config);
+
+    let mut rx = observable.subscribe(["users"]);
+
+    // Write through the observable writer
+    let mut writer = observable.acquire_writer().await?;
+    sqlx::query("BEGIN").execute(&mut *writer).await?;
+    sqlx::query("INSERT INTO users (name) VALUES (?)")
+        .bind("Alice")
+        .execute(&mut *writer)
+        .await?;
+    sqlx::query("COMMIT").execute(&mut *writer).await?;
+
+    // Notification arrives after commit
+    let change = rx.recv().await?;
+    println!("Changed: {}", change.table);
+
+    Ok(())
+}
+```
 
 ## Usage Notes
 
@@ -300,6 +341,58 @@ let config = ObserverConfig::new()
     .with_tables(["users", "posts"])
     .with_channel_capacity(1000); // Handle large transactions
 ```
+
+### Handling Lag
+
+When using the Stream API, the stream yields `TableChangeEvent` values.
+Most events are `Change` variants, but if a consumer falls behind, the
+stream yields a `Lagged(n)` event indicating how many notifications
+were missed.
+
+```rust
+use futures::StreamExt;
+use sqlx_sqlite_observer::TableChangeEvent;
+# use sqlx_sqlite_observer::{SqliteObserver, ObserverConfig};
+# async fn example(observer: SqliteObserver) {
+
+let mut stream = observer.subscribe_stream(["users"]);
+
+while let Some(event) = stream.next().await {
+    match event {
+        TableChangeEvent::Change(change) => {
+            // Process the change normally
+        }
+        TableChangeEvent::Lagged(n) => {
+            // n notifications were missed — local state may be stale.
+            // Re-query the database for current state.
+            tracing::warn!("Missed {} change notifications", n);
+        }
+    }
+}
+# }
+```
+
+**When does lag happen?** The broadcast channel has a fixed capacity
+(default 256). Lag occurs when the oldest unread messages are
+overwritten. This can happen in two ways:
+
+   * A subscriber processes changes slower than they arrive
+   * A single transaction contains more mutating statements than the
+     channel capacity, causing messages to be overwritten before the
+     consumer reads them
+
+This is rare under normal conditions but can occur during bulk
+writes or large transactions.
+
+**How to prevent it:**
+
+   * Increase `channel_capacity` via `ObserverConfig::with_channel_capacity`
+   * Process changes faster (avoid blocking in the stream consumer)
+   * Use a dedicated task for stream consumption
+
+**Note:** The `broadcast::Receiver` API (from `subscribe()`) surfaces
+lag as `RecvError::Lagged(n)` — the same information, just through
+the raw tokio broadcast channel interface rather than the stream.
 
 ### Disabling Value Capture
 

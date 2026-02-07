@@ -15,6 +15,11 @@ pub enum Error {
    #[error("Failed to acquire connection from pool")]
    PoolAcquire,
 
+   /// Connection manager error.
+   #[cfg(feature = "conn-mgr")]
+   #[error("Connection manager error: {0}")]
+   ConnMgr(#[from] sqlx_sqlite_conn_mgr::Error),
+
    /// Database error (non-sqlx).
    #[error("Database error: {0}")]
    Database(String),

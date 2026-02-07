@@ -6,7 +6,7 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
 
-use crate::change::TableChange;
+use crate::change::{TableChange, TableChangeEvent};
 
 /// A filtered stream of table change notifications.
 ///
@@ -32,7 +32,7 @@ impl TableChangeStream {
 }
 
 impl Stream for TableChangeStream {
-   type Item = TableChange;
+   type Item = TableChangeEvent;
 
    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
       loop {
@@ -46,15 +46,17 @@ impl Stream for TableChangeStream {
                {
                   continue;
                }
-               return Poll::Ready(Some(change));
+               return Poll::Ready(Some(TableChangeEvent::Change(change)));
             }
-            Poll::Ready(Some(Err(err))) => {
-               // Lagged error - missed some messages due to slow consumption
+            Poll::Ready(Some(Err(
+               tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(count),
+            ))) => {
                warn!(
-                  error = %err,
-                  "Stream lagged — missed change notifications. Consider increasing channel_capacity."
+                  missed = count,
+                  "Stream lagged — missed change notifications. \
+                   Consider increasing channel_capacity."
                );
-               continue;
+               return Poll::Ready(Some(TableChangeEvent::Lagged(count)));
             }
             Poll::Ready(None) => return Poll::Ready(None),
             Poll::Pending => return Poll::Pending,

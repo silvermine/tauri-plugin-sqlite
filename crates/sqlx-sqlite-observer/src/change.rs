@@ -100,6 +100,30 @@ impl ColumnValue {
    }
 }
 
+/// Event yielded by [`TableChangeStream`](crate::stream::TableChangeStream).
+///
+/// Most events are `Change` variants containing the actual table change data.
+/// A `Lagged` event indicates the consumer fell behind and missed some
+/// notifications — consider increasing
+/// [`channel_capacity`](crate::config::ObserverConfig::channel_capacity).
+#[derive(Debug, Clone)]
+pub enum TableChangeEvent {
+   /// A table change notification.
+   Change(TableChange),
+   /// The stream fell behind and missed `n` change notifications.
+   ///
+   /// This can happen when:
+   /// - The consumer is processing changes too slowly relative to the
+   ///   rate of database writes.
+   /// - A single transaction contains more mutating statements than the
+   ///   channel capacity, causing older messages to be overwritten before
+   ///   the consumer reads them.
+   ///
+   /// When this happens, the consumer should assume its local state may
+   /// be stale and re-query the database for the current state.
+   Lagged(u64),
+}
+
 /// Notification of a change to a database table.
 ///
 /// Contains the table name, operation type, affected rowid, and the

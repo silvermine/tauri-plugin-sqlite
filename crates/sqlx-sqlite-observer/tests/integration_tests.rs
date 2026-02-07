@@ -391,8 +391,15 @@ async fn test_stream_receives_notifications() {
    let result = timeout(Duration::from_millis(100), stream.next()).await;
    assert!(result.is_ok(), "Stream receives notification");
 
-   let change = result.unwrap().unwrap();
-   assert_eq!(change.table, "users");
+   let event = result.unwrap().unwrap();
+   match event {
+      sqlx_sqlite_observer::TableChangeEvent::Change(change) => {
+         assert_eq!(change.table, "users");
+      }
+      sqlx_sqlite_observer::TableChangeEvent::Lagged(_) => {
+         panic!("Expected Change event, got Lagged");
+      }
+   }
 }
 
 #[tokio::test]
@@ -422,6 +429,50 @@ async fn test_stream_filters_tables() {
 
    let result = timeout(Duration::from_millis(50), stream.next()).await;
    assert!(result.is_err(), "Stream filters out non-subscribed tables");
+}
+
+#[tokio::test]
+async fn test_stream_lag_when_capacity_exceeded() {
+   let pool = setup_test_db().await;
+   let config = ObserverConfig::new()
+      .with_tables(["users"])
+      .with_channel_capacity(2);
+
+   let observer = SqliteObserver::new(pool, config);
+
+   let mut stream = observer.subscribe_stream(["users"]);
+   let mut conn = observer.acquire().await.unwrap();
+
+   // Insert more rows than the channel capacity in a single transaction
+   sqlx::query("BEGIN").execute(&mut **conn).await.unwrap();
+   for i in 0..5 {
+      sqlx::query("INSERT INTO users (name) VALUES (?)")
+         .bind(format!("User{}", i))
+         .execute(&mut **conn)
+         .await
+         .unwrap();
+   }
+   sqlx::query("COMMIT").execute(&mut **conn).await.unwrap();
+
+   let mut saw_lagged = false;
+   let mut saw_change = false;
+
+   // Drain all available events
+   while let Ok(Some(event)) = timeout(Duration::from_millis(100), stream.next()).await {
+      match event {
+         sqlx_sqlite_observer::TableChangeEvent::Lagged(n) => {
+            assert!(n > 0, "Lagged count should be > 0");
+            saw_lagged = true;
+         }
+         sqlx_sqlite_observer::TableChangeEvent::Change(change) => {
+            assert_eq!(change.table, "users");
+            saw_change = true;
+         }
+      }
+   }
+
+   assert!(saw_lagged, "Expected at least one Lagged event");
+   assert!(saw_change, "Expected at least one Change event");
 }
 
 // ============================================================================

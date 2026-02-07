@@ -3742,6 +3742,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlx-sqlite-conn-mgr"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d1ee0837ee4c49036a64632adf814c1799ec54cc0ba31712d263ce12c09ad45"
+dependencies = [
+ "serde",
+ "sqlx",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sqlx-sqlite-observer"
 version = "0.8.6"
 dependencies = [
@@ -3750,6 +3763,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "sqlx",
+ "sqlx-sqlite-conn-mgr 0.8.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
@@ -4076,7 +4090,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "sqlx-sqlite-conn-mgr",
+ "sqlx-sqlite-conn-mgr 0.8.6",
  "tauri",
  "tauri-plugin",
  "tempfile",
