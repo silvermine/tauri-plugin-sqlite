@@ -81,7 +81,9 @@
 //! ```rust,no_run
 //! use futures::StreamExt;
 //! use sqlx::SqlitePool;
-//! use sqlx_sqlite_observer::{ChangeOperation, SqliteObserver, ObserverConfig, TableChangeStreamExt};
+//! use sqlx_sqlite_observer::{
+//!     SqliteObserver, ObserverConfig, TableChangeEvent, TableChangeStreamExt,
+//! };
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -92,20 +94,26 @@
 //!     // Get a Stream instead of broadcast::Receiver
 //!     let mut stream = observer.subscribe_stream(["users"]);
 //!
-//!     // Use standard Stream combinators
-//!     while let Some(change) = stream.next().await {
-//!         println!(
-//!             "Table {} row {} was {:?}",
-//!             change.table,
-//!             change.rowid.unwrap_or(-1),
-//!             change.operation
-//!         );
-//!         // Access typed column values
-//!         if let Some(old) = &change.old_values {
-//!             println!("  Old values: {:?}", old);
-//!         }
-//!         if let Some(new) = &change.new_values {
-//!             println!("  New values: {:?}", new);
+//!     // Stream yields TableChangeEvent variants
+//!     while let Some(event) = stream.next().await {
+//!         match event {
+//!             TableChangeEvent::Change(change) => {
+//!                 println!(
+//!                     "Table {} row {} was {:?}",
+//!                     change.table,
+//!                     change.rowid.unwrap_or(-1),
+//!                     change.operation
+//!                 );
+//!                 if let Some(old) = &change.old_values {
+//!                     println!("  Old values: {:?}", old);
+//!                 }
+//!                 if let Some(new) = &change.new_values {
+//!                     println!("  New values: {:?}", new);
+//!                 }
+//!             }
+//!             TableChangeEvent::Lagged(n) => {
+//!                 eprintln!("Missed {} notifications, re-query state", n);
+//!             }
 //!         }
 //!     }
 //!
@@ -123,13 +131,19 @@ pub mod observer;
 pub mod schema;
 pub mod stream;
 
+#[cfg(feature = "conn-mgr")]
+pub mod conn_mgr;
+
 pub use broker::ObservationBroker;
-pub use change::{ChangeOperation, ColumnValue, TableChange, TableInfo};
+pub use change::{ChangeOperation, ColumnValue, TableChange, TableChangeEvent, TableInfo};
 pub use config::ObserverConfig;
 pub use connection::ObservableConnection;
 pub use error::Error;
 pub use hooks::{SqliteValue, is_preupdate_hook_enabled, unregister_hooks};
 pub use observer::SqliteObserver;
 pub use stream::{TableChangeStream, TableChangeStreamExt};
+
+#[cfg(feature = "conn-mgr")]
+pub use conn_mgr::{ObservableSqliteDatabase, ObservableWriteGuard};
 
 pub type Result<T> = std::result::Result<T, Error>;
