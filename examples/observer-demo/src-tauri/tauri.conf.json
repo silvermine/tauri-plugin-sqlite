@@ -1,0 +1,24 @@
+{
+   "$schema": "https://raw.githubusercontent.com/nicoverbruggen/tauri-v2-schema/main/schema.json",
+   "productName": "observer-demo",
+   "version": "0.0.0",
+   "identifier": "com.silvermine.observerdemo",
+   "build": {
+      "beforeDevCommand": "npm run dev",
+      "devUrl": "http://localhost:1420",
+      "beforeBuildCommand": "npm run build",
+      "frontendDist": "../dist"
+   },
+   "app": {
+      "windows": [
+         {
+            "title": "SQLite Observer Demo",
+            "width": 900,
+            "height": 700
+         }
+      ],
+      "security": {
+         "csp": null
+      }
+   }
+}

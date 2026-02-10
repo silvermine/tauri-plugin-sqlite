@@ -3,7 +3,14 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
-import Database, { MigrationEvent } from './index';
+import Database, {
+   MigrationEvent,
+   Subscription,
+   ObserverConfig,
+   ColumnValue,
+   TableChange,
+   TableChangeEvent,
+} from './index';
 
 let lastCmd = '',
     lastArgs: Record<string, unknown> = {};
@@ -52,6 +59,18 @@ beforeEach(() => {
       }
       if (cmd === 'plugin:sqlite|get_migration_events') {
          return [];
+      }
+      if (cmd === 'plugin:sqlite|observe') {
+         return undefined;
+      }
+      if (cmd === 'plugin:sqlite|subscribe') {
+         return 'sub-123';
+      }
+      if (cmd === 'plugin:sqlite|unsubscribe') {
+         return true;
+      }
+      if (cmd === 'plugin:sqlite|unobserve') {
+         return undefined;
       }
       return undefined;
    });
@@ -324,6 +343,65 @@ describe('Database commands', () => {
    });
 });
 
+describe('Database.load with customConfig', () => {
+   it('passes customConfig to backend', async () => {
+      await Database.load('test.db', { maxReadConnections: 10, idleTimeoutSecs: 60 });
+      expect(lastCmd).toBe('plugin:sqlite|load');
+      expect(lastArgs.db).toBe('test.db');
+      expect(lastArgs.customConfig).toEqual({ maxReadConnections: 10, idleTimeoutSecs: 60 });
+   });
+});
+
+describe('Observer commands', () => {
+   it('observe', async () => {
+      await Database.get('t.db').observe([ 'users', 'posts' ]);
+      expect(lastCmd).toBe('plugin:sqlite|observe');
+      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.tables).toEqual([ 'users', 'posts' ]);
+      expect(lastArgs.config).toBe(null);
+   });
+
+   it('observe with config', async () => {
+      const config: ObserverConfig = { channelCapacity: 512, captureValues: false };
+
+      await Database.get('t.db').observe([ 'users' ], config);
+      expect(lastCmd).toBe('plugin:sqlite|observe');
+      expect(lastArgs.tables).toEqual([ 'users' ]);
+      expect(lastArgs.config).toEqual({ channelCapacity: 512, captureValues: false });
+   });
+
+   it('subscribe', async () => {
+      const events: TableChangeEvent[] = [];
+
+      const sub = await Database.get('t.db').subscribe([ 'users' ], (e) => { events.push(e); });
+
+      expect(lastCmd).toBe('plugin:sqlite|subscribe');
+      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.tables).toEqual([ 'users' ]);
+      expect(lastArgs.onEvent).toBeDefined();
+      expect(sub).toBeInstanceOf(Subscription);
+      expect(sub.id).toBe('sub-123');
+   });
+
+   it('unsubscribe', async () => {
+      const sub = new Subscription('sub-456');
+
+      expect(sub.id).toBe('sub-456');
+
+      const result = await sub.unsubscribe();
+
+      expect(lastCmd).toBe('plugin:sqlite|unsubscribe');
+      expect(lastArgs.subscriptionId).toBe('sub-456');
+      expect(result).toBe(true);
+   });
+
+   it('unobserve', async () => {
+      await Database.get('t.db').unobserve();
+      expect(lastCmd).toBe('plugin:sqlite|unobserve');
+      expect(lastArgs.db).toBe('t.db');
+   });
+});
+
 describe('MigrationEvent type', () => {
    it('accepts running status', () => {
       const event: MigrationEvent = {
@@ -356,5 +434,78 @@ describe('MigrationEvent type', () => {
 
       expect(event.status).toBe('failed');
       expect(event.error).toBe('Migration failed: syntax error');
+   });
+});
+
+describe('Observer types', () => {
+   it('ColumnValue variants', () => {
+      const values: ColumnValue[] = [
+         { type: 'null' },
+         { type: 'integer', value: 42 },
+         { type: 'real', value: 3.14 },
+         { type: 'text', value: 'hello' },
+         { type: 'blob', value: 'SGVsbG8=' },
+      ];
+
+      expect(values).toHaveLength(5);
+      expect(values[0].type).toBe('null');
+      expect(values[1].type).toBe('integer');
+      expect((values[1] as { type: 'integer'; value: number }).value).toBe(42);
+      expect(values[4].type).toBe('blob');
+   });
+
+   it('TableChange structure', () => {
+      const change: TableChange = {
+         table: 'users',
+         operation: 'insert',
+         rowid: 1,
+         primaryKey: [ { type: 'integer', value: 1 } ],
+         newValues: [
+            { type: 'integer', value: 1 },
+            { type: 'text', value: 'Alice' },
+         ],
+      };
+
+      expect(change.table).toBe('users');
+      expect(change.operation).toBe('insert');
+      expect(change.rowid).toBe(1);
+      expect(change.primaryKey).toHaveLength(1);
+      expect(change.oldValues).toBeUndefined();
+      expect(change.newValues).toHaveLength(2);
+   });
+
+   it('TableChange without rowid', () => {
+      const change: TableChange = {
+         table: 'kv_store',
+         operation: 'update',
+         primaryKey: [ { type: 'text', value: 'my-key' } ],
+      };
+
+      expect(change.rowid).toBeUndefined();
+      expect(change.primaryKey[0]).toEqual({ type: 'text', value: 'my-key' });
+   });
+
+   it('TableChangeEvent change variant', () => {
+      const event: TableChangeEvent = {
+         event: 'change',
+         data: {
+            table: 'users',
+            operation: 'delete',
+            primaryKey: [ { type: 'integer', value: 5 } ],
+         },
+      };
+
+      expect(event.event).toBe('change');
+      expect(event.data).toHaveProperty('table', 'users');
+   });
+
+   it('TableChangeEvent lagged variant', () => {
+      const event: TableChangeEvent = {
+         event: 'lagged',
+         data: { count: 42 },
+      };
+
+      expect(event.event).toBe('lagged');
+      expect(event.data).toEqual({ count: 42 });
    });
 });

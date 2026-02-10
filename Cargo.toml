@@ -5,11 +5,12 @@ members = [
    "crates/sqlx-sqlite-observer",
    "crates/sqlx-sqlite-toolkit",
 ]
+exclude = ["examples/observer-demo/src-tauri"]
 
 [package]
 name = "tauri-plugin-sqlite"
-version = "0.1.0"
-description = "A Tauri plugin for SQLite database access with connection management"
+version = "0.3.0"
+description = "A Tauri plugin for SQLite with connection pooling, builder-pattern queries, transactions, and reactive change notifications"
 license = "MIT"
 edition = "2024"
 rust-version = "1.89"
@@ -34,8 +35,14 @@ sqlx = { version = "0.8.6", features = ["sqlite", "json", "time", "runtime-tokio
 # Connection manager
 sqlx-sqlite-conn-mgr = { path = "crates/sqlx-sqlite-conn-mgr" }
 
-# High-level toolkit (builders, transactions, decoding)
-sqlx-sqlite-toolkit = { path = "crates/sqlx-sqlite-toolkit" }
+# Toolkit (high-level API — builders, transactions, decoding)
+sqlx-sqlite-toolkit = { path = "crates/sqlx-sqlite-toolkit", features = ["observer"] }
+
+# Observer types (for payload conversion)
+sqlx-sqlite-observer = { path = "crates/sqlx-sqlite-observer", features = ["conn-mgr"] }
+
+# Async stream support for observer subscriptions
+futures = "0.3.31"
 
 [build-dependencies]
 tauri-plugin = { version = "2.5.1", features = ["build"] }

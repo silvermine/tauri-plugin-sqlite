@@ -397,6 +397,66 @@ await db.executeTransaction([
    * Attachments are connection-scoped and don't persist across queries
    * Main database is always accessible without a schema prefix
 
+### Change Notifications
+
+Subscribe to real-time change notifications when rows are inserted, updated, or
+deleted. Changes are only published after transactions commit — you never see
+partial or rolled-back data.
+
+```typescript
+// 1. Enable observation for specific tables
+await db.observe(['users', 'posts']);
+
+// 2. Subscribe to changes
+const subscription = await db.subscribe(['users'], (event) => {
+   if (event.event === 'change') {
+      const { table, operation, primaryKey, newValues, oldValues } = event.data;
+
+      console.info(`${operation} on ${table}, row key:`, primaryKey);
+
+      if (operation === 'insert' || operation === 'update') {
+         console.info('New values:', newValues);
+      }
+      if (operation === 'update' || operation === 'delete') {
+         console.info('Old values:', oldValues);
+      }
+   } else if (event.event === 'lagged') {
+      // Consumer fell behind — some notifications were missed
+      console.warn(`Missed ${event.data.count} notifications`);
+   }
+});
+
+// 3. Changes are now streamed to the callback
+await db.execute('INSERT INTO users (name) VALUES ($1)', ['Alice']);
+// callback fires: { event: 'change', data: { table: 'users', operation: 'insert', ... } }
+
+// 4. Unsubscribe when done
+await subscription.unsubscribe();
+
+// 5. Disable observation entirely (also aborts all active subscriptions)
+await db.unobserve();
+```
+
+**Configuration:**
+
+```typescript
+await db.observe(['users'], {
+   channelCapacity: 512,  // default: 256 — at least the number of writes in your largest transaction
+   captureValues: false,  // default: true — disable to reduce memory per notification
+});
+```
+
+**Important:**
+
+   * Call `observe()` before `subscribe()` — subscribing without observation returns
+     an error
+   * Multiple subscriptions can be active on the same database, each filtering by
+     different tables
+   * `lagged` events indicate the broadcast channel filled up before the
+     subscriber could read — increase `channelCapacity`
+   * Column values (`oldValues`, `newValues`) are typed as `ColumnValue` — a tagged
+     union of `null`, `integer`, `real`, `text`, or `blob` (base64-encoded)
+
 ### Error Handling
 
 ```typescript
@@ -419,6 +479,8 @@ Common error codes:
    * `IO_ERROR` - File system error
    * `MIGRATION_ERROR` - Migration failed
    * `MULTIPLE_ROWS_RETURNED` - `fetchOne()` returned multiple rows
+   * `OBSERVATION_NOT_ENABLED` - Called `subscribe()` before `observe()`
+   * `OBSERVER_ERROR` - Error from the observer subsystem
 
 ### Closing and Removing
 
@@ -449,6 +511,9 @@ await db.remove();           // Close and DELETE database file(s) - irreversible
 | `fetchOne<T>(query, values?)` | Execute SELECT, return single row or `undefined` |
 | `close()` | Close connection, returns `true` if was loaded |
 | `remove()` | Close and delete database file(s), returns `true` if was loaded |
+| `observe(tables, config?)` | Enable change observation for tables |
+| `subscribe(tables, onEvent)` | Subscribe to change notifications, returns `Subscription` |
+| `unobserve()` | Disable observation and abort all subscriptions |
 
 ### Builder Methods
 
@@ -468,6 +533,12 @@ return builders that are directly awaitable and support method chaining:
 | `continueWith(statements)` | Execute additional statements, returns new `InterruptibleTransaction` |
 | `commit()` | Commit transaction and release write lock |
 | `rollback()` | Rollback transaction and release write lock |
+
+### Subscription Methods
+
+| Method | Description |
+| ------ | ----------- |
+| `unsubscribe()` | Stop receiving change notifications, returns `true` if was active |
 
 ### Types
 
@@ -492,6 +563,33 @@ interface SqliteError {
    code: string;
    message: string;
 }
+
+interface ObserverConfig {
+   channelCapacity?: number;  // default: 256
+   captureValues?: boolean;   // default: true
+}
+
+type ChangeOperation = 'insert' | 'update' | 'delete';
+
+type ColumnValue =
+   | { type: 'null' }
+   | { type: 'integer'; value: number }
+   | { type: 'real'; value: number }
+   | { type: 'text'; value: string }
+   | { type: 'blob'; value: string };  // base64-encoded
+
+interface TableChange {
+   table: string;
+   operation?: ChangeOperation;
+   rowid?: number;
+   primaryKey: ColumnValue[];
+   oldValues?: ColumnValue[];   // update, delete
+   newValues?: ColumnValue[];   // insert, update
+}
+
+type TableChangeEvent =
+   | { event: 'change'; data: TableChange }
+   | { event: 'lagged'; data: { count: number } };
 ```
 
 ## Rust-Only API

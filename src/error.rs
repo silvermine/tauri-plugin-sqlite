@@ -31,6 +31,10 @@ pub enum Error {
    #[error("database {0} not loaded")]
    DatabaseNotLoaded(String),
 
+   /// Observation not enabled for this database.
+   #[error("observation not enabled for database: {0}")]
+   ObservationNotEnabled(String),
+
    /// Generic error for operations that don't fit other categories.
    #[error("{0}")]
    Other(String),
@@ -64,6 +68,7 @@ impl Error {
          Error::Migration(_) => "MIGRATION_ERROR".to_string(),
          Error::InvalidPath(_) => "INVALID_PATH".to_string(),
          Error::DatabaseNotLoaded(_) => "DATABASE_NOT_LOADED".to_string(),
+         Error::ObservationNotEnabled(_) => "OBSERVATION_NOT_ENABLED".to_string(),
          Error::Other(_) => "ERROR".to_string(),
       }
    }

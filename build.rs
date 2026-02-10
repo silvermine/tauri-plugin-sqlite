@@ -12,6 +12,10 @@ fn main() {
       "close_all",
       "remove",
       "get_migration_events",
+      "observe",
+      "subscribe",
+      "unsubscribe",
+      "unobserve",
    ])
    .build();
 }

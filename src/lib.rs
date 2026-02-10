@@ -10,6 +10,7 @@ use tracing::{debug, error, info, trace, warn};
 mod commands;
 mod error;
 mod resolve;
+mod subscriptions;
 
 pub use error::{Error, Result};
 pub use sqlx_sqlite_conn_mgr::{
@@ -187,12 +188,17 @@ impl Builder {
             commands::close_all,
             commands::remove,
             commands::get_migration_events,
+            commands::observe,
+            commands::subscribe,
+            commands::unsubscribe,
+            commands::unobserve,
          ])
          .setup(move |app, _api| {
             app.manage(DbInstances::default());
             app.manage(MigrationStates::default());
             app.manage(ActiveInterruptibleTransactions::default());
             app.manage(ActiveRegularTransactions::default());
+            app.manage(subscriptions::ActiveSubscriptions::default());
 
             // Initialize migration states as Pending for all registered databases
             let migration_states = app.state::<MigrationStates>();
@@ -224,7 +230,14 @@ impl Builder {
          .on_event(|app, event| {
             match event {
                RunEvent::ExitRequested { api, code, .. } => {
-                  info!("App exit requested (code: {:?}) - cleaning up transactions and databases", code);
+                  // Only intercept user-initiated exits (code is None). Programmatic
+                  // exits via app_handle.exit() have Some(code) — let those through
+                  // to avoid an infinite ExitRequested loop.
+                  if code.is_some() {
+                     return;
+                  }
+
+                  info!("App exit requested - cleaning up transactions and databases");
 
                   // Prevent immediate exit so we can close connections and checkpoint WAL
                   api.prevent_exit();
@@ -243,14 +256,25 @@ impl Builder {
                   let instances_clone = app.state::<DbInstances>().inner().clone();
                   let interruptible_txs_clone = app.state::<ActiveInterruptibleTransactions>().inner().clone();
                   let regular_txs_clone = app.state::<ActiveRegularTransactions>().inner().clone();
+                  let active_subs_clone = app.state::<subscriptions::ActiveSubscriptions>().inner().clone();
 
                   // Spawn a blocking thread to abort transactions and close databases
                   // (block_in_place panics on current_thread runtime)
                   let cleanup_result = std::thread::spawn(move || {
                      handle.block_on(async {
-                        // First, abort all active transactions
-                        debug!("Aborting active transactions");
+                        // First, abort all subscriptions and transactions
+                        debug!("Aborting active subscriptions and transactions");
+                        active_subs_clone.abort_all().await;
                         sqlx_sqlite_toolkit::cleanup_all_transactions(&interruptible_txs_clone, &regular_txs_clone).await;
+
+                        // Disable observers before closing (observers hold the write
+                        // connection via hooks; dropping them first lets close() proceed)
+                        {
+                           let mut guard = instances_clone.0.write().await;
+                           for wrapper in guard.values_mut() {
+                              wrapper.disable_observation();
+                           }
+                        }
 
                         // Then close databases
                         let mut guard = instances_clone.0.write().await;

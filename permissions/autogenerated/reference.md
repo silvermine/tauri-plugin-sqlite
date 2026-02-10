@@ -15,6 +15,11 @@ Default permissions for the sqlite plugin - allows all database operations
 - `allow-close`
 - `allow-close-all`
 - `allow-remove`
+- `allow-get-migration-events`
+- `allow-observe`
+- `allow-subscribe`
+- `allow-unsubscribe`
+- `allow-unobserve`
 
 ## Permission Table
 
@@ -288,6 +293,32 @@ Denies the load command without any pre-configured scope.
 <tr>
 <td>
 
+`sqlite:allow-observe`
+
+</td>
+<td>
+
+Enables the observe command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-observe`
+
+</td>
+<td>
+
+Denies the observe command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `sqlite:allow-remove`
 
 </td>
@@ -307,6 +338,32 @@ Enables the remove command without any pre-configured scope.
 <td>
 
 Denies the remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:allow-subscribe`
+
+</td>
+<td>
+
+Enables the subscribe command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-subscribe`
+
+</td>
+<td>
+
+Denies the subscribe command without any pre-configured scope.
 
 </td>
 </tr>
@@ -359,6 +416,58 @@ Enables the transaction_read command without any pre-configured scope.
 <td>
 
 Denies the transaction_read command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:allow-unobserve`
+
+</td>
+<td>
+
+Enables the unobserve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-unobserve`
+
+</td>
+<td>
+
+Denies the unobserve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:allow-unsubscribe`
+
+</td>
+<td>
+
+Enables the unsubscribe command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-unsubscribe`
+
+</td>
+<td>
+
+Denies the unsubscribe command without any pre-configured scope.
 
 </td>
 </tr>

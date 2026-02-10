@@ -9,7 +9,7 @@
 //! Use [`is_preupdate_hook_enabled()`] to check at runtime whether the linked
 //! SQLite library supports this feature.
 
-use std::ffi::{CStr, CString, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::panic::catch_unwind;
 use std::ptr;
 use std::sync::Arc;
@@ -61,7 +61,7 @@ impl SqliteValue {
                SqliteValue::Null
             } else {
                // SAFETY: SQLite guarantees text is valid UTF-8 with a null terminator
-               let cstr = unsafe { CStr::from_ptr(text_ptr as *const i8) };
+               let cstr = unsafe { CStr::from_ptr(text_ptr as *const c_char) };
                SqliteValue::Text(cstr.to_string_lossy().into_owned())
             }
          }
@@ -214,8 +214,8 @@ unsafe extern "C" fn preupdate_callback(
    user_data: *mut c_void,
    db: *mut sqlite3,
    op: c_int,
-   _database: *const i8,
-   table: *const i8,
+   _database: *const c_char,
+   table: *const c_char,
    old_rowid: i64,
    new_rowid: i64,
 ) {

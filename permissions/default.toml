@@ -18,4 +18,9 @@ permissions = [
    "allow-close",
    "allow-close-all",
    "allow-remove",
+   "allow-get-migration-events",
+   "allow-observe",
+   "allow-subscribe",
+   "allow-unsubscribe",
+   "allow-unobserve",
 ]

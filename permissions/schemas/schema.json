@@ -415,6 +415,18 @@
           "markdownDescription": "Denies the load command without any pre-configured scope."
         },
         {
+          "description": "Enables the observe command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-observe",
+          "markdownDescription": "Enables the observe command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the observe command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-observe",
+          "markdownDescription": "Denies the observe command without any pre-configured scope."
+        },
+        {
           "description": "Enables the remove command without any pre-configured scope.",
           "type": "string",
           "const": "allow-remove",
@@ -425,6 +437,18 @@
           "type": "string",
           "const": "deny-remove",
           "markdownDescription": "Denies the remove command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the subscribe command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-subscribe",
+          "markdownDescription": "Enables the subscribe command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the subscribe command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-subscribe",
+          "markdownDescription": "Denies the subscribe command without any pre-configured scope."
         },
         {
           "description": "Enables the transaction_continue command without any pre-configured scope.",
@@ -451,10 +475,34 @@
           "markdownDescription": "Denies the transaction_read command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the sqlite plugin - allows all database operations\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-execute`\n- `allow-execute-transaction`\n- `allow-begin-interruptible-transaction`\n- `allow-transaction-continue`\n- `allow-transaction-read`\n- `allow-fetch-all`\n- `allow-fetch-one`\n- `allow-close`\n- `allow-close-all`\n- `allow-remove`",
+          "description": "Enables the unobserve command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-unobserve",
+          "markdownDescription": "Enables the unobserve command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the unobserve command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-unobserve",
+          "markdownDescription": "Denies the unobserve command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the unsubscribe command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-unsubscribe",
+          "markdownDescription": "Enables the unsubscribe command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the unsubscribe command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-unsubscribe",
+          "markdownDescription": "Denies the unsubscribe command without any pre-configured scope."
+        },
+        {
+          "description": "Default permissions for the sqlite plugin - allows all database operations\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-execute`\n- `allow-execute-transaction`\n- `allow-begin-interruptible-transaction`\n- `allow-transaction-continue`\n- `allow-transaction-read`\n- `allow-fetch-all`\n- `allow-fetch-one`\n- `allow-close`\n- `allow-close-all`\n- `allow-remove`\n- `allow-get-migration-events`\n- `allow-observe`\n- `allow-subscribe`\n- `allow-unsubscribe`\n- `allow-unobserve`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the sqlite plugin - allows all database operations\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-execute`\n- `allow-execute-transaction`\n- `allow-begin-interruptible-transaction`\n- `allow-transaction-continue`\n- `allow-transaction-read`\n- `allow-fetch-all`\n- `allow-fetch-one`\n- `allow-close`\n- `allow-close-all`\n- `allow-remove`"
+          "markdownDescription": "Default permissions for the sqlite plugin - allows all database operations\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-execute`\n- `allow-execute-transaction`\n- `allow-begin-interruptible-transaction`\n- `allow-transaction-continue`\n- `allow-transaction-read`\n- `allow-fetch-all`\n- `allow-fetch-one`\n- `allow-close`\n- `allow-close-all`\n- `allow-remove`\n- `allow-get-migration-events`\n- `allow-observe`\n- `allow-subscribe`\n- `allow-unsubscribe`\n- `allow-unobserve`"
         }
       ]
     }
