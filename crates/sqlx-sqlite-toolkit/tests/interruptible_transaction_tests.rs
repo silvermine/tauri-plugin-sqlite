@@ -1,11 +1,11 @@
 use serde_json::json;
-use tauri_plugin_sqlite::{DatabaseWrapper, Statement};
+use sqlx_sqlite_toolkit::{DatabaseWrapper, Statement};
 use tempfile::TempDir;
 
 async fn create_test_db(name: &str) -> (DatabaseWrapper, TempDir) {
    let temp_dir = TempDir::new().expect("Failed to create temp directory");
    let db_path = temp_dir.path().join(name);
-   let wrapper = DatabaseWrapper::connect_with_path(&db_path, None)
+   let wrapper = DatabaseWrapper::connect(&db_path, None)
       .await
       .expect("Failed to connect to test database");
 

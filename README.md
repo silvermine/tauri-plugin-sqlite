@@ -21,8 +21,41 @@ SQLite database interface for Tauri applications using
    * **Type Safety**: Full TypeScript bindings
    * **Migration Support**: SQLx's migration framework
    * **Resource Management**: Proper cleanup on application exit
+   * **Optional Change Notifications**: SQLite hooks for reactive change notifications
 
 ## Architecture
+
+The plugin is built from three standalone Rust crates, each usable independently
+without Tauri:
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│                   tauri-plugin-sqlite (src/)                  │
+│         Tauri commands, state management, permissions         │
+├───────────────────────────────────────────────────────────────┤
+│                   sqlx-sqlite-toolkit (crate)                 │
+│            DatabaseWrapper, builders, transactions            │
+│          JSON decoding, optional observer integration         │
+├───────────────────────────────────────────────────────────────┤
+│  sqlx-sqlite-conn-mgr (crate) │  sqlx-sqlite-observer (crate) │
+│  Connection pools,            │  Change notifications         │
+│  single writer,               │  via SQLite hooks             │
+│  WAL mode, attached           │  broadcast streams            │
+│  databases                    │  (optional)                   │
+└───────────────────────────────┴───────────────────────────────┘
+```
+
+   * **[`sqlx-sqlite-conn-mgr`](crates/sqlx-sqlite-conn-mgr/)** — Low-level connection
+     management: read pool, exclusive writer, WAL mode, attached databases
+   * **[`sqlx-sqlite-observer`](crates/sqlx-sqlite-observer/)** — Reactive change
+     notifications using SQLite's native preupdate/commit/rollback hooks
+   * **[`sqlx-sqlite-toolkit`](crates/sqlx-sqlite-toolkit/)** — High-level API:
+     `DatabaseWrapper`, builder-pattern queries, interruptible transactions, JSON
+     type decoding. Optionally integrates the observer behind a feature flag.
+   * **`tauri-plugin-sqlite` (this package)** — Thin Tauri layer: IPC commands, path
+     resolution, state management, permissions
+
+### Query Routing
 
 | Operation Type       | Method          | Pool Used        | Concurrency         |
 | -------------------- | --------------- | ---------------- | ------------------- |
@@ -31,8 +64,7 @@ SQLite database interface for Tauri applications using
 | INSERT/UPDATE/DELETE | `execute()`     | Write connection | Serialized          |
 | DDL (CREATE, etc.)   | `execute()`     | Write connection | Serialized          |
 
-See [`crates/sqlx-sqlite-conn-mgr/README.md`](crates/sqlx-sqlite-conn-mgr/README.md) for
-connection manager internals.
+See individual crate READMEs for detailed API documentation.
 
 ## Installation
 
@@ -85,10 +117,10 @@ Register the plugin in your Tauri application:
 
 ```rust
 fn main() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_sqlite::Builder::new().build())
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+   tauri::Builder::default()
+      .plugin(tauri_plugin_sqlite::Builder::new().build())
+      .run(tauri::generate_context!())
+      .expect("error while running tauri application");
 }
 ```
 
@@ -112,14 +144,14 @@ Register migrations using SQLx's `migrate!()` macro, which embeds them at compil
 use tauri_plugin_sqlite::Builder;
 
 fn main() {
-    tauri::Builder::default()
-        .plugin(
-            Builder::new()
-                .add_migrations("main.db", sqlx::migrate!("./migrations"))
-                .build()
-        )
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+   tauri::Builder::default()
+      .plugin(
+         Builder::new()
+            .add_migrations("main.db", sqlx::migrate!("./migrations"))
+            .build()
+      )
+      .run(tauri::generate_context!())
+      .expect("error while running tauri application");
 }
 ```
 
@@ -133,16 +165,16 @@ tracked in `_sqlx_migrations` — re-running is safe and idempotent.
 Use `getMigrationEvents()` to retrieve cached events:
 
 ```typescript
-import Database from '@silvermine/tauri-plugin-sqlite'
+import Database from '@silvermine/tauri-plugin-sqlite';
 
-const db = await Database.load('mydb.db')
+const db = await Database.load('mydb.db');
 
 // Get all migration events (including ones emitted before listener could be registered)
-const events = await db.getMigrationEvents()
+const events = await db.getMigrationEvents();
 for (const event of events) {
-   console.info(`${event.status}: ${event.dbPath}`)
+   console.info(`${event.status}: ${event.dbPath}`);
    if (event.status === 'failed') {
-      console.error(`Migration error: ${event.error}`)
+      console.error(`Migration error: ${event.error}`);
    }
 }
 ```
@@ -151,31 +183,31 @@ for (const event of events) {
 layer completing some or all migrations before the frontend subscription initializes.
 
 ```typescript
-import { listen } from '@tauri-apps/api/event'
-import type { MigrationEvent } from '@silvermine/tauri-plugin-sqlite'
+import { listen } from '@tauri-apps/api/event';
+import type { MigrationEvent } from '@silvermine/tauri-plugin-sqlite';
 
 await listen<MigrationEvent>('sqlite:migration', (event) => {
-   const { dbPath, status, migrationCount, error } = event.payload
-   console.info(`Migration ${status} for ${dbPath}: ${migrationCount} migrations`, error)
-})
+   const { dbPath, status, migrationCount, error } = event.payload;
+   console.info(`Migration ${status} for ${dbPath}: ${migrationCount} migrations`, error);
+});
 ```
 
 ### Connecting
 
 ```typescript
-import Database from '@silvermine/tauri-plugin-sqlite'
+import Database from '@silvermine/tauri-plugin-sqlite';
 
 // Path is relative to app config directory (no sqlite: prefix needed)
-let db = await Database.load('mydb.db')
+let db = await Database.load('mydb.db');
 
 // With custom configuration
 db = await Database.load('mydb.db', {
    maxReadConnections: 10, // default: 6
    idleTimeoutSecs: 60     // default: 30
-})
+});
 
 // Lazy initialization (connects on first query)
-db = Database.get('mydb.db')
+db = Database.get('mydb.db');
 ```
 
 ### Parameter Binding
@@ -183,7 +215,7 @@ db = Database.get('mydb.db')
 All query methods use `$1`, `$2`, etc. syntax with `SqlValue` types:
 
 ```typescript
-type SqlValue = string | number | boolean | null | Uint8Array
+type SqlValue = string | number | boolean | null | Uint8Array;
 ```
 
 | SQLite Type | TypeScript Type | Notes                               |
@@ -205,34 +237,34 @@ Use `execute()` for INSERT, UPDATE, DELETE, CREATE, etc.:
 ```typescript
 await db.execute(
    'CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)'
-)
+);
 
 const result = await db.execute(
    'INSERT INTO users (name, email) VALUES ($1, $2)',
    ['Alice', 'alice@example.com']
-)
-console.info(`Inserted ${result.rowsAffected} row(s), ID: ${result.lastInsertId}`)
+);
+console.info(`Inserted ${result.rowsAffected} row(s), ID: ${result.lastInsertId}`);
 ```
 
 ### Read Operations
 
 ```typescript
-type User = { id: number; name: string; email: string }
+type User = { id: number; name: string; email: string };
 
 // Multiple rows
 const users = await db.fetchAll<User[]>(
    'SELECT * FROM users WHERE email LIKE $1',
    ['%@example.com']
-)
-console.info(`Found ${users.length} users`)
+);
+console.info(`Found ${users.length} users`);
 
 // Single row (returns undefined if not found, throws if multiple rows)
 const user = await db.fetchOne<User>(
    'SELECT * FROM users WHERE id = $1',
    [42]
-)
+);
 if (user) {
-   console.info(`Found user: ${user.name}`)
+   console.info(`Found user: ${user.name}`);
 }
 ```
 
@@ -245,8 +277,8 @@ const results = await db.executeTransaction([
    ['UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, 1]],
    ['UPDATE accounts SET balance = balance + $1 WHERE id = $2', [100, 2]],
    ['INSERT INTO transfers (from_id, to_id, amount) VALUES ($1, $2, $3)', [1, 2, 100]]
-])
-console.info(`Transaction completed: ${results.length} statements executed`)
+]);
+console.info(`Transaction completed: ${results.length} statements executed`);
 ```
 
 Transactions use `BEGIN IMMEDIATE`, commit on success, and rollback on any failure.
@@ -259,30 +291,30 @@ generated ID or other computed values, then using that data in subsequent writes
 
 ```typescript
 // Assuming userId, productId, itemTotal are defined in your application context
-const userId = 123
-const productId = 456
-const itemTotal = 99.99
+const userId = 123;
+const productId = 456;
+const itemTotal = 99.99;
 
 // Begin transaction with initial insert
 let tx = await db.beginInterruptibleTransaction([
    ['INSERT INTO orders (user_id, total) VALUES ($1, $2)', [userId, 0]]
-])
+]);
 
 // Read the uncommitted data to get the generated order ID
 const orders = await tx.read<Array<{ id: number }>>(
    'SELECT id FROM orders WHERE user_id = $1 ORDER BY id DESC LIMIT 1',
    [userId]
-)
-const orderId = orders[0].id
+);
+const orderId = orders[0].id;
 
 // Continue transaction with the order ID
 tx = await tx.continueWith([
    ['INSERT INTO order_items (order_id, product_id) VALUES ($1, $2)', [orderId, productId]],
    ['UPDATE orders SET total = $1 WHERE id = $2', [itemTotal, orderId]]
-])
+]);
 
 // Commit the transaction
-await tx.commit()
+await tx.commit();
 ```
 
 **Important:**
@@ -296,7 +328,7 @@ await tx.commit()
 To rollback instead of committing:
 
 ```typescript
-await tx.rollback()
+await tx.rollback();
 ```
 
 ### Cross-Database Queries
@@ -320,8 +352,8 @@ const results = await db.fetchAll(
       schemaName: 'orders',
       mode: 'readOnly'
    }
-])
-console.info(`Found ${results.length} results from cross-database query`)
+]);
+console.info(`Found ${results.length} results from cross-database query`);
 
 // Update main database using data from attached database
 await db.execute(
@@ -333,12 +365,12 @@ await db.execute(
       schemaName: 'archive',
       mode: 'readOnly'
    }
-])
+]);
 
 // Atomic writes across multiple databases
 // Assuming userId and total are defined in your application context
-const userId = 123
-const total = 99.99
+const userId = 123;
+const total = 99.99;
 
 await db.executeTransaction([
    ['INSERT INTO main.orders (user_id, total) VALUES ($1, $2)', [userId, total]],
@@ -349,7 +381,7 @@ await db.executeTransaction([
       schemaName: 'stats',
       mode: 'readWrite'
    }
-])
+]);
 ```
 
 **Attached Database Modes:**
@@ -368,13 +400,13 @@ await db.executeTransaction([
 ### Error Handling
 
 ```typescript
-import type { SqliteError } from '@silvermine/tauri-plugin-sqlite'
+import type { SqliteError } from '@silvermine/tauri-plugin-sqlite';
 
 try {
-   await db.execute('INSERT INTO users (id) VALUES ($1)', [1])
+   await db.execute('INSERT INTO users (id) VALUES ($1)', [1]);
 } catch (err) {
-   const error = err as SqliteError
-   console.error(error.code, error.message)
+   const error = err as SqliteError;
+   console.error(error.code, error.message);
 }
 ```
 
@@ -391,9 +423,9 @@ Common error codes:
 ### Closing and Removing
 
 ```typescript
-await db.close()            // Close this connection
-await Database.close_all()  // Close all connections
-await db.remove()           // Close and DELETE database file(s) - irreversible!
+await db.close();            // Close this connection
+await Database.close_all();  // Close all connections
+await db.remove();           // Close and DELETE database file(s) - irreversible!
 ```
 
 ## API Reference
@@ -441,24 +473,24 @@ return builders that are directly awaitable and support method chaining:
 
 ```typescript
 interface WriteQueryResult {
-   rowsAffected: number
-   lastInsertId: number  // 0 for WITHOUT ROWID tables
+   rowsAffected: number;
+   lastInsertId: number;  // 0 for WITHOUT ROWID tables
 }
 
 interface CustomConfig {
-   maxReadConnections?: number  // default: 6
-   idleTimeoutSecs?: number     // default: 30
+   maxReadConnections?: number;  // default: 6
+   idleTimeoutSecs?: number;     // default: 30
 }
 
 interface AttachedDatabaseSpec {
-   databasePath: string  // Path relative to app config directory
-   schemaName: string    // Schema name for accessing tables (e.g., 'orders')
-   mode: 'readOnly' | 'readWrite'
+   databasePath: string;  // Path relative to app config directory
+   schemaName: string;    // Schema name for accessing tables (e.g., 'orders')
+   mode: 'readOnly' | 'readWrite';
 }
 
 interface SqliteError {
-   code: string
-   message: string
+   code: string;
+   message: string;
 }
 ```
 
@@ -479,8 +511,8 @@ let mut db = DatabaseWrapper::load(PathBuf::from("/path/to/mydb.db"), None).awai
 // With custom configuration
 use tauri_plugin_sqlite::CustomConfig;
 let config = CustomConfig {
-    max_read_connections: Some(10),
-    idle_timeout_secs: Some(60),
+   max_read_connections: Some(10),
+   idle_timeout_secs: Some(60),
 };
 db = DatabaseWrapper::load(PathBuf::from("/path/to/mydb.db"), Some(config)).await?;
 ```
@@ -492,28 +524,28 @@ use serde_json::json;
 
 // Write operations
 let result = db.execute(
-    "INSERT INTO users (name, email) VALUES (?, ?)".into(),
-    vec![json!("Alice"), json!("alice@example.com")]
+   "INSERT INTO users (name, email) VALUES (?, ?)".into(),
+   vec![json!("Alice"), json!("alice@example.com")]
 ).await?;
 
 println!("Inserted row {}", result.last_insert_id);
 
 // Read multiple rows
 let users = db.fetch_all(
-    "SELECT * FROM users WHERE active = ?".into(),
-    vec![json!(true)]
+   "SELECT * FROM users WHERE active = ?".into(),
+   vec![json!(true)]
 ).await?;
 
 println!("Found {} users", users.len());
 
 // Read single row
 let user = db.fetch_one(
-    "SELECT * FROM users WHERE id = ?".into(),
-    vec![json!(42)]
+   "SELECT * FROM users WHERE id = ?".into(),
+   vec![json!(42)]
 ).await?;
 
 if let Some(user_data) = user {
-    println!("Found user: {:?}", user_data);
+   println!("Found user: {:?}", user_data);
 }
 ```
 
@@ -523,9 +555,9 @@ Use `execute_transaction()` for atomic execution of multiple statements:
 
 ```rust
 let results = db.execute_transaction(vec![
-    ("UPDATE accounts SET balance = balance - ? WHERE id = ?", vec![json!(100), json!(1)]),
-    ("UPDATE accounts SET balance = balance + ? WHERE id = ?", vec![json!(100), json!(2)]),
-    ("INSERT INTO transfers (from_id, to_id, amount) VALUES (?, ?, ?)", vec![json!(1), json!(2), json!(100)]),
+   ("UPDATE accounts SET balance = balance - ? WHERE id = ?", vec![json!(100), json!(1)]),
+   ("UPDATE accounts SET balance = balance + ? WHERE id = ?", vec![json!(100), json!(2)]),
+   ("INSERT INTO transfers (from_id, to_id, amount) VALUES (?, ?, ?)", vec![json!(1), json!(2), json!(100)]),
 ]).await?;
 
 println!("Transaction completed: {} statements executed", results.len());
@@ -545,23 +577,23 @@ let item_total = 99.99;
 
 // Begin transaction with initial statements
 let mut tx = db.begin_interruptible_transaction()
-    .execute(vec![
-        ("INSERT INTO orders (user_id, total) VALUES (?, ?)", vec![json!(user_id), json!(0)]),
-    ])
-    .await?;
+   .execute(vec![
+      ("INSERT INTO orders (user_id, total) VALUES (?, ?)", vec![json!(user_id), json!(0)]),
+   ])
+   .await?;
 
 // Read uncommitted data
 let orders = tx.read(
-    "SELECT id FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1".into(),
-    vec![json!(user_id)]
+   "SELECT id FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1".into(),
+   vec![json!(user_id)]
 ).await?;
 
 let order_id = orders[0].get("id").unwrap().as_i64().unwrap();
 
 // Continue with more statements
 tx.continue_with(vec![
-    ("INSERT INTO order_items (order_id, product_id) VALUES (?, ?)", vec![json!(order_id), json!(product_id)]),
-    ("UPDATE orders SET total = ? WHERE id = ?", vec![json!(item_total), json!(order_id)]),
+   ("INSERT INTO order_items (order_id, product_id) VALUES (?, ?)", vec![json!(order_id), json!(product_id)]),
+   ("UPDATE orders SET total = ? WHERE id = ?", vec![json!(item_total), json!(order_id)]),
 ]).await?;
 
 // Commit (or rollback)
@@ -585,15 +617,15 @@ let stats_db = DatabaseWrapper::load("/path/to/stats.db".into(), None).await?;
 
 // Create attached spec using the inner database reference
 let stats_spec = AttachedSpec {
-    database: Arc::clone(stats_db.inner()),
-    schema_name: "stats".to_string(),
-    mode: AttachedMode::ReadWrite,
+   database: Arc::clone(stats_db.inner()),
+   schema_name: "stats".to_string(),
+   mode: AttachedMode::ReadWrite,
 };
 
 // Simple transaction with attached database
 let results = main_db.execute_transaction(vec![
-    ("INSERT INTO main.orders (user_id) VALUES (?)", vec![json!(1)]),
-    ("UPDATE stats.order_count SET count = count + 1", vec![]),
+   ("INSERT INTO main.orders (user_id) VALUES (?)", vec![json!(1)]),
+   ("UPDATE stats.order_count SET count = count + 1", vec![]),
 ])
 .attach(vec![stats_spec])
 .await?;
@@ -605,20 +637,20 @@ let inventory_db = DatabaseWrapper::load("/path/to/inventory.db".into(), None).a
 
 // Create spec for inventory database
 let inv_spec = AttachedSpec {
-    database: Arc::clone(inventory_db.inner()),
-    schema_name: "inv".to_string(),
-    mode: AttachedMode::ReadWrite,
+   database: Arc::clone(inventory_db.inner()),
+   schema_name: "inv".to_string(),
+   mode: AttachedMode::ReadWrite,
 };
 
 // Assuming product_id is defined in your application context
 let product_id = 789;
 
 let _tx = main_db.begin_interruptible_transaction()
-    .attach(vec![inv_spec])
-    .execute(vec![
-        ("UPDATE inv.stock SET quantity = quantity - ? WHERE product_id = ?", vec![json!(1), json!(product_id)]),
-    ])
-    .await?;
+   .attach(vec![inv_spec])
+   .execute(vec![
+      ("UPDATE inv.stock SET quantity = quantity - ? WHERE product_id = ?", vec![json!(1), json!(product_id)]),
+   ])
+   .await?;
 // Continue with transaction operations...
 ```
 
@@ -669,22 +701,22 @@ tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
 ```rust
 #[cfg(debug_assertions)]
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("trace"));
+   use tracing_subscriber::{fmt, EnvFilter};
+   let filter = EnvFilter::try_from_default_env()
+      .unwrap_or_else(|_| EnvFilter::new("trace"));
 
-    fmt().with_env_filter(filter).compact().init();
+   fmt().with_env_filter(filter).compact().init();
 }
 
 #[cfg(not(debug_assertions))]
 fn init_tracing() {}
 
 fn main() {
-    init_tracing();
-    tauri::Builder::default()
-        .plugin(tauri_plugin_sqlite::Builder::new().build())
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+   init_tracing();
+   tauri::Builder::default()
+      .plugin(tauri_plugin_sqlite::Builder::new().build())
+      .run(tauri::generate_context!())
+      .expect("error while running tauri application");
 }
 ```
 

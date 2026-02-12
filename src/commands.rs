@@ -7,18 +7,15 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx_sqlite_conn_mgr::SqliteDatabaseConfig;
+use sqlx_sqlite_toolkit::{
+   ActiveInterruptibleTransaction, ActiveInterruptibleTransactions, ActiveRegularTransactions,
+   DatabaseWrapper, Statement, TransactionWriter, WriteQueryResult,
+};
 use std::sync::Arc;
 use tauri::{AppHandle, Runtime, State};
 use uuid::Uuid;
 
-use crate::{
-   DbInstances, Error, MigrationEvent, MigrationStates, MigrationStatus, Result, WriteQueryResult,
-   transactions::{
-      ActiveInterruptibleTransaction, ActiveInterruptibleTransactions, ActiveRegularTransactions,
-      Statement, TransactionWriter,
-   },
-   wrapper::DatabaseWrapper,
-};
+use crate::{DbInstances, Error, MigrationEvent, MigrationStates, MigrationStatus, Result};
 
 /// Token representing an active interruptible transaction
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,7 +125,7 @@ pub async fn load<R: Runtime>(
       }
       Entry::Vacant(entry) => {
          // We won the race, create and insert the wrapper
-         let wrapper = DatabaseWrapper::connect(&db, &app, custom_config).await?;
+         let wrapper = crate::resolve::connect(&db, &app, custom_config).await?;
          entry.insert(wrapper);
          Ok(db)
       }
@@ -264,7 +261,7 @@ pub async fn execute_transaction(
 
    // Wait for transaction to complete
    match handle.await {
-      Ok(result) => result,
+      Ok(result) => Ok(result?),
       Err(e) => {
          // Task panicked or was aborted - ensure cleanup
          regular_txs.remove(&tx_key).await;
@@ -357,10 +354,10 @@ pub async fn close_all(db_instances: State<'_, DbInstances>) -> Result<()> {
    let wrappers: Vec<DatabaseWrapper> = instances.drain().map(|(_, v)| v).collect();
 
    // Close each connection, continuing on errors to ensure all get closed
-   let mut last_error = None;
+   let mut last_error: Option<Error> = None;
    for wrapper in wrappers {
       if let Err(e) = wrapper.close().await {
-         last_error = Some(e);
+         last_error = Some(e.into());
       }
    }
 
@@ -435,35 +432,20 @@ pub async fn begin_interruptible_transaction(
             .await?;
       TransactionWriter::Attached(guard)
    } else {
-      TransactionWriter::Regular(wrapper.acquire_writer().await?)
+      TransactionWriter::from(wrapper.acquire_writer().await?)
    };
 
    // Begin transaction
-   match &mut writer {
-      TransactionWriter::Regular(w) => {
-         sqlx::query("BEGIN IMMEDIATE").execute(&mut **w).await?;
-      }
-      TransactionWriter::Attached(w) => {
-         sqlx::query("BEGIN IMMEDIATE").execute(&mut **w).await?;
-      }
-   }
+   writer.begin_immediate().await?;
 
    // Execute initial statements
-   for statement in initial_statements {
-      let mut q = sqlx::query(&statement.query);
-      for value in statement.values {
-         q = crate::wrapper::bind_value(q, value);
-      }
-      match &mut writer {
-         TransactionWriter::Regular(w) => q.execute(&mut **w).await?,
-         TransactionWriter::Attached(w) => q.execute(&mut **w).await?,
-      };
-   }
+   let mut active_tx =
+      ActiveInterruptibleTransaction::new(db.clone(), transaction_id.clone(), writer);
+
+   active_tx.continue_with(initial_statements).await?;
 
    // Store transaction state
-   let tx = ActiveInterruptibleTransaction::new(db.clone(), transaction_id.clone(), writer);
-
-   active_txs.insert(db.clone(), tx).await?;
+   active_txs.insert(db.clone(), active_tx).await?;
 
    Ok(TransactionToken {
       db_path: db,
@@ -495,14 +477,14 @@ pub async fn transaction_continue(
                   Ok(()) => Ok(Some(token)),
                   Err(e) => {
                      // Transaction lost but will auto-rollback via Drop
-                     Err(e)
+                     Err(e.into())
                   }
                }
             }
             Err(e) => {
                // Execution failed, explicitly rollback before returning error
                let _ = tx.rollback().await;
-               Err(e)
+               Err(e.into())
             }
          }
       }
@@ -553,14 +535,14 @@ pub async fn transaction_read(
             Ok(()) => Ok(results),
             Err(e) => {
                // Transaction lost but will auto-rollback via Drop
-               Err(e)
+               Err(e.into())
             }
          }
       }
       Err(e) => {
          // Read failed, explicitly rollback before returning error
          let _ = tx.rollback().await;
-         Err(e)
+         Err(e.into())
       }
    }
 }

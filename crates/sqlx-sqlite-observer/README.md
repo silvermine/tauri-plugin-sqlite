@@ -62,19 +62,19 @@ The library uses SQLite's native hooks for transaction-safe change tracking:
 │ (captures data) │     │  (Vec<Event>)   │     │                 │
 └─────────────────┘     └────────┬────────┘     └─────────────────┘
                                  │                       ▲
-                    ┌────────────┼────────────┐          │
-                    │            │            │          │
-              ┌─────▼────┐  ┌────▼─────┐      │          │
-              │  COMMIT  │  │ ROLLBACK │      │          │
-              └─────┬────┘  └────┬─────┘      │          │
-                    │            │            │          │
-                    ▼            ▼            │          │
-              on_commit()   on_rollback()     │          │
-                    │            │            │          │
-                    │       buffer.clear()    │          │
-                    │       (discard)         │          │
-                    │                         │          │
-                    └─────────────────────────┴──────────┘
+                    ┌────────────|                       │
+                    │            │                       │
+              ┌─────▼────┐  ┌────▼─────┐                 │
+              │  COMMIT  │  │ ROLLBACK │                 │
+              └─────┬────┘  └────┬─────┘                 │
+                    │            │                       │
+                    ▼            ▼                       │
+              on_commit()   on_rollback()                │
+                    │            │                       │
+                    │       buffer.clear()               │
+                    │       (discard)                    │
+                    │                                    │
+                    └────────────────────────────────────┘
                             change_tx.send()
                             (publish)
 ```
@@ -283,6 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ObserverConfig::new()
         .with_tables(["users"])
         .with_capture_values(false);
+
     let observer = SqliteObserver::new(
         SqlitePool::connect("sqlite:mydb.db").await?,
         config,

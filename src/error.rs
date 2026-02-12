@@ -11,15 +11,13 @@ struct ErrorResponse {
 }
 
 /// Error types for the SQLite plugin.
+///
+/// Plugin-specific errors wrap toolkit errors with additional state-management variants.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-   /// Error from SQLx operations.
+   /// Error from the SQLite toolkit (database operations).
    #[error(transparent)]
-   Sqlx(#[from] sqlx::Error),
-
-   /// Error from the connection manager.
-   #[error(transparent)]
-   ConnectionManager(#[from] sqlx_sqlite_conn_mgr::Error),
+   Toolkit(#[from] sqlx_sqlite_toolkit::Error),
 
    /// Error from database migrations.
    #[error(transparent)]
@@ -33,44 +31,27 @@ pub enum Error {
    #[error("database {0} not loaded")]
    DatabaseNotLoaded(String),
 
-   /// SQLite type that cannot be mapped to JSON.
-   #[error("unsupported datatype: {0}")]
-   UnsupportedDatatype(String),
-
-   /// I/O error when accessing database files.
-   #[error("io error: {0}")]
-   Io(#[from] std::io::Error),
-
-   /// Multiple rows returned from fetchOne query.
-   #[error("fetchOne() query returned {0} rows, expected 0 or 1")]
-   MultipleRowsReturned(usize),
-
-   /// Transaction failed and rollback also failed.
-   #[error("transaction failed: {transaction_error}; rollback also failed: {rollback_error}")]
-   TransactionRollbackFailed {
-      transaction_error: String,
-      rollback_error: String,
-   },
-
-   /// Transaction already active for this database.
-   #[error("transaction already active for database: {0}")]
-   TransactionAlreadyActive(String),
-
-   /// No active transaction for this database.
-   #[error("no active transaction for database: {0}")]
-   NoActiveTransaction(String),
-
-   /// Invalid transaction token provided.
-   #[error("invalid transaction token")]
-   InvalidTransactionToken,
-
-   /// Transaction has already been committed or rolled back.
-   #[error("transaction has already been finalized (committed or rolled back)")]
-   TransactionAlreadyFinalized,
-
    /// Generic error for operations that don't fit other categories.
    #[error("{0}")]
    Other(String),
+}
+
+impl From<sqlx_sqlite_conn_mgr::Error> for Error {
+   fn from(e: sqlx_sqlite_conn_mgr::Error) -> Self {
+      Error::Toolkit(sqlx_sqlite_toolkit::Error::from(e))
+   }
+}
+
+impl From<sqlx::Error> for Error {
+   fn from(e: sqlx::Error) -> Self {
+      Error::Toolkit(sqlx_sqlite_toolkit::Error::from(e))
+   }
+}
+
+impl From<std::io::Error> for Error {
+   fn from(e: std::io::Error) -> Self {
+      Error::Toolkit(sqlx_sqlite_toolkit::Error::from(e))
+   }
 }
 
 impl Error {
@@ -79,25 +60,10 @@ impl Error {
    /// This provides machine-readable error codes for frontend error handling.
    fn error_code(&self) -> String {
       match self {
-         Error::Sqlx(e) => {
-            // Extract SQLite error codes from sqlx errors
-            if let Some(code) = e.as_database_error().and_then(|db_err| db_err.code()) {
-               return format!("SQLITE_{}", code);
-            }
-            "SQLX_ERROR".to_string()
-         }
-         Error::ConnectionManager(_) => "CONNECTION_ERROR".to_string(),
+         Error::Toolkit(e) => e.error_code(),
          Error::Migration(_) => "MIGRATION_ERROR".to_string(),
          Error::InvalidPath(_) => "INVALID_PATH".to_string(),
          Error::DatabaseNotLoaded(_) => "DATABASE_NOT_LOADED".to_string(),
-         Error::UnsupportedDatatype(_) => "UNSUPPORTED_DATATYPE".to_string(),
-         Error::Io(_) => "IO_ERROR".to_string(),
-         Error::MultipleRowsReturned(_) => "MULTIPLE_ROWS_RETURNED".to_string(),
-         Error::TransactionRollbackFailed { .. } => "TRANSACTION_ROLLBACK_FAILED".to_string(),
-         Error::TransactionAlreadyActive(_) => "TRANSACTION_ALREADY_ACTIVE".to_string(),
-         Error::NoActiveTransaction(_) => "NO_ACTIVE_TRANSACTION".to_string(),
-         Error::InvalidTransactionToken => "INVALID_TRANSACTION_TOKEN".to_string(),
-         Error::TransactionAlreadyFinalized => "TRANSACTION_ALREADY_FINALIZED".to_string(),
          Error::Other(_) => "ERROR".to_string(),
       }
    }
@@ -134,13 +100,15 @@ mod tests {
 
    #[test]
    fn test_error_code_unsupported_datatype() {
-      let err = Error::UnsupportedDatatype("WEIRD_TYPE".into());
+      let err = Error::Toolkit(sqlx_sqlite_toolkit::Error::UnsupportedDatatype(
+         "WEIRD_TYPE".into(),
+      ));
       assert_eq!(err.error_code(), "UNSUPPORTED_DATATYPE");
    }
 
    #[test]
    fn test_error_code_multiple_rows() {
-      let err = Error::MultipleRowsReturned(5);
+      let err = Error::Toolkit(sqlx_sqlite_toolkit::Error::MultipleRowsReturned(5));
       assert_eq!(err.error_code(), "MULTIPLE_ROWS_RETURNED");
    }
 
@@ -176,7 +144,7 @@ mod tests {
 
    #[test]
    fn test_error_serialization_multiple_rows() {
-      let err = Error::MultipleRowsReturned(3);
+      let err = Error::Toolkit(sqlx_sqlite_toolkit::Error::MultipleRowsReturned(3));
       let json = serde_json::to_value(&err).unwrap();
 
       assert_eq!(json["code"], "MULTIPLE_ROWS_RETURNED");
@@ -188,7 +156,7 @@ mod tests {
    #[test]
    fn test_error_message_format() {
       // Verify error messages are descriptive
-      let err = Error::MultipleRowsReturned(5);
+      let err = Error::Toolkit(sqlx_sqlite_toolkit::Error::MultipleRowsReturned(5));
       let message = err.to_string();
       assert!(message.contains("fetchOne()"));
       assert!(message.contains("5 rows"));
@@ -197,19 +165,19 @@ mod tests {
 
    #[test]
    fn test_error_code_transaction_rollback_failed() {
-      let err = Error::TransactionRollbackFailed {
+      let err = Error::Toolkit(sqlx_sqlite_toolkit::Error::TransactionRollbackFailed {
          transaction_error: "constraint violation".to_string(),
          rollback_error: "connection lost".to_string(),
-      };
+      });
       assert_eq!(err.error_code(), "TRANSACTION_ROLLBACK_FAILED");
    }
 
    #[test]
    fn test_error_serialization_transaction_rollback_failed() {
-      let err = Error::TransactionRollbackFailed {
+      let err = Error::Toolkit(sqlx_sqlite_toolkit::Error::TransactionRollbackFailed {
          transaction_error: "constraint violation".to_string(),
          rollback_error: "connection lost".to_string(),
-      };
+      });
       let json = serde_json::to_value(&err).unwrap();
 
       assert_eq!(json["code"], "TRANSACTION_ROLLBACK_FAILED");

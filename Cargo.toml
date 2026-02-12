@@ -3,6 +3,7 @@ resolver = "3"
 members = [
    "crates/sqlx-sqlite-conn-mgr",
    "crates/sqlx-sqlite-observer",
+   "crates/sqlx-sqlite-toolkit",
 ]
 
 [package]
@@ -32,6 +33,9 @@ sqlx = { version = "0.8.6", features = ["sqlite", "json", "time", "runtime-tokio
 
 # Connection manager
 sqlx-sqlite-conn-mgr = { path = "crates/sqlx-sqlite-conn-mgr" }
+
+# High-level toolkit (builders, transactions, decoding)
+sqlx-sqlite-toolkit = { path = "crates/sqlx-sqlite-toolkit" }
 
 [build-dependencies]
 tauri-plugin = { version = "2.5.1", features = ["build"] }

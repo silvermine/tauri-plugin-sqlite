@@ -3,7 +3,7 @@ fn main() {
       "load",
       "execute",
       "execute_transaction",
-      "execute_interruptible_transaction",
+      "begin_interruptible_transaction",
       "transaction_continue",
       "transaction_read",
       "fetch_all",
@@ -11,6 +11,7 @@ fn main() {
       "close",
       "close_all",
       "remove",
+      "get_migration_events",
    ])
    .build();
 }

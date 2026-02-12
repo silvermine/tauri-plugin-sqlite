@@ -10,7 +10,7 @@ permissions = [
    "allow-load",
    "allow-execute",
    "allow-execute-transaction",
-   "allow-execute-interruptible-transaction",
+   "allow-begin-interruptible-transaction",
    "allow-transaction-continue",
    "allow-transaction-read",
    "allow-fetch-all",

@@ -8,65 +8,86 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use sqlx::{Column, Row};
 use sqlx_sqlite_conn_mgr::{AttachedWriteGuard, WriteGuard};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 use tracing::debug;
 
+#[cfg(feature = "observer")]
+use sqlx_sqlite_observer::ObservableWriteGuard;
+
+use crate::wrapper::WriterGuard;
 use crate::{Error, Result, WriteQueryResult};
 
-/// Wrapper around WriteGuard or AttachedWriteGuard to unify transaction handling
+/// Wrapper around WriteGuard, ObservableWriteGuard, or AttachedWriteGuard
+/// to unify transaction handling.
 pub enum TransactionWriter {
    Regular(WriteGuard),
    Attached(AttachedWriteGuard),
+   #[cfg(feature = "observer")]
+   Observable(ObservableWriteGuard),
 }
 
 impl TransactionWriter {
    /// Execute a query on either writer type
-   pub(crate) async fn execute_query<'a>(
+   pub async fn execute_query<'a>(
       &mut self,
       query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
    ) -> Result<sqlx::sqlite::SqliteQueryResult> {
       match self {
          Self::Regular(w) => query.execute(&mut **w).await.map_err(Into::into),
          Self::Attached(w) => query.execute(&mut **w).await.map_err(Into::into),
+         #[cfg(feature = "observer")]
+         Self::Observable(w) => query.execute(&mut **w).await.map_err(Into::into),
       }
    }
 
    /// Fetch all rows from either writer type
-   pub(crate) async fn fetch_all<'a>(
+   pub async fn fetch_all<'a>(
       &mut self,
       query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
       match self {
          Self::Regular(w) => query.fetch_all(&mut **w).await.map_err(Into::into),
          Self::Attached(w) => query.fetch_all(&mut **w).await.map_err(Into::into),
+         #[cfg(feature = "observer")]
+         Self::Observable(w) => query.fetch_all(&mut **w).await.map_err(Into::into),
       }
    }
 
    /// Begin an immediate transaction
-   pub(crate) async fn begin_immediate(&mut self) -> Result<()> {
+   pub async fn begin_immediate(&mut self) -> Result<()> {
       self.execute_query(sqlx::query("BEGIN IMMEDIATE")).await?;
       Ok(())
    }
 
    /// Commit the current transaction
-   pub(crate) async fn commit(&mut self) -> Result<()> {
+   pub async fn commit(&mut self) -> Result<()> {
       self.execute_query(sqlx::query("COMMIT")).await?;
       Ok(())
    }
 
    /// Rollback the current transaction
-   pub(crate) async fn rollback(&mut self) -> Result<()> {
+   pub async fn rollback(&mut self) -> Result<()> {
       self.execute_query(sqlx::query("ROLLBACK")).await?;
       Ok(())
    }
 
    /// Detach all attached databases if this is an attached writer
-   pub(crate) async fn detach_if_attached(self) -> Result<()> {
+   pub async fn detach_if_attached(self) -> Result<()> {
       if let Self::Attached(w) = self {
          w.detach_all().await?;
       }
       Ok(())
+   }
+}
+
+impl From<WriterGuard> for TransactionWriter {
+   fn from(guard: WriterGuard) -> Self {
+      match guard {
+         WriterGuard::Regular(w) => TransactionWriter::Regular(w),
+         #[cfg(feature = "observer")]
+         WriterGuard::Observable(w) => TransactionWriter::Observable(w),
+      }
    }
 }
 
@@ -104,13 +125,6 @@ impl ActiveInterruptibleTransaction {
 
    pub fn transaction_id(&self) -> &str {
       &self.transaction_id
-   }
-
-   pub fn validate_token(&self, token_id: &str) -> Result<()> {
-      if self.transaction_id != token_id {
-         return Err(Error::InvalidTransactionToken);
-      }
-      Ok(())
    }
 
    /// Execute a read query within this transaction and return decoded results
@@ -227,18 +241,23 @@ impl Drop for ActiveInterruptibleTransaction {
    }
 }
 
-/// Global state tracking all active interruptible transactions
+/// Global state tracking all active interruptible transactions.
+///
+/// Enforces one interruptible transaction per database path.
+/// Uses `Mutex` rather than `RwLock` because all operations require write access,
+/// and `Mutex<T>` only requires `T: Send` (not `T: Sync`) — avoiding an
+/// `unsafe impl Sync` that would otherwise be needed due to non-`Sync` inner
+/// types (`PoolConnection`, raw pointers in observer guards).
 #[derive(Clone, Default)]
 pub struct ActiveInterruptibleTransactions(
-   Arc<RwLock<HashMap<String, ActiveInterruptibleTransaction>>>,
+   Arc<Mutex<HashMap<String, ActiveInterruptibleTransaction>>>,
 );
 
 impl ActiveInterruptibleTransactions {
    pub async fn insert(&self, db_path: String, tx: ActiveInterruptibleTransaction) -> Result<()> {
       use std::collections::hash_map::Entry;
-      let mut txs = self.0.write().await;
+      let mut txs = self.0.lock().await;
 
-      // Ensure only one transaction per database using Entry API
       match txs.entry(db_path.clone()) {
          Entry::Vacant(e) => {
             e.insert(tx);
@@ -249,7 +268,7 @@ impl ActiveInterruptibleTransactions {
    }
 
    pub async fn abort_all(&self) {
-      let mut txs = self.0.write().await;
+      let mut txs = self.0.lock().await;
       debug!("Aborting {} active interruptible transaction(s)", txs.len());
 
       for db_path in txs.keys() {
@@ -270,22 +289,25 @@ impl ActiveInterruptibleTransactions {
       db_path: &str,
       token_id: &str,
    ) -> Result<ActiveInterruptibleTransaction> {
-      let mut txs = self.0.write().await;
+      let mut txs = self.0.lock().await;
 
       // Validate token before removal
       let tx = txs
          .get(db_path)
          .ok_or_else(|| Error::NoActiveTransaction(db_path.to_string()))?;
 
-      tx.validate_token(token_id)?;
+      if tx.transaction_id() != token_id {
+         return Err(Error::InvalidTransactionToken);
+      }
 
       // Safe unwrap: we just confirmed the key exists above
       Ok(txs.remove(db_path).unwrap())
    }
 }
 
-/// Tracking for regular (non-pausable) transactions that are in-flight
-/// This allows us to abort them on app exit
+/// Tracking for regular (non-pausable) transactions that are in-flight.
+///
+/// Holds abort handles so transactions can be cancelled on app exit.
 #[derive(Clone, Default)]
 pub struct ActiveRegularTransactions(Arc<RwLock<HashMap<String, AbortHandle>>>);
 
@@ -309,24 +331,19 @@ impl ActiveRegularTransactions {
          abort_handle.abort();
       }
 
-      // Clear all tracked transactions to prevent memory leak
       txs.clear();
    }
 }
 
-/// Cleanup all transactions on app exit
+/// Cleanup all transactions on app exit.
 pub async fn cleanup_all_transactions(
    interruptible: &ActiveInterruptibleTransactions,
    regular: &ActiveRegularTransactions,
 ) {
    debug!("Cleaning up all active transactions");
 
-   // Abort all transaction tasks
    interruptible.abort_all().await;
    regular.abort_all().await;
-
-   // Interruptible transactions will auto-rollback when dropped
-   // Regular transactions will also auto-rollback when aborted task cleans up
 
    debug!("Transaction cleanup initiated");
 }

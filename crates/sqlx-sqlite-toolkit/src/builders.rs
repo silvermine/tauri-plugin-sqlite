@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 use sqlx_sqlite_conn_mgr::AttachedSpec;
 
 use crate::Error;
-use crate::wrapper::{WriteQueryResult, bind_value};
+use crate::wrapper::{DatabaseWrapper, WriteQueryResult, bind_value};
 
 /// Builder for SELECT queries returning multiple rows
 pub struct FetchAllBuilder {
@@ -155,18 +155,14 @@ impl IntoFuture for FetchOneBuilder {
 
 /// Builder for write queries (INSERT/UPDATE/DELETE)
 pub struct ExecuteBuilder {
-   db: Arc<sqlx_sqlite_conn_mgr::SqliteDatabase>,
+   db: DatabaseWrapper,
    query: String,
    values: Vec<JsonValue>,
    attached: Vec<AttachedSpec>,
 }
 
 impl ExecuteBuilder {
-   pub(crate) fn new(
-      db: Arc<sqlx_sqlite_conn_mgr::SqliteDatabase>,
-      query: String,
-      values: Vec<JsonValue>,
-   ) -> Self {
+   pub(crate) fn new(db: DatabaseWrapper, query: String, values: Vec<JsonValue>) -> Self {
       Self {
          db,
          query,
@@ -184,7 +180,7 @@ impl ExecuteBuilder {
    /// Execute the write operation
    pub async fn execute(self) -> Result<WriteQueryResult, Error> {
       if self.attached.is_empty() {
-         // No attached databases - use regular writer
+         // No attached databases - use wrapper's writer (routes through observer when in use)
          let mut writer = self.db.acquire_writer().await?;
          let mut q = sqlx::query(&self.query);
          for value in self.values {
@@ -198,7 +194,8 @@ impl ExecuteBuilder {
       } else {
          // With attached database(s) - acquire writer with attached database(s)
          let mut conn =
-            sqlx_sqlite_conn_mgr::acquire_writer_with_attached(&self.db, self.attached).await?;
+            sqlx_sqlite_conn_mgr::acquire_writer_with_attached(self.db.inner(), self.attached)
+               .await?;
 
          let mut q = sqlx::query(&self.query);
          for value in self.values {
@@ -227,7 +224,7 @@ impl IntoFuture for ExecuteBuilder {
 }
 
 /// Helper to decode SQLite rows to JSON
-fn decode_rows(
+pub(crate) fn decode_rows(
    rows: Vec<sqlx::sqlite::SqliteRow>,
 ) -> Result<Vec<IndexMap<String, JsonValue>>, Error> {
    use sqlx::{Column, Row};

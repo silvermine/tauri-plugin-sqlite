@@ -7,20 +7,17 @@ use tauri::{Emitter, Manager, RunEvent, Runtime, plugin::Builder as PluginBuilde
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
-mod builders;
 mod commands;
-mod decode;
 mod error;
-mod transactions;
-mod wrapper;
+mod resolve;
 
 pub use error::{Error, Result};
 pub use sqlx_sqlite_conn_mgr::{
    AttachedMode, AttachedSpec, Migrator as SqliteMigrator, SqliteDatabaseConfig,
 };
-pub use transactions::{ActiveInterruptibleTransactions, ActiveRegularTransactions, Statement};
-pub use wrapper::{
-   DatabaseWrapper, InterruptibleTransaction, InterruptibleTransactionBuilder,
+pub use sqlx_sqlite_toolkit::{
+   ActiveInterruptibleTransactions, ActiveRegularTransactions, DatabaseWrapper,
+   InterruptibleTransaction, InterruptibleTransactionBuilder, Statement,
    TransactionExecutionBuilder, WriteQueryResult,
 };
 
@@ -253,7 +250,7 @@ impl Builder {
                      handle.block_on(async {
                         // First, abort all active transactions
                         debug!("Aborting active transactions");
-                        transactions::cleanup_all_transactions(&interruptible_txs_clone, &regular_txs_clone).await;
+                        sqlx_sqlite_toolkit::cleanup_all_transactions(&interruptible_txs_clone, &regular_txs_clone).await;
 
                         // Then close databases
                         let mut guard = instances_clone.0.write().await;
@@ -383,7 +380,7 @@ async fn run_migrations_for_database<R: Runtime>(
    };
 
    // Connect to database
-   let db = match DatabaseWrapper::connect_with_path(&abs_path, None).await {
+   let db = match DatabaseWrapper::connect(&abs_path, None).await {
       Ok(wrapper) => wrapper,
       Err(e) => {
          let error_msg = e.to_string();
@@ -469,7 +466,7 @@ fn resolve_migration_path<R: Runtime>(
       .app_config_dir()
       .map_err(|_| Error::InvalidPath("No app config path found".to_string()))?;
 
-   std::fs::create_dir_all(&app_path).map_err(Error::Io)?;
+   std::fs::create_dir_all(&app_path)?;
 
    Ok(app_path.join(path))
 }

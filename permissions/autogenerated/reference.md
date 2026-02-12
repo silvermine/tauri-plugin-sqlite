@@ -7,7 +7,7 @@ Default permissions for the sqlite plugin - allows all database operations
 - `allow-load`
 - `allow-execute`
 - `allow-execute-transaction`
-- `allow-execute-interruptible-transaction`
+- `allow-begin-interruptible-transaction`
 - `allow-transaction-continue`
 - `allow-transaction-read`
 - `allow-fetch-all`
@@ -24,6 +24,32 @@ Default permissions for the sqlite plugin - allows all database operations
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`sqlite:allow-begin-interruptible-transaction`
+
+</td>
+<td>
+
+Enables the begin_interruptible_transaction command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-begin-interruptible-transaction`
+
+</td>
+<td>
+
+Denies the begin_interruptible_transaction command without any pre-configured scope.
+
+</td>
+</tr>
 
 <tr>
 <td>
@@ -106,32 +132,6 @@ Denies the execute command without any pre-configured scope.
 <tr>
 <td>
 
-`sqlite:allow-execute-interruptible-transaction`
-
-</td>
-<td>
-
-Enables the execute_interruptible_transaction command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`sqlite:deny-execute-interruptible-transaction`
-
-</td>
-<td>
-
-Denies the execute_interruptible_transaction command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
 `sqlite:allow-execute-transaction`
 
 </td>
@@ -203,6 +203,32 @@ Enables the fetch_one command without any pre-configured scope.
 <td>
 
 Denies the fetch_one command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:allow-get-migration-events`
+
+</td>
+<td>
+
+Enables the get_migration_events command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`sqlite:deny-get-migration-events`
+
+</td>
+<td>
+
+Denies the get_migration_events command without any pre-configured scope.
 
 </td>
 </tr>

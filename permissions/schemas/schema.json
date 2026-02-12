@@ -295,6 +295,18 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the begin_interruptible_transaction command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-begin-interruptible-transaction",
+          "markdownDescription": "Enables the begin_interruptible_transaction command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the begin_interruptible_transaction command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-begin-interruptible-transaction",
+          "markdownDescription": "Denies the begin_interruptible_transaction command without any pre-configured scope."
+        },
+        {
           "description": "Enables the close command without any pre-configured scope.",
           "type": "string",
           "const": "allow-close",
@@ -331,18 +343,6 @@
           "markdownDescription": "Denies the execute command without any pre-configured scope."
         },
         {
-          "description": "Enables the execute_interruptible_transaction command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-execute-interruptible-transaction",
-          "markdownDescription": "Enables the execute_interruptible_transaction command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the execute_interruptible_transaction command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-execute-interruptible-transaction",
-          "markdownDescription": "Denies the execute_interruptible_transaction command without any pre-configured scope."
-        },
-        {
           "description": "Enables the execute_transaction command without any pre-configured scope.",
           "type": "string",
           "const": "allow-execute-transaction",
@@ -377,6 +377,18 @@
           "type": "string",
           "const": "deny-fetch-one",
           "markdownDescription": "Denies the fetch_one command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_migration_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-migration-events",
+          "markdownDescription": "Enables the get_migration_events command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_migration_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-migration-events",
+          "markdownDescription": "Denies the get_migration_events command without any pre-configured scope."
         },
         {
           "description": "Enables the hello command without any pre-configured scope.",
@@ -439,10 +451,10 @@
           "markdownDescription": "Denies the transaction_read command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the sqlite plugin - allows all database operations\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-execute`\n- `allow-execute-transaction`\n- `allow-execute-interruptible-transaction`\n- `allow-transaction-continue`\n- `allow-transaction-read`\n- `allow-fetch-all`\n- `allow-fetch-one`\n- `allow-close`\n- `allow-close-all`\n- `allow-remove`",
+          "description": "Default permissions for the sqlite plugin - allows all database operations\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-execute`\n- `allow-execute-transaction`\n- `allow-begin-interruptible-transaction`\n- `allow-transaction-continue`\n- `allow-transaction-read`\n- `allow-fetch-all`\n- `allow-fetch-one`\n- `allow-close`\n- `allow-close-all`\n- `allow-remove`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the sqlite plugin - allows all database operations\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-execute`\n- `allow-execute-transaction`\n- `allow-execute-interruptible-transaction`\n- `allow-transaction-continue`\n- `allow-transaction-read`\n- `allow-fetch-all`\n- `allow-fetch-one`\n- `allow-close`\n- `allow-close-all`\n- `allow-remove`"
+          "markdownDescription": "Default permissions for the sqlite plugin - allows all database operations\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-execute`\n- `allow-execute-transaction`\n- `allow-begin-interruptible-transaction`\n- `allow-transaction-continue`\n- `allow-transaction-read`\n- `allow-fetch-all`\n- `allow-fetch-one`\n- `allow-close`\n- `allow-close-all`\n- `allow-remove`"
         }
       ]
     }

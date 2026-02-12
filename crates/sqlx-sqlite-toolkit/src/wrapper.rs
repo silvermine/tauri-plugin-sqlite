@@ -1,11 +1,13 @@
-use std::fs::create_dir_all;
-use std::path::PathBuf;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx_sqlite_conn_mgr::{SqliteDatabase, SqliteDatabaseConfig};
-use tauri::{AppHandle, Manager, Runtime};
+use sqlx::sqlite::SqliteConnection;
+use sqlx_sqlite_conn_mgr::{SqliteDatabase, SqliteDatabaseConfig, WriteGuard};
+
+#[cfg(feature = "observer")]
+use sqlx_sqlite_observer::{ObservableSqliteDatabase, ObservableWriteGuard, ObserverConfig};
 
 use crate::Error;
 
@@ -21,10 +23,52 @@ pub struct WriteQueryResult {
    pub last_insert_id: i64,
 }
 
-/// Wrapper around SqliteDatabase that adapts it for the plugin interface
+/// Unified writer guard that routes through observer when enabled.
+///
+/// Derefs to `SqliteConnection` so it can be used with `sqlx::query().execute()`.
+pub enum WriterGuard {
+   /// Regular writer from the connection manager.
+   Regular(WriteGuard),
+   /// Observable writer that tracks changes via SQLite hooks.
+   #[cfg(feature = "observer")]
+   Observable(ObservableWriteGuard),
+}
+
+impl Deref for WriterGuard {
+   type Target = SqliteConnection;
+
+   fn deref(&self) -> &Self::Target {
+      match self {
+         WriterGuard::Regular(w) => w,
+         #[cfg(feature = "observer")]
+         WriterGuard::Observable(w) => w,
+      }
+   }
+}
+
+impl DerefMut for WriterGuard {
+   fn deref_mut(&mut self) -> &mut Self::Target {
+      match self {
+         WriterGuard::Regular(w) => &mut *w,
+         #[cfg(feature = "observer")]
+         WriterGuard::Observable(w) => &mut *w,
+      }
+   }
+}
+
+/// Wrapper around SqliteDatabase that provides a high-level API for database operations.
+///
+/// This struct is the main entry point for interacting with SQLite databases through
+/// the toolkit. It wraps the connection manager's `SqliteDatabase` and provides
+/// builder-pattern APIs for queries, transactions, and write operations.
+///
+/// When the `observer` feature is enabled, the wrapper can also manage an
+/// `ObservableSqliteDatabase` for change notification support.
 #[derive(Clone)]
 pub struct DatabaseWrapper {
    inner: Arc<SqliteDatabase>,
+   #[cfg(feature = "observer")]
+   observer: Option<ObservableSqliteDatabase>,
 }
 
 impl DatabaseWrapper {
@@ -32,24 +76,6 @@ impl DatabaseWrapper {
    ///
    /// This is useful when you need to create `AttachedSpec` instances for cross-database
    /// operations with interruptible transactions.
-   ///
-   /// # Example
-   ///
-   /// ```no_run
-   /// # use tauri_plugin_sqlite::{DatabaseWrapper, AttachedSpec, AttachedMode};
-   /// # use std::sync::Arc;
-   /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-   /// # let db1: DatabaseWrapper = todo!();
-   /// # let db2: DatabaseWrapper = todo!();
-   /// // Create an attached spec using the inner database reference
-   /// let spec = AttachedSpec {
-   ///     database: Arc::clone(db2.inner()),
-   ///     schema_name: "other".to_string(),
-   ///     mode: AttachedMode::ReadOnly,
-   /// };
-   /// # Ok(())
-   /// # }
-   /// ```
    pub fn inner(&self) -> &Arc<SqliteDatabase> {
       &self.inner
    }
@@ -59,39 +85,48 @@ impl DatabaseWrapper {
       &self.inner
    }
 
-   /// Acquire writer connection (for pausable transactions)
-   pub async fn acquire_writer(&self) -> Result<sqlx_sqlite_conn_mgr::WriteGuard, Error> {
+   /// Acquire a writer guard.
+   ///
+   /// When observation is enabled, returns an observable writer that tracks
+   /// changes via SQLite hooks. Otherwise, returns a regular writer.
+   pub async fn acquire_writer(&self) -> Result<WriterGuard, Error> {
+      #[cfg(feature = "observer")]
+      if let Some(ref observable) = self.observer {
+         let writer = observable.acquire_writer().await.map_err(Error::Observer)?;
+         return Ok(WriterGuard::Observable(writer));
+      }
+
+      Ok(WriterGuard::Regular(self.inner.acquire_writer().await?))
+   }
+
+   /// Acquire a regular (non-observable) writer connection.
+   ///
+   /// This always bypasses the observer, even when observation is enabled.
+   /// Useful when you need a writer for operations that should not trigger
+   /// change notifications (e.g., internal bookkeeping).
+   pub async fn acquire_regular_writer(&self) -> Result<WriteGuard, Error> {
       Ok(self.inner.acquire_writer().await?)
    }
 
-   /// Begin an interruptible transaction that can be paused and resumed
+   /// Begin an interruptible transaction that can be paused and resumed.
    ///
    /// Returns a builder that allows attaching databases before executing the transaction.
+   /// Unlike `execute_transaction()`, this allows reading uncommitted data mid-transaction.
    ///
-   /// # Example
+   /// # Examples
    ///
    /// ```no_run
-   /// # use tauri_plugin_sqlite::{DatabaseWrapper, Statement};
-   /// # use serde_json::json;
-   /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-   /// # let db: DatabaseWrapper = todo!();
-   /// // Start transaction with initial statements
-   /// let mut tx = db
-   ///    .begin_interruptible_transaction()
-   ///    .execute(vec![
-   ///       ("DELETE FROM cache WHERE expired = 1", vec![])
-   ///    ])
-   ///    .await?;
+   /// # async fn example(db: &sqlx_sqlite_toolkit::DatabaseWrapper) -> Result<(), sqlx_sqlite_toolkit::Error> {
+   /// use serde_json::json;
    ///
-   /// // Continue with more work
-   /// let results = tx.continue_with(vec![
-   ///    Statement {
-   ///       query: "INSERT INTO items (name) VALUES (?)".to_string(),
-   ///       values: vec![json!("item1")],
-   ///    }
-   /// ]).await?;
+   /// let mut tx = db.begin_interruptible_transaction()
+   ///     .execute(vec![
+   ///         ("INSERT INTO users (name) VALUES (?)", vec![json!("Alice")]),
+   ///     ]).await?;
    ///
-   /// // Commit when done
+   /// // Read uncommitted data within the transaction
+   /// let rows = tx.read("SELECT count(*) as n FROM users".into(), vec![]).await?;
+   ///
    /// tx.commit().await?;
    /// # Ok(())
    /// # }
@@ -100,66 +135,63 @@ impl DatabaseWrapper {
       InterruptibleTransactionBuilder::new(self.clone())
    }
 
-   /// Connect to a SQLite database via the connection manager
-   pub async fn connect<R: Runtime>(
-      path: &str,
-      app: &AppHandle<R>,
-      custom_config: Option<SqliteDatabaseConfig>,
-   ) -> Result<Self, Error> {
-      // Resolve path relative to app_config_dir
-      let abs_path = resolve_database_path(path, app)?;
-
-      Self::connect_with_path(&abs_path, custom_config).await
-   }
-
    /// Connect to a SQLite database with an absolute path.
    ///
-   /// This is the core connection method used by `connect()`. It's also
-   /// used by the migration task during plugin setup.
+   /// This is the core connection method. It connects to the database at the given
+   /// absolute path with optional configuration.
    ///
    /// Note: `SqliteDatabase::connect()` caches instances in a global registry.
    /// Multiple calls with the same path return the same underlying database,
    /// so this wrapper is lightweight - the actual connection pools are shared.
-   pub async fn connect_with_path(
+   ///
+   /// # Examples
+   ///
+   /// ```no_run
+   /// # async fn example() -> Result<(), sqlx_sqlite_toolkit::Error> {
+   /// use sqlx_sqlite_toolkit::DatabaseWrapper;
+   /// use std::path::Path;
+   ///
+   /// let db = DatabaseWrapper::connect(Path::new("/tmp/my.db"), None).await?;
+   /// # Ok(())
+   /// # }
+   /// ```
+   pub async fn connect(
       abs_path: &std::path::Path,
       custom_config: Option<SqliteDatabaseConfig>,
    ) -> Result<Self, Error> {
-      // Use connection manager to connect with optional custom config
       let db = SqliteDatabase::connect(abs_path, custom_config).await?;
 
-      Ok(Self { inner: db })
+      Ok(Self {
+         inner: db,
+         #[cfg(feature = "observer")]
+         observer: None,
+      })
    }
 
-   /// Create a builder for write queries (INSERT/UPDATE/DELETE)
+   /// Create a builder for write queries (INSERT/UPDATE/DELETE).
    ///
    /// Returns a builder that can optionally attach databases before executing.
    ///
-   /// # Example
+   /// # Examples
    ///
    /// ```no_run
-   /// # use tauri_plugin_sqlite::DatabaseWrapper;
-   /// # use serde_json::json;
-   /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-   /// # let db: DatabaseWrapper = todo!();
-   /// # let sql = "INSERT INTO users (name) VALUES (?)";
-   /// # let params = vec![json!("Alice")];
-   /// // Without attached databases
-   /// db.execute(sql.to_string(), params.clone()).await?;
+   /// # async fn example(db: &sqlx_sqlite_toolkit::DatabaseWrapper) -> Result<(), sqlx_sqlite_toolkit::Error> {
+   /// use serde_json::json;
    ///
-   /// // With attached database(s)
-   /// # let spec1 = todo!();
-   /// # let spec2 = todo!();
-   /// db.execute(sql.to_string(), params)
-   ///   .attach(vec![spec1, spec2])
-   ///   .await?;
+   /// let result = db.execute(
+   ///     "INSERT INTO users (name, age) VALUES (?, ?)".into(),
+   ///     vec![json!("Alice"), json!(30)],
+   /// ).execute().await?;
+   ///
+   /// println!("Inserted row {}", result.last_insert_id);
    /// # Ok(())
    /// # }
    /// ```
    pub fn execute(&self, query: String, values: Vec<JsonValue>) -> crate::builders::ExecuteBuilder {
-      crate::builders::ExecuteBuilder::new(Arc::clone(&self.inner), query, values)
+      crate::builders::ExecuteBuilder::new(self.clone(), query, values)
    }
 
-   /// Execute multiple statements atomically within a transaction
+   /// Execute multiple statements atomically within a transaction.
    ///
    /// Returns a builder that allows attaching databases before executing the transaction.
    /// All statements either succeed together or fail together.
@@ -167,22 +199,18 @@ impl DatabaseWrapper {
    /// Use this when you have a batch of writes and don't need to read data mid-transaction.
    /// For transactions requiring reads of uncommitted data, use `begin_interruptible_transaction()`.
    ///
-   /// # Example
+   /// # Examples
    ///
    /// ```no_run
-   /// # use tauri_plugin_sqlite::DatabaseWrapper;
-   /// # use serde_json::json;
-   /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-   /// # let db: DatabaseWrapper = todo!();
-   /// // Execute multiple inserts atomically
-   /// let results = db
-   ///    .execute_transaction(vec![
-   ///       ("INSERT INTO users (name) VALUES (?)", vec![json!("Alice")]),
-   ///       ("INSERT INTO audit_log (action) VALUES (?)", vec![json!("user_created")])
-   ///    ])
-   ///    .await?;
+   /// # async fn example(db: &sqlx_sqlite_toolkit::DatabaseWrapper) -> Result<(), sqlx_sqlite_toolkit::Error> {
+   /// use serde_json::json;
    ///
-   /// println!("User ID: {}", results[0].last_insert_id);
+   /// let results = db.execute_transaction(vec![
+   ///     ("INSERT INTO users (name) VALUES (?)", vec![json!("Alice")]),
+   ///     ("INSERT INTO users (name) VALUES (?)", vec![json!("Bob")]),
+   /// ]).execute().await?;
+   ///
+   /// println!("Inserted {} rows total", results.len());
    /// # Ok(())
    /// # }
    /// ```
@@ -193,28 +221,22 @@ impl DatabaseWrapper {
       TransactionExecutionBuilder::new(self.clone(), statements)
    }
 
-   /// Create a builder for SELECT queries returning multiple rows
+   /// Create a builder for SELECT queries returning multiple rows.
    ///
    /// Returns a builder that can optionally attach databases before executing.
    ///
-   /// # Example
+   /// # Examples
    ///
    /// ```no_run
-   /// # use tauri_plugin_sqlite::DatabaseWrapper;
-   /// # use serde_json::json;
-   /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-   /// # let db: DatabaseWrapper = todo!();
-   /// # let sql = "SELECT * FROM users";
-   /// # let params = vec![];
-   /// // Without attached databases
-   /// db.fetch_all(sql.to_string(), params.clone()).await?;
+   /// # async fn example(db: &sqlx_sqlite_toolkit::DatabaseWrapper) -> Result<(), sqlx_sqlite_toolkit::Error> {
+   /// let rows = db.fetch_all(
+   ///     "SELECT name, age FROM users WHERE age > ?".into(),
+   ///     vec![serde_json::json!(21)],
+   /// ).execute().await?;
    ///
-   /// // With attached database(s)
-   /// # let spec1 = todo!();
-   /// # let spec2 = todo!();
-   /// db.fetch_all(sql.to_string(), params)
-   ///   .attach(vec![spec1, spec2])
-   ///   .await?;
+   /// for row in &rows {
+   ///     println!("{}: {}", row["name"], row["age"]);
+   /// }
    /// # Ok(())
    /// # }
    /// ```
@@ -226,30 +248,24 @@ impl DatabaseWrapper {
       crate::builders::FetchAllBuilder::new(Arc::clone(&self.inner), query, values)
    }
 
-   /// Create a builder for SELECT queries returning zero or one row
+   /// Create a builder for SELECT queries returning zero or one row.
    ///
    /// Returns a builder that can optionally attach databases before executing.
-   ///
    /// Returns an error if the query returns more than one row.
    ///
-   /// # Example
+   /// # Examples
    ///
    /// ```no_run
-   /// # use tauri_plugin_sqlite::DatabaseWrapper;
-   /// # use serde_json::json;
-   /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-   /// # let db: DatabaseWrapper = todo!();
-   /// # let sql = "SELECT * FROM users WHERE id = ?";
-   /// # let params = vec![json!(1)];
-   /// // Without attached databases
-   /// db.fetch_one(sql.to_string(), params.clone()).await?;
+   /// # async fn example(db: &sqlx_sqlite_toolkit::DatabaseWrapper) -> Result<(), sqlx_sqlite_toolkit::Error> {
+   /// let user = db.fetch_one(
+   ///     "SELECT name FROM users WHERE id = ?".into(),
+   ///     vec![serde_json::json!(1)],
+   /// ).execute().await?;
    ///
-   /// // With attached database(s)
-   /// # let spec1 = todo!();
-   /// # let spec2 = todo!();
-   /// db.fetch_one(sql.to_string(), params)
-   ///   .attach(vec![spec1, spec2])
-   ///   .await?;
+   /// match user {
+   ///     Some(row) => println!("Found: {}", row["name"]),
+   ///     None => println!("Not found"),
+   /// }
    /// # Ok(())
    /// # }
    /// ```
@@ -273,18 +289,63 @@ impl DatabaseWrapper {
       Ok(())
    }
 
-   /// Close the database connection
+   /// Close the database connection.
+   ///
+   /// Checkpoints the WAL and closes all connection pools.
    pub async fn close(self) -> Result<(), Error> {
-      // Close via Arc (handles both owned and shared cases)
       self.inner.close().await?;
       Ok(())
    }
 
-   /// Close the database connection and remove all database files
+   /// Close the database connection and remove all database files.
+   ///
+   /// Removes the main database file, WAL, and SHM files.
    pub async fn remove(self) -> Result<(), Error> {
-      // Remove via Arc (handles both owned and shared cases)
       self.inner.remove().await?;
       Ok(())
+   }
+
+   /// Enable observation on this database for the specified tables.
+   ///
+   /// After calling this, write operations will be tracked and subscribers
+   /// can receive change notifications.
+   ///
+   /// Requires the `observer` feature.
+   #[cfg(feature = "observer")]
+   pub fn enable_observation(&mut self, config: ObserverConfig) {
+      self.observer = Some(ObservableSqliteDatabase::new(
+         Arc::clone(&self.inner),
+         config,
+      ));
+   }
+
+   /// Disable observation on this database.
+   ///
+   /// Drops the observable wrapper and stops tracking changes.
+   /// Existing subscribers will stop receiving notifications.
+   ///
+   /// Requires the `observer` feature.
+   #[cfg(feature = "observer")]
+   pub fn disable_observation(&mut self) {
+      self.observer = None;
+   }
+
+   /// Get a reference to the observable database, if observation is enabled.
+   ///
+   /// Returns `None` if observation has not been enabled via `enable_observation()`.
+   ///
+   /// Requires the `observer` feature.
+   #[cfg(feature = "observer")]
+   pub fn observable(&self) -> Option<&ObservableSqliteDatabase> {
+      self.observer.as_ref()
+   }
+
+   /// Returns true if observation is currently enabled on this database.
+   ///
+   /// Requires the `observer` feature.
+   #[cfg(feature = "observer")]
+   pub fn is_observing(&self) -> bool {
+      self.observer.is_some()
    }
 }
 
@@ -303,32 +364,6 @@ impl InterruptibleTransactionBuilder {
    }
 
    /// Attach databases for cross-database operations
-   ///
-   /// # Example
-   ///
-   /// ```no_run
-   /// # use tauri_plugin_sqlite::DatabaseWrapper;
-   /// # use sqlx_sqlite_conn_mgr::{AttachedSpec, AttachedMode};
-   /// # use serde_json::json;
-   /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-   /// # let db: DatabaseWrapper = todo!();
-   /// # let archive_db: std::sync::Arc<sqlx_sqlite_conn_mgr::SqliteDatabase> = todo!();
-   /// let mut tx = db
-   ///    .begin_interruptible_transaction()
-   ///    .attach(vec![AttachedSpec {
-   ///       database: archive_db,
-   ///       schema_name: "archive".to_string(),
-   ///       mode: AttachedMode::ReadOnly,
-   ///    }])
-   ///    .execute(vec![
-   ///       ("INSERT INTO items SELECT * FROM archive.items", vec![])
-   ///    ])
-   ///    .await?;
-   ///
-   /// tx.commit().await?;
-   /// # Ok(())
-   /// # }
-   /// ```
    pub fn attach(mut self, specs: Vec<sqlx_sqlite_conn_mgr::AttachedSpec>) -> Self {
       self.attached = specs;
       self
@@ -345,7 +380,8 @@ impl InterruptibleTransactionBuilder {
 
       // Acquire appropriate writer based on whether databases are attached
       let mut writer = if self.attached.is_empty() {
-         TransactionWriter::Regular(self.db.acquire_writer().await?)
+         let guard = self.db.acquire_writer().await?;
+         TransactionWriter::from(guard)
       } else {
          let guard =
             sqlx_sqlite_conn_mgr::acquire_writer_with_attached(self.db.inner(), self.attached)
@@ -449,7 +485,8 @@ impl TransactionExecutionBuilder {
 
       // Acquire appropriate writer based on whether databases are attached
       let mut writer = if self.attached.is_empty() {
-         TransactionWriter::Regular(self.db.acquire_writer().await?)
+         let guard = self.db.acquire_writer().await?;
+         TransactionWriter::from(guard)
       } else {
          let guard =
             sqlx_sqlite_conn_mgr::acquire_writer_with_attached(self.db.inner(), self.attached)
@@ -506,7 +543,7 @@ impl std::future::IntoFuture for TransactionExecutionBuilder {
 }
 
 /// Helper function to bind a JSON value to a SQLx query
-pub(crate) fn bind_value<'a>(
+pub fn bind_value<'a>(
    query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
    value: JsonValue,
 ) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
@@ -533,20 +570,4 @@ pub(crate) fn bind_value<'a>(
    } else {
       query.bind(value)
    }
-}
-
-/// Resolve database file path relative to app config directory.
-///
-/// Paths are joined to `app_config_dir()` (e.g., `Library/Application Support/${bundleIdentifier}` on iOS).
-/// Special paths like `:memory:` are passed through unchanged.
-fn resolve_database_path<R: Runtime>(path: &str, app: &AppHandle<R>) -> Result<PathBuf, Error> {
-   let app_path = app
-      .path()
-      .app_config_dir()
-      .expect("No App config path was found!");
-
-   create_dir_all(&app_path).expect("Couldn't create app config dir");
-
-   // Join the relative path to the app config directory
-   Ok(app_path.join(path))
 }

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-begin-interruptible-transaction"
+description = "Enables the begin_interruptible_transaction command without any pre-configured scope."
+commands.allow = ["begin_interruptible_transaction"]
+
+[[permission]]
+identifier = "deny-begin-interruptible-transaction"
+description = "Denies the begin_interruptible_transaction command without any pre-configured scope."
+commands.deny = ["begin_interruptible_transaction"]

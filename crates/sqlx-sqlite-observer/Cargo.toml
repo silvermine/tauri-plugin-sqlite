@@ -13,11 +13,11 @@ keywords = ["sqlite", "sqlx", "reactive", "observer", "database"]
 categories = ["database", "asynchronous"]
 
 [features]
-conn-mgr = ["dep:sqlx-sqlite-conn-mgr"]
 # Bundle SQLite by default - preupdate hooks require SQLITE_ENABLE_PREUPDATE_HOOK
 # which most system SQLite libraries don't have enabled.
 default = ["bundled"]
 bundled = ["libsqlite3-sys/bundled"]
+conn-mgr = ["dep:sqlx-sqlite-conn-mgr"]
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["sync"] }
@@ -29,7 +29,7 @@ regex = "1.12.3"
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio"], default-features = false }
 # Required for preupdate_hook - SQLite must be compiled with SQLITE_ENABLE_PREUPDATE_HOOK
 libsqlite3-sys = { version = "0.30.1", features = ["preupdate_hook"] }
-sqlx-sqlite-conn-mgr = { version = "0.8.6", optional = true }
+sqlx-sqlite-conn-mgr = { path = "../sqlx-sqlite-conn-mgr", version = "0.8.6", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["full", "macros"] }
