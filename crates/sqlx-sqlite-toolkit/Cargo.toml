@@ -5,6 +5,12 @@ version = "0.8.6"
 license = "MIT"
 edition = "2024"
 rust-version = "1.89"
+authors = ["Jeremy Thomerson"]
+description = "High-level SQLite API built on sqlx with builder-pattern queries, transactions, and JSON decoding"
+repository = "https://github.com/silvermine/tauri-plugin-sqlite"
+readme = "README.md"
+keywords = ["sqlite", "sqlx", "database", "transactions", "async"]
+categories = ["database", "asynchronous"]
 
 [features]
 default = []

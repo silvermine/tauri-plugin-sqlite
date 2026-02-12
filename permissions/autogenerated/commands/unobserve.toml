@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-unobserve"
+description = "Enables the unobserve command without any pre-configured scope."
+commands.allow = ["unobserve"]
+
+[[permission]]
+identifier = "deny-unobserve"
+description = "Denies the unobserve command without any pre-configured scope."
+commands.deny = ["unobserve"]

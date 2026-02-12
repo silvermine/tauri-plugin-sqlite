@@ -17,6 +17,7 @@ module.exports = [
          '**/*.d.ts',
          '**/commitlint.config.cjs',
          'vitest.config.ts',
+         'examples/**',
       ],
    },
    ...config,

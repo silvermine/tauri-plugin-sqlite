@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 
 /**
  * Valid SQLite parameter binding value types.
@@ -262,6 +262,114 @@ export interface MigrationEvent {
 
    /** Error message (on "failed") */
    error?: string;
+}
+
+// ─── Observer Types ───
+
+/**
+ * Configuration for the database observer.
+ */
+export interface ObserverConfig {
+
+   /**
+    * Capacity of the broadcast channel for change notifications.
+    *
+    * Set this to at least your largest expected transaction size (number of
+    * INSERT/UPDATE/DELETE statements in a single transaction). Default: 256.
+    */
+   channelCapacity?: number;
+
+   /**
+    * Whether to capture column values in change notifications.
+    *
+    * When `true` (default), `TableChange` includes `oldValues` and `newValues`
+    * with actual column data. When `false`, these fields are undefined,
+    * reducing memory usage per notification.
+    */
+   captureValues?: boolean;
+}
+
+/**
+ * The type of change operation that occurred.
+ */
+export type ChangeOperation = 'insert' | 'update' | 'delete';
+
+/**
+ * A typed column value from SQLite.
+ *
+ * Tagged union representing a single column's value with its native SQLite type.
+ */
+export type ColumnValue =
+   | { type: 'null' }
+   | { type: 'integer'; value: number }
+   | { type: 'real'; value: number }
+   | { type: 'text'; value: string }
+   | { type: 'blob'; value: string }; // base64-encoded
+
+/**
+ * Notification of a change to a database table.
+ */
+export interface TableChange {
+
+   /** Name of the table that was changed */
+   table: string;
+
+   /** The type of change operation (insert, update, delete) */
+   operation?: ChangeOperation;
+
+   /** The SQLite internal rowid (undefined for WITHOUT ROWID tables) */
+   rowid?: number;
+
+   /** Primary key value(s) for the affected row */
+   primaryKey: ColumnValue[];
+
+   /** Column values before the change (for update and delete) */
+   oldValues?: ColumnValue[];
+
+   /** Column values after the change (for insert and update) */
+   newValues?: ColumnValue[];
+}
+
+/**
+ * Event yielded by a table change subscription.
+ *
+ * Most events are `change` variants containing actual table change data.
+ * A `lagged` event indicates the consumer fell behind and missed some
+ * notifications.
+ */
+export type TableChangeEvent =
+   | { event: 'change'; data: TableChange }
+   | { event: 'lagged'; data: { count: number } };
+
+/**
+ * Represents an active subscription to table change notifications.
+ *
+ * Use `unsubscribe()` to stop receiving notifications.
+ */
+export class Subscription {
+   private readonly _subscriptionId: string;
+
+   public constructor(subscriptionId: string) {
+      this._subscriptionId = subscriptionId;
+   }
+
+   /**
+    * Get the subscription ID.
+    */
+   public get id(): string {
+      return this._subscriptionId;
+   }
+
+   /**
+    * Stop receiving change notifications for this subscription.
+    *
+    * @returns `true` if the subscription was active and removed
+    */
+   public async unsubscribe(): Promise<boolean> {
+      return await invoke<boolean>('plugin:sqlite|unsubscribe', {
+         subscriptionId: this._subscriptionId,
+      });
+   }
 }
 
 /**
@@ -761,6 +869,104 @@ export default class Database {
     */
    public fetchOne<T>(query: string, bindValues?: SqlValue[]): FetchOneBuilder<T> {
       return new FetchOneBuilder<T>(this, query, bindValues ?? []);
+   }
+
+   // ─── Observer Methods ───
+
+   /**
+    * **observe**
+    *
+    * Enable change observation for the specified tables.
+    *
+    * Must be called before `subscribe()`. This configures the database to track
+    * changes via SQLite hooks. Changes are only published after transactions commit.
+    *
+    * @param tables - Table names to observe for changes
+    * @param config - Optional observer configuration
+    *
+    * @example
+    * ```ts
+    * await db.observe(['users', 'posts']);
+    *
+    * // With custom config
+    * await db.observe(['users'], {
+    *    channelCapacity: 512,
+    *    captureValues: false,
+    * });
+    * ```
+    */
+   public async observe(tables: string[], config?: ObserverConfig): Promise<void> {
+      await invoke<void>('plugin:sqlite|observe', {
+         db: this.path,
+         tables,
+         config: config ?? null,
+      });
+   }
+
+   /**
+    * **subscribe**
+    *
+    * Subscribe to change notifications for specific tables.
+    *
+    * Returns a `Subscription` that can be used to unsubscribe later. Change events
+    * are streamed to the provided callback function.
+    *
+    * Requires `observe()` to have been called first.
+    *
+    * @param tables - Table names to receive notifications for
+    * @param onEvent - Callback invoked for each change event
+    * @returns A Subscription that can be used to stop receiving notifications
+    *
+    * @example
+    * ```ts
+    * await db.observe(['users']);
+    *
+    * const subscription = await db.subscribe(['users'], (event) => {
+    *    if (event.event === 'change') {
+    *       console.log(`${event.data.operation} on ${event.data.table}`);
+    *       console.log('Primary key:', event.data.primaryKey);
+    *    } else {
+    *       console.warn(`Missed ${event.data.count} notifications`);
+    *    }
+    * });
+    *
+    * // Later, stop receiving notifications
+    * await subscription.unsubscribe();
+    * ```
+    */
+   public async subscribe(
+      tables: string[],
+      onEvent: (event: TableChangeEvent) => void
+   ): Promise<Subscription> {
+      const channel = new Channel<TableChangeEvent>();
+
+      channel.onmessage = onEvent;
+
+      const subscriptionId = await invoke<string>('plugin:sqlite|subscribe', {
+         db: this.path,
+         tables,
+         onEvent: channel,
+      });
+
+      return new Subscription(subscriptionId);
+   }
+
+   /**
+    * **unobserve**
+    *
+    * Disable change observation for this database.
+    *
+    * Stops tracking changes and aborts all active subscriptions for this database.
+    *
+    * @example
+    * ```ts
+    * await db.unobserve();
+    * ```
+    */
+   public async unobserve(): Promise<void> {
+      await invoke<void>('plugin:sqlite|unobserve', {
+         db: this.path,
+      });
    }
 
    /**
