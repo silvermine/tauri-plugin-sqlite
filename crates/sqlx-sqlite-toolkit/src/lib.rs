@@ -4,7 +4,7 @@
 //! and application-level code (e.g., a Tauri plugin). It provides:
 //!
 //! - [`DatabaseWrapper`] — main entry point wrapping a connection-managed database
-//! - Builder-pattern APIs for queries ([`ExecuteBuilder`], [`FetchAllBuilder`], [`FetchOneBuilder`])
+//! - Builder-pattern APIs for queries ([`ExecuteBuilder`], [`FetchAllBuilder`], [`FetchOneBuilder`], [`FetchPageBuilder`])
 //! - Transaction support ([`TransactionExecutionBuilder`], [`InterruptibleTransactionBuilder`])
 //! - JSON type decoding for SQLite values
 //!
@@ -37,11 +37,13 @@
 pub mod builders;
 pub mod decode;
 pub mod error;
+pub mod pagination;
 pub mod transactions;
 pub mod wrapper;
 
-pub use builders::{ExecuteBuilder, FetchAllBuilder, FetchOneBuilder};
+pub use builders::{ExecuteBuilder, FetchAllBuilder, FetchOneBuilder, FetchPageBuilder};
 pub use error::{Error, Result};
+pub use pagination::{KeysetColumn, KeysetPage, SortDirection};
 pub use transactions::{
    ActiveInterruptibleTransaction, ActiveInterruptibleTransactions, ActiveRegularTransactions,
    Statement, TransactionWriter, cleanup_all_transactions,

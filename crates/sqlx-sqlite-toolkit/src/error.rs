@@ -54,6 +54,42 @@ pub enum Error {
    #[error("io error: {0}")]
    Io(#[from] std::io::Error),
 
+   /// Keyset pagination requires at least one column.
+   #[error("keyset pagination requires at least one column")]
+   EmptyKeysetColumns,
+
+   /// Page size must be greater than zero.
+   #[error("page size must be greater than zero")]
+   InvalidPageSize,
+
+   /// Cursor length does not match keyset column count.
+   #[error("cursor has {cursor_len} values but keyset has {keyset_len} columns")]
+   CursorLengthMismatch {
+      cursor_len: usize,
+      keyset_len: usize,
+   },
+
+   /// Pagination base query must not contain top-level ORDER BY or LIMIT clauses.
+   #[error(
+      "pagination base query must not contain top-level ORDER BY or LIMIT clauses (these are added automatically; subquery usage is fine)"
+   )]
+   InvalidPaginationQuery,
+
+   /// Keyset column not found in query results.
+   #[error("keyset column '{column}' not found in query results")]
+   CursorColumnNotFound { column: String },
+
+   /// Keyset column name contains invalid characters.
+   ///
+   /// Column names must match `[a-zA-Z_][a-zA-Z0-9_.]*` (letters, digits,
+   /// underscores, and dots for qualified names like `table.column`).
+   #[error("invalid keyset column name '{name}': must match [a-zA-Z_][a-zA-Z0-9_.]*")]
+   InvalidColumnName { name: String },
+
+   /// Cannot provide both `after` and `before` cursors.
+   #[error("cannot provide both 'after' and 'before' cursors")]
+   ConflictingCursors,
+
    /// Generic error for operations that don't fit other categories.
    #[error("{0}")]
    Other(String),
@@ -82,6 +118,13 @@ impl Error {
          #[cfg(feature = "observer")]
          Error::Observer(_) => "OBSERVER_ERROR".to_string(),
          Error::Io(_) => "IO_ERROR".to_string(),
+         Error::EmptyKeysetColumns => "EMPTY_KEYSET_COLUMNS".to_string(),
+         Error::InvalidPageSize => "INVALID_PAGE_SIZE".to_string(),
+         Error::CursorLengthMismatch { .. } => "CURSOR_LENGTH_MISMATCH".to_string(),
+         Error::InvalidPaginationQuery => "INVALID_PAGINATION_QUERY".to_string(),
+         Error::CursorColumnNotFound { .. } => "CURSOR_COLUMN_NOT_FOUND".to_string(),
+         Error::InvalidColumnName { .. } => "INVALID_COLUMN_NAME".to_string(),
+         Error::ConflictingCursors => "CONFLICTING_CURSORS".to_string(),
          Error::Other(_) => "ERROR".to_string(),
       }
    }
@@ -163,5 +206,63 @@ mod tests {
       // RowNotFound is not a database error, so no SQLite code
       let err = Error::Sqlx(sqlx::Error::RowNotFound);
       assert_eq!(err.error_code(), "SQLX_ERROR");
+   }
+
+   #[test]
+   fn test_error_code_empty_keyset_columns() {
+      let err = Error::EmptyKeysetColumns;
+      assert_eq!(err.error_code(), "EMPTY_KEYSET_COLUMNS");
+      assert!(err.to_string().contains("at least one column"));
+   }
+
+   #[test]
+   fn test_error_code_invalid_page_size() {
+      let err = Error::InvalidPageSize;
+      assert_eq!(err.error_code(), "INVALID_PAGE_SIZE");
+      assert!(err.to_string().contains("greater than zero"));
+   }
+
+   #[test]
+   fn test_error_code_cursor_length_mismatch() {
+      let err = Error::CursorLengthMismatch {
+         cursor_len: 2,
+         keyset_len: 3,
+      };
+      assert_eq!(err.error_code(), "CURSOR_LENGTH_MISMATCH");
+      assert!(err.to_string().contains("2"));
+      assert!(err.to_string().contains("3"));
+   }
+
+   #[test]
+   fn test_error_code_invalid_pagination_query() {
+      let err = Error::InvalidPaginationQuery;
+      assert_eq!(err.error_code(), "INVALID_PAGINATION_QUERY");
+      assert!(err.to_string().contains("top-level ORDER BY or LIMIT"));
+   }
+
+   #[test]
+   fn test_error_code_cursor_column_not_found() {
+      let err = Error::CursorColumnNotFound {
+         column: "score".into(),
+      };
+      assert_eq!(err.error_code(), "CURSOR_COLUMN_NOT_FOUND");
+      assert!(err.to_string().contains("score"));
+   }
+
+   #[test]
+   fn test_error_code_invalid_column_name() {
+      let err = Error::InvalidColumnName {
+         name: "bad;name".into(),
+      };
+      assert_eq!(err.error_code(), "INVALID_COLUMN_NAME");
+      assert!(err.to_string().contains("bad;name"));
+   }
+
+   #[test]
+   fn test_error_code_conflicting_cursors() {
+      let err = Error::ConflictingCursors;
+      assert_eq!(err.error_code(), "CONFLICTING_CURSORS");
+      assert!(err.to_string().contains("after"));
+      assert!(err.to_string().contains("before"));
    }
 }
