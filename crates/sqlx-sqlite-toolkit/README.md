@@ -127,6 +127,61 @@ tx.commit().await?;
 // Or: tx.rollback().await?;
 ```
 
+### Pagination
+
+When working with large result sets, loading all rows at once can cause
+performance degradation and excessive memory usage. The toolkit provides
+built-in pagination via `fetch_page` to fetch data in fixed-size pages,
+keeping memory bounded and queries fast regardless of total row count.
+
+#### Why Keyset Pagination
+
+The toolkit uses keyset (cursor-based) pagination rather than traditional
+OFFSET-based pagination. With OFFSET, the database must scan and discard
+all skipped rows on every page request, making deeper pages progressively
+slower. Keyset pagination uses indexed column values from the last row of
+the current page to seek directly to the next page, keeping query time
+constant no matter how far you paginate.
+
+```rust
+use sqlx_sqlite_toolkit::pagination::KeysetColumn;
+
+let keyset = vec![
+   KeysetColumn::asc("category"),
+   KeysetColumn::desc("score"),
+   KeysetColumn::asc("id"),
+];
+
+// First page
+let page = db.fetch_page(
+   "SELECT id, title, category, score FROM posts".into(),
+   vec![],
+   keyset.clone(),
+   25,
+).await?;
+
+// Next page (forward) — pass the cursor from the previous page
+if let Some(cursor) = page.next_cursor {
+   let next = db.fetch_page(
+      "SELECT id, title, category, score FROM posts".into(),
+      vec![],
+      keyset.clone(),
+      25,
+   ).after(cursor).await?;
+}
+
+// Previous page (backward) — rows are returned in original sort order
+let prev = db.fetch_page(
+   "SELECT id, title, category, score FROM posts".into(),
+   vec![],
+   keyset,
+   25,
+).before(some_cursor).await?;
+```
+
+The base query must not contain `ORDER BY` or `LIMIT` clauses — the builder
+appends these automatically based on the keyset definition.
+
 ### Cross-Database Queries
 
 Attach other databases using the builder pattern:
@@ -183,6 +238,7 @@ cleanup_all_transactions(&interruptible, &regular).await;
 | `begin_interruptible_transaction()` | Begin interruptible transaction (builder) |
 | `fetch_all(query, values)` | Fetch all rows as JSON maps |
 | `fetch_one(query, values)` | Fetch single row or `None` |
+| `fetch_page(query, values, keyset, page_size)` | Keyset pagination (builder, supports `.after()`, `.before()`, `.attach()`) |
 | `acquire_writer()` | Acquire exclusive `WriterGuard` |
 | `run_migrations(migrator)` | Run pending migrations |
 | `close()` | Close connection |
@@ -214,6 +270,7 @@ All errors provide an `error_code()` method returning a machine-readable string:
 | `NO_ACTIVE_TRANSACTION` | Remove from empty state |
 | `INVALID_TRANSACTION_TOKEN` | Wrong transaction ID |
 | `IO_ERROR` | File system error |
+| `INVALID_COLUMN_NAME` | Keyset column name contains invalid characters |
 
 ## Development
 

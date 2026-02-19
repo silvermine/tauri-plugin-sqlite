@@ -248,6 +248,73 @@ impl DatabaseWrapper {
       crate::builders::FetchAllBuilder::new(Arc::clone(&self.inner), query, values)
    }
 
+   /// Create a builder for paginated SELECT queries using keyset (cursor-based) pagination.
+   ///
+   /// Returns a builder that supports `.after(cursor)` for forward pagination,
+   /// `.before(cursor)` for backward pagination, and `.attach(specs)` for
+   /// cross-database queries.
+   ///
+   /// The base query must not contain ORDER BY or LIMIT clauses — the builder
+   /// appends these automatically based on the keyset definition.
+   ///
+   /// # Examples
+   ///
+   /// ```no_run
+   /// # async fn example(db: &sqlx_sqlite_toolkit::DatabaseWrapper) -> Result<(), sqlx_sqlite_toolkit::Error> {
+   /// use sqlx_sqlite_toolkit::pagination::KeysetColumn;
+   ///
+   /// let keyset = vec![
+   ///    KeysetColumn::asc("category"),
+   ///    KeysetColumn::desc("score"),
+   ///    KeysetColumn::asc("id"),
+   /// ];
+   ///
+   /// // First page
+   /// let page = db.fetch_page(
+   ///    "SELECT * FROM posts".into(),
+   ///    vec![],
+   ///    keyset.clone(),
+   ///    25,
+   /// ).await?;
+   ///
+   /// // Next page (forward)
+   /// if let Some(cursor) = page.next_cursor {
+   ///    let next = db.fetch_page(
+   ///       "SELECT * FROM posts".into(),
+   ///       vec![],
+   ///       keyset.clone(),
+   ///       25,
+   ///    ).after(cursor).await?;
+   ///
+   ///    // Previous page (backward)
+   ///    if let Some(prev_cursor) = next.next_cursor {
+   ///       let prev = db.fetch_page(
+   ///          "SELECT * FROM posts".into(),
+   ///          vec![],
+   ///          keyset,
+   ///          25,
+   ///       ).before(prev_cursor).await?;
+   ///    }
+   /// }
+   /// # Ok(())
+   /// # }
+   /// ```
+   pub fn fetch_page(
+      &self,
+      query: String,
+      values: Vec<JsonValue>,
+      keyset: Vec<crate::pagination::KeysetColumn>,
+      page_size: usize,
+   ) -> crate::builders::FetchPageBuilder {
+      crate::builders::FetchPageBuilder::new(
+         Arc::clone(&self.inner),
+         query,
+         values,
+         keyset,
+         page_size,
+      )
+   }
+
    /// Create a builder for SELECT queries returning zero or one row.
    ///
    /// Returns a builder that can optionally attach databases before executing.
