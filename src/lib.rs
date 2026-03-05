@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::Serialize;
 use sqlx_sqlite_conn_mgr::Migrator;
@@ -24,6 +25,23 @@ pub use sqlx_sqlite_toolkit::{
 
 /// Default maximum number of concurrently loaded databases.
 const DEFAULT_MAX_DATABASES: usize = 50;
+
+/// Tracks cleanup progress during app exit: 0 = not started, 1 = running, 2 = complete.
+static CLEANUP_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Guarantees `CLEANUP_STATE` reaches `2` and `app_handle.exit(0)` fires even if the
+/// cleanup task panics. Without this, a panic would leave the state at `1` and subsequent
+/// user exit attempts would call `prevent_exit()` indefinitely.
+struct ExitGuard<R: Runtime> {
+   app_handle: tauri::AppHandle<R>,
+}
+
+impl<R: Runtime> Drop for ExitGuard<R> {
+   fn drop(&mut self) {
+      CLEANUP_STATE.store(2, Ordering::SeqCst);
+      self.app_handle.exit(0);
+   }
+}
 
 /// Database instances managed by the plugin.
 ///
@@ -310,6 +328,19 @@ impl Builder {
                      return;
                   }
 
+                  // Claim cleanup ownership once. If another handler invocation won
+                  // the race, keep exit prevented while its cleanup finishes.
+                  if CLEANUP_STATE
+                     .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                     .is_err()
+                  {
+                     if CLEANUP_STATE.load(Ordering::SeqCst) == 1 {
+                        api.prevent_exit();
+                        debug!("Exit requested while database cleanup is in progress");
+                     }
+                     return;
+                  }
+
                   info!("App exit requested - cleaning up transactions and databases");
 
                   // Prevent immediate exit so we can close connections and checkpoint WAL
@@ -317,44 +348,41 @@ impl Builder {
 
                   let app_handle = app.clone();
 
-                  let handle = match tokio::runtime::Handle::try_current() {
-                     Ok(h) => h,
-                     Err(_) => {
-                        warn!("No tokio runtime available for cleanup");
-                        app_handle.exit(code.unwrap_or(0));
-                        return;
-                     }
-                  };
-
                   let instances_clone = app.state::<DbInstances>().inner().clone();
                   let interruptible_txs_clone = app.state::<ActiveInterruptibleTransactions>().inner().clone();
                   let regular_txs_clone = app.state::<ActiveRegularTransactions>().inner().clone();
                   let active_subs_clone = app.state::<subscriptions::ActiveSubscriptions>().inner().clone();
 
-                  // Spawn a blocking thread to abort transactions and close databases
-                  // (block_in_place panics on current_thread runtime)
-                  let cleanup_result = std::thread::spawn(move || {
-                     handle.block_on(async {
-                        // First, abort all subscriptions and transactions
-                        debug!("Aborting active subscriptions and transactions");
-                        active_subs_clone.abort_all().await;
-                        sqlx_sqlite_toolkit::cleanup_all_transactions(&interruptible_txs_clone, &regular_txs_clone).await;
+                  // Run cleanup on the async runtime (without blocking the event loop),
+                  // then trigger a programmatic exit when done. ExitGuard ensures
+                  // CLEANUP_STATE reaches 2 and exit() fires even on panic.
+                  tauri::async_runtime::spawn(async move {
+                     let _guard = ExitGuard { app_handle };
 
-                        // Close databases (each wrapper's close() disables its own
-                        // observer at the crate level, unregistering SQLite hooks)
-                        let mut guard = instances_clone.inner.write().await;
-                        let wrappers: Vec<DatabaseWrapper> =
-                           guard.drain().map(|(_, v)| v).collect();
-
-                        // Close databases in parallel with timeout
-                        let mut set = tokio::task::JoinSet::new();
-                        for wrapper in wrappers {
-                           set.spawn(async move { wrapper.close().await });
-                        }
-
+                     // Scope block: drops the RwLock write guard (from instances_clone)
+                     // before _guard fires exit(), whose RunEvent::Exit handler calls
+                     // try_read() on the same lock.
+                     {
                         let timeout_result = tokio::time::timeout(
                            std::time::Duration::from_secs(5),
                            async {
+                              // First, abort all subscriptions and transactions
+                              debug!("Aborting active subscriptions and transactions");
+                              active_subs_clone.abort_all().await;
+                              sqlx_sqlite_toolkit::cleanup_all_transactions(&interruptible_txs_clone, &regular_txs_clone).await;
+
+                              // Close databases (each wrapper's close() disables its own
+                              // observer at the crate level, unregistering SQLite hooks)
+                              let mut guard = instances_clone.inner.write().await;
+                              let wrappers: Vec<DatabaseWrapper> =
+                                 guard.drain().map(|(_, v)| v).collect();
+
+                              // Close databases in parallel
+                              let mut set = tokio::task::JoinSet::new();
+                              for wrapper in wrappers {
+                                 set.spawn(async move { wrapper.close().await });
+                              }
+
                               while let Some(result) = set.join_next().await {
                                  match result {
                                     Ok(Err(e)) => warn!("Error closing database: {:?}", e),
@@ -371,15 +399,8 @@ impl Builder {
                         } else {
                            debug!("Database cleanup complete");
                         }
-                     })
-                  })
-                  .join();
-
-                  if let Err(e) = cleanup_result {
-                     error!("Database cleanup thread panicked: {:?}", e);
-                  }
-
-                  app_handle.exit(code.unwrap_or(0));
+                     }
+                  });
                }
                RunEvent::Exit => {
                   // ExitRequested should have already closed all databases
