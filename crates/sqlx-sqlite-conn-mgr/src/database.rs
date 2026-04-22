@@ -10,7 +10,7 @@ use sqlx::{ConnectOptions, Pool, Sqlite};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::error;
+use tracing::{error, warn};
 
 /// Analysis limit for PRAGMA optimize on close.
 /// SQLite recommends 100-1000 for older versions; 3.46.0+ handles automatically.
@@ -177,12 +177,40 @@ impl SqliteDatabase {
             .read_only(false)
             .optimize_on_close(true, OPTIMIZE_ANALYSIS_LIMIT);
 
+         // Defense-in-depth: when any writer is returned to the pool, issue
+         // ROLLBACK to discard any transaction that a caller may have left open
+         // (e.g., a writer dropped after BEGIN without COMMIT/ROLLBACK). SQLite
+         // only auto-rollbacks on connection close, not on pool return, so
+         // without this the next acquire_writer() sees "cannot start a
+         // transaction within a transaction".
+         //
+         // Error handling: the expected benign case on a clean connection is
+         // "cannot rollback - no transaction is active" — recycle normally.
+         // Anything else means ROLLBACK itself failed or the connection is
+         // wedged; tell the pool not to recycle so a broken connection isn't
+         // handed to the next caller.
          let write_conn = SqlitePoolOptions::new()
             .max_connections(1)
             .min_connections(0)
             .idle_timeout(Some(std::time::Duration::from_secs(
                config.idle_timeout_secs,
             )))
+            .after_release(|conn, _meta| {
+               Box::pin(async move {
+                  match sqlx::query("ROLLBACK").execute(&mut *conn).await {
+                     Ok(_) => Ok(true),
+                     Err(sqlx::Error::Database(e))
+                        if e.message().contains("no transaction is active") =>
+                     {
+                        Ok(true)
+                     }
+                     Err(err) => {
+                        warn!("after_release ROLLBACK failed, discarding connection: {err}");
+                        Ok(false)
+                     }
+                  }
+               })
+            })
             .connect_with(write_options)
             .await?;
 

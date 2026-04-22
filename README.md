@@ -381,8 +381,10 @@ await tx.commit();
    * Only one interruptible transaction can be active per database at a time
    * The write lock is held for the entire duration - keep transactions short
    * Uncommitted writes are visible only within the transaction's `read()` method
-   * Always commit or rollback - abandoned transactions will rollback automatically
-     on app exit
+   * If the transaction handle is dropped without calling `commit()` or
+     `rollback()`, the transaction is automatically rolled back and the write
+     connection is released back to the pool. This also happens on app exit
+     and on transaction timeout.
 
 To rollback instead of committing:
 
@@ -783,6 +785,10 @@ println!("Transaction completed: {} statements executed", results.len());
 ### Interruptible Transactions (Rust)
 
 For transactions that need to read data mid-transaction:
+
+If `tx` is dropped without calling `commit()` or `rollback()` — including via
+an early return from a `?` operator — the transaction is automatically rolled
+back and the write connection is released back to the pool.
 
 ```rust
 // Assuming user_id, product_id, item_total are defined in your application context

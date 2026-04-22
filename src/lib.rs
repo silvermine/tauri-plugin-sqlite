@@ -29,17 +29,23 @@ const DEFAULT_MAX_DATABASES: usize = 50;
 /// Tracks cleanup progress during app exit: 0 = not started, 1 = running, 2 = complete.
 static CLEANUP_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Guarantees `CLEANUP_STATE` reaches `2` and `app_handle.exit(0)` fires even if the
+/// Guarantees `CLEANUP_STATE` reaches `2` and `app_handle.exit(..)` fires even if the
 /// cleanup task panics. Without this, a panic would leave the state at `1` and subsequent
 /// user exit attempts would call `prevent_exit()` indefinitely.
+///
+/// The exit code carried through is whatever the triggering `ExitRequested` carried —
+/// `None` (user-initiated close) becomes `0`, `Some(n)` (programmatic
+/// `app_handle.exit(n)`) is preserved so application-level exit codes survive the
+/// cleanup detour.
 struct ExitGuard<R: Runtime> {
    app_handle: tauri::AppHandle<R>,
+   exit_code: i32,
 }
 
 impl<R: Runtime> Drop for ExitGuard<R> {
    fn drop(&mut self) {
       CLEANUP_STATE.store(2, Ordering::SeqCst);
-      self.app_handle.exit(0);
+      self.app_handle.exit(self.exit_code);
    }
 }
 
@@ -321,27 +327,40 @@ impl Builder {
          .on_event(|app, event| {
             match event {
                RunEvent::ExitRequested { api, code, .. } => {
-                  // Only intercept user-initiated exits (code is None). Programmatic
-                  // exits via app_handle.exit() have Some(code) — let those through
-                  // to avoid an infinite ExitRequested loop.
-                  if code.is_some() {
-                     return;
-                  }
-
-                  // Claim cleanup ownership once. If another handler invocation won
-                  // the race, keep exit prevented while its cleanup finishes.
-                  if CLEANUP_STATE
-                     .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-                     .is_err()
-                  {
-                     if CLEANUP_STATE.load(Ordering::SeqCst) == 1 {
+                  // Claim cleanup ownership once. Three possible CLEANUP_STATE values:
+                  //   0 → claim it, run cleanup
+                  //   1 → cleanup already in progress (another invocation won the
+                  //       race). Keep exit prevented while it finishes.
+                  //   2 → cleanup already complete; this ExitRequested is the
+                  //       re-exit fired by ExitGuard. Let it through unchanged.
+                  //
+                  // We deliberately do not skip programmatic exits (code.is_some()).
+                  // A user-space app_handle.exit(N) — fatal-error handler, updater,
+                  // Ctrl+C handler — would otherwise tear down plugin state with
+                  // interruptible transactions still live in the map, and the
+                  // captured-runtime Drop path on the toolkit side still relies on
+                  // the runtime being up when it spawns the rollback. Running
+                  // cleanup here is the clean path.
+                  match CLEANUP_STATE.compare_exchange(
+                     0,
+                     1,
+                     Ordering::SeqCst,
+                     Ordering::SeqCst,
+                  ) {
+                     Ok(_) => {}
+                     Err(2) => return,
+                     Err(_) => {
                         api.prevent_exit();
                         debug!("Exit requested while database cleanup is in progress");
+                        return;
                      }
-                     return;
                   }
 
-                  info!("App exit requested - cleaning up transactions and databases");
+                  let exit_code = code.unwrap_or(0);
+                  info!(
+                     "App exit requested (code={}) - cleaning up transactions and databases",
+                     exit_code
+                  );
 
                   // Prevent immediate exit so we can close connections and checkpoint WAL
                   api.prevent_exit();
@@ -357,7 +376,7 @@ impl Builder {
                   // then trigger a programmatic exit when done. ExitGuard ensures
                   // CLEANUP_STATE reaches 2 and exit() fires even on panic.
                   tauri::async_runtime::spawn(async move {
-                     let _guard = ExitGuard { app_handle };
+                     let _guard = ExitGuard { app_handle, exit_code };
 
                      // Scope block: drops the RwLock write guard (from instances_clone)
                      // before _guard fires exit(), whose RunEvent::Exit handler calls

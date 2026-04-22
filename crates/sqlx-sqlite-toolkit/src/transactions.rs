@@ -99,15 +99,28 @@ pub struct ActiveInterruptibleTransaction {
    transaction_id: String,
    writer: Option<TransactionWriter>,
    created_at: Instant,
+   // Captured at construction so Drop can always spawn the rollback task on a
+   // valid runtime, even when the struct is dropped from a thread that has no
+   // tokio thread-local (e.g., Tauri teardown on the main thread). Without a
+   // stored handle, Drop's synchronous path through PoolConnection::Drop would
+   // call sqlx's rt::spawn and panic with "this functionality requires a Tokio
+   // context".
+   runtime_handle: tokio::runtime::Handle,
 }
 
 impl ActiveInterruptibleTransaction {
+   /// # Panics
+   ///
+   /// Panics if called outside a tokio runtime context. Both production call
+   /// sites (the plugin command handler and the direct Rust API) run inside
+   /// async functions, so this is a programming error, not a runtime risk.
    pub fn new(db_path: String, transaction_id: String, writer: TransactionWriter) -> Self {
       Self {
          db_path,
          transaction_id,
          writer: Some(writer),
          created_at: Instant::now(),
+         runtime_handle: tokio::runtime::Handle::current(),
       }
    }
 
@@ -230,17 +243,62 @@ impl From<(String, Vec<JsonValue>)> for Statement {
    }
 }
 
+/// Upper bound on how long the auto-rollback task may hold the writer permit
+/// before it is considered hung and the connection is abandoned.
+const DROP_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Drop for ActiveInterruptibleTransaction {
    fn drop(&mut self) {
-      // If writer is still present, it means commit/rollback wasn't called.
-      // SQLite will automatically ROLLBACK the transaction when the connection
-      // is returned to the pool if no explicit COMMIT was issued.
-      if self.writer.is_some() {
-         debug!(
-            "Dropping transaction for db: {}, tx_id: {} (will auto-rollback)",
-            self.db_path, self.transaction_id
-         );
-      }
+      // If writer is still present, commit/rollback was not called. The connection
+      // is about to return to the pool — we must issue ROLLBACK explicitly because
+      // sqlx pools reuse the connection (SQLite only auto-rollbacks on close, not
+      // on pool return). Without this, the next acquire_writer() gets a connection
+      // with an open transaction and "BEGIN IMMEDIATE" fails.
+      let Some(mut writer) = self.writer.take() else {
+         return;
+      };
+      let db_path = std::mem::take(&mut self.db_path);
+      let tx_id = std::mem::take(&mut self.transaction_id);
+
+      debug!(
+         "Dropping transaction for db: {}, tx_id: {} (auto-rollback scheduled)",
+         db_path, tx_id
+      );
+
+      // No race with the next acquire_writer(): `writer` owns the PoolConnection
+      // (via WriteGuard / AttachedWriteGuard), which holds the single-writer
+      // permit. The permit is not released until `writer` drops at the end of
+      // this task — after ROLLBACK completes. The next acquire_writer() blocks
+      // on that permit, so it cannot see a connection with a still-open tx.
+      //
+      // The timeout bounds how long a pathological ROLLBACK (stuck I/O, a
+      // rogue busy lock) can keep the single-writer pool stalled. On timeout
+      // we drop `writer` inside the runtime; after_release then cleans up.
+      self.runtime_handle.spawn(async move {
+         let result = tokio::time::timeout(DROP_ROLLBACK_TIMEOUT, async {
+            if let Err(e) = writer.rollback().await {
+               warn!(
+                  "auto-rollback on drop failed (db: {}, tx: {}): {}",
+                  db_path, tx_id, e
+               );
+            }
+            if let Err(e) = writer.detach_if_attached().await {
+               warn!(
+                  "detach_all after auto-rollback failed (db: {}, tx: {}): {}",
+                  db_path, tx_id, e
+               );
+            }
+            // writer drops here — connection returns to pool clean
+         })
+         .await;
+
+         if result.is_err() {
+            warn!(
+               "auto-rollback on drop timed out after {:?} (db: {}, tx: {}) — pool's after_release hook will reconcile",
+               DROP_ROLLBACK_TIMEOUT, db_path, tx_id
+            );
+         }
+      });
    }
 }
 
@@ -288,8 +346,10 @@ impl ActiveInterruptibleTransactions {
             Ok(())
          }
          Entry::Occupied(mut e) => {
-            // If the existing transaction has expired, drop it (auto-rollback) and
-            // replace with the new one.
+            // If the existing transaction has expired, roll it back and replace
+            // with the new one. We rollback explicitly (rather than relying on
+            // Drop) so the writer is guaranteed to return to the pool clean
+            // before the caller tries to start a new transaction on it.
             if e.get().created_at.elapsed() >= self.timeout {
                warn!(
                   "Evicting expired transaction for db: {} (age: {:?}, timeout: {:?})",
@@ -297,8 +357,10 @@ impl ActiveInterruptibleTransactions {
                   e.get().created_at.elapsed(),
                   self.timeout,
                );
-               // Drop the expired transaction (auto-rollback) before inserting the new one
-               let _expired = e.insert(tx);
+               let expired = e.insert(tx);
+               if let Err(err) = expired.rollback().await {
+                  warn!("rollback of expired transaction failed (db: {db_path}): {err}");
+               }
                Ok(())
             } else {
                Err(Error::TransactionAlreadyActive(db_path))
@@ -308,26 +370,30 @@ impl ActiveInterruptibleTransactions {
    }
 
    pub async fn abort_all(&self) {
-      let mut txs = self.inner.lock().await;
-      debug!("Aborting {} active interruptible transaction(s)", txs.len());
+      // Drain under the lock, then release it before awaiting rollbacks so we
+      // don't hold the mutex across a chain of awaits.
+      let drained: Vec<(String, ActiveInterruptibleTransaction)> = {
+         let mut txs = self.inner.lock().await;
+         debug!("Aborting {} active interruptible transaction(s)", txs.len());
+         txs.drain().collect()
+      };
 
-      for db_path in txs.keys() {
+      for (db_path, tx) in drained {
          debug!(
-            "Dropping interruptible transaction for database: {}",
+            "Rolling back interruptible transaction for database: {}",
             db_path
          );
+         if let Err(err) = tx.rollback().await {
+            warn!("rollback during abort_all failed (db: {db_path}): {err}");
+         }
       }
-
-      // Clear all transactions to drop WriteGuards and release locks
-      // Dropping triggers auto-rollback via Drop trait
-      txs.clear();
    }
 
    /// Remove and return transaction for commit/rollback.
    ///
    /// Returns `Err(Error::TransactionTimedOut)` if the transaction has exceeded the
-   /// configured timeout. The expired transaction is dropped (auto-rolled-back) in
-   /// that case.
+   /// configured timeout. The expired transaction is rolled back before the error
+   /// is returned.
    pub async fn remove(
       &self,
       db_path: &str,
@@ -335,7 +401,6 @@ impl ActiveInterruptibleTransactions {
    ) -> Result<ActiveInterruptibleTransaction> {
       let mut txs = self.inner.lock().await;
 
-      // Validate token before removal
       let tx = txs
          .get(db_path)
          .ok_or_else(|| Error::NoActiveTransaction(db_path.to_string()))?;
@@ -344,21 +409,27 @@ impl ActiveInterruptibleTransactions {
          return Err(Error::InvalidTransactionToken);
       }
 
-      // Check if the transaction has expired
-      if tx.created_at.elapsed() >= self.timeout {
-         warn!(
-            "Transaction timed out for db: {} (age: {:?}, timeout: {:?})",
-            db_path,
-            tx.created_at.elapsed(),
-            self.timeout,
-         );
-         // Drop the expired transaction (auto-rollback via Drop)
-         txs.remove(db_path);
-         return Err(Error::TransactionTimedOut(db_path.to_string()));
+      // Happy path: not expired, hand it back to the caller.
+      if tx.created_at.elapsed() < self.timeout {
+         // Safe unwrap: we just confirmed the key exists above.
+         return Ok(txs.remove(db_path).unwrap());
       }
 
-      // Safe unwrap: we just confirmed the key exists above
-      Ok(txs.remove(db_path).unwrap())
+      // Expired: take it out, release the lock, then rollback without holding
+      // it so other callers aren't blocked on an unrelated cleanup.
+      warn!(
+         "Transaction timed out for db: {} (age: {:?}, timeout: {:?})",
+         db_path,
+         tx.created_at.elapsed(),
+         self.timeout,
+      );
+      let expired = txs.remove(db_path).unwrap();
+      drop(txs);
+
+      if let Err(err) = expired.rollback().await {
+         warn!("rollback of timed-out transaction failed (db: {db_path}): {err}");
+      }
+      Err(Error::TransactionTimedOut(db_path.to_string()))
    }
 }
 

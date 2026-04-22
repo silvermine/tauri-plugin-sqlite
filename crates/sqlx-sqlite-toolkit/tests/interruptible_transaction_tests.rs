@@ -377,3 +377,141 @@ async fn test_execute_transaction_rollback_on_failure() {
 
    db.remove().await.unwrap();
 }
+
+/// How long to wait for the post-drop rollback to complete before failing
+/// the test. Comfortably larger than the drop-path rollback timeout, so a
+/// regression (stuck rollback, leaked writer permit) fails fast rather than
+/// hanging CI on the next `acquire_writer()`.
+const DROP_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Regression test for issue #46:
+/// https://github.com/silvermine/tauri-plugin-sqlite/issues/46
+///
+/// Dropping an interruptible transaction without calling commit/rollback must
+/// leave the shared write connection in a clean state so the next transaction
+/// can start. Previously the writer was returned to the pool with an open
+/// transaction, causing "cannot start a transaction within a transaction" on
+/// the next BEGIN IMMEDIATE.
+#[tokio::test]
+async fn test_dropped_transaction_releases_write_connection() {
+   let (db, _temp) = create_test_db("test.db").await;
+
+   db.execute(
+      "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)".into(),
+      vec![],
+   )
+   .await
+   .unwrap();
+
+   // Start a transaction and drop it without commit/rollback.
+   {
+      let _tx = db
+         .begin_interruptible_transaction()
+         .execute(vec![(
+            "INSERT INTO users (name) VALUES (?)",
+            vec![json!("Alice")],
+         )])
+         .await
+         .unwrap();
+   }
+
+   // Starting a second interruptible transaction must succeed — the previous
+   // writer should have been rolled back and returned to the pool clean.
+   // Wrapped in a timeout so a regression in the drop path (stuck rollback,
+   // leaked permit) surfaces as a test failure rather than a hung CI.
+   let tx2 = tokio::time::timeout(
+      DROP_TEST_TIMEOUT,
+      db.begin_interruptible_transaction().execute(vec![(
+         "INSERT INTO users (name) VALUES (?)",
+         vec![json!("Bob")],
+      )]),
+   )
+   .await
+   .expect("second transaction should not be blocked by leaked writer")
+   .expect("second transaction should start on a clean connection");
+
+   tx2.commit().await.unwrap();
+
+   // Only Bob should be present — Alice's insert was rolled back on drop.
+   let rows = db
+      .fetch_all("SELECT name FROM users ORDER BY id".into(), vec![])
+      .await
+      .unwrap();
+   assert_eq!(rows.len(), 1);
+   assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("Bob"));
+
+   db.remove().await.unwrap();
+}
+
+/// Dropping an interruptible transaction that attached a secondary database
+/// must also release the attached-database lock, so the next transaction can
+/// attach the same database cleanly. Exercises the `detach_if_attached` branch
+/// of the drop path; a regression there would silently hang the next attach.
+#[tokio::test]
+async fn test_dropped_attached_transaction_releases_writer_and_detaches() {
+   let (main_db, _temp_main) = create_test_db("main.db").await;
+   let (attached_db, _temp_attached) = create_test_db("attached.db").await;
+
+   main_db
+      .execute(
+         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)".into(),
+         vec![],
+      )
+      .await
+      .unwrap();
+
+   attached_db
+      .execute(
+         "CREATE TABLE archive (id INTEGER PRIMARY KEY, user_name TEXT)".into(),
+         vec![],
+      )
+      .await
+      .unwrap();
+
+   let make_spec = || sqlx_sqlite_conn_mgr::AttachedSpec {
+      database: std::sync::Arc::clone(attached_db.inner_for_testing()),
+      schema_name: "archive".to_string(),
+      mode: sqlx_sqlite_conn_mgr::AttachedMode::ReadOnly,
+   };
+
+   // Start an attached transaction, then drop it without commit/rollback.
+   {
+      let _tx = main_db
+         .begin_interruptible_transaction()
+         .attach(vec![make_spec()])
+         .execute(vec![(
+            "INSERT INTO users (name) VALUES (?)",
+            vec![json!("Alice")],
+         )])
+         .await
+         .unwrap();
+   }
+
+   // A second attached transaction must succeed: the drop path must have
+   // rolled back the tx, detached the attached db, and released the writer.
+   let tx2 = tokio::time::timeout(
+      DROP_TEST_TIMEOUT,
+      main_db
+         .begin_interruptible_transaction()
+         .attach(vec![make_spec()])
+         .execute(vec![(
+            "INSERT INTO users (name) VALUES (?)",
+            vec![json!("Bob")],
+         )]),
+   )
+   .await
+   .expect("second attached transaction should not be blocked by leaked writer or attach")
+   .expect("second attached transaction should start on a clean connection");
+
+   tx2.commit().await.unwrap();
+
+   let rows = main_db
+      .fetch_all("SELECT name FROM users ORDER BY id".into(), vec![])
+      .await
+      .unwrap();
+   assert_eq!(rows.len(), 1);
+   assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("Bob"));
+
+   main_db.remove().await.unwrap();
+   attached_db.remove().await.unwrap();
+}
