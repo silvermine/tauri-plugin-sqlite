@@ -45,7 +45,7 @@ impl FetchAllBuilder {
       if self.attached.is_empty() {
          // No attached databases - use regular read pool
          let pool = self.db.read_pool()?;
-         let mut q = sqlx::query(&self.query);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
          for value in self.values {
             q = bind_value(q, value);
          }
@@ -56,7 +56,7 @@ impl FetchAllBuilder {
          let mut conn =
             sqlx_sqlite_conn_mgr::acquire_reader_with_attached(&self.db, self.attached).await?;
 
-         let mut q = sqlx::query(&self.query);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
          for value in self.values {
             q = bind_value(q, value);
          }
@@ -112,7 +112,7 @@ impl FetchOneBuilder {
       let rows = if self.attached.is_empty() {
          // No attached databases - use regular read pool
          let pool = self.db.read_pool()?;
-         let mut q = sqlx::query(&self.query);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
          for value in self.values {
             q = bind_value(q, value);
          }
@@ -122,7 +122,7 @@ impl FetchOneBuilder {
          let mut conn =
             sqlx_sqlite_conn_mgr::acquire_reader_with_attached(&self.db, self.attached).await?;
 
-         let mut q = sqlx::query(&self.query);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
          for value in self.values {
             q = bind_value(q, value);
          }
@@ -259,7 +259,7 @@ impl FetchPageBuilder {
       // Execute query
       let rows = if self.attached.is_empty() {
          let pool = self.db.read_pool()?;
-         let mut q = sqlx::query(&sql);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
          for value in all_values {
             q = bind_value(q, value);
          }
@@ -268,7 +268,7 @@ impl FetchPageBuilder {
          let mut conn =
             sqlx_sqlite_conn_mgr::acquire_reader_with_attached(&self.db, self.attached).await?;
 
-         let mut q = sqlx::query(&sql);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
          for value in all_values {
             q = bind_value(q, value);
          }
@@ -365,7 +365,7 @@ impl ExecuteBuilder {
       if self.attached.is_empty() {
          // No attached databases - use wrapper's writer (routes through observer when in use)
          let mut writer = self.db.acquire_writer().await?;
-         let mut q = sqlx::query(&self.query);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
          for value in self.values {
             q = bind_value(q, value);
          }
@@ -380,7 +380,7 @@ impl ExecuteBuilder {
             sqlx_sqlite_conn_mgr::acquire_writer_with_attached(self.db.inner(), self.attached)
                .await?;
 
-         let mut q = sqlx::query(&self.query);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
          for value in self.values {
             q = bind_value(q, value);
          }

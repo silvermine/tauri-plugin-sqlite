@@ -1,7 +1,7 @@
 [package]
 name = "sqlx-sqlite-observer"
 # Sync major.minor with major.minor of SQLx crate
-version = "0.8.7"
+version = "0.9.0"
 license = "MIT"
 edition = "2024"
 rust-version = "1.94.0"
@@ -26,10 +26,10 @@ thiserror = "2.0.17"
 tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_off"] }
 parking_lot = "0.12.3"
 regex = "1.12.3"
-sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio"], default-features = false }
+sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"], default-features = false }
 # Required for preupdate_hook - SQLite must be compiled with SQLITE_ENABLE_PREUPDATE_HOOK
-libsqlite3-sys = { version = "0.30.1", features = ["preupdate_hook"] }
-sqlx-sqlite-conn-mgr = { path = "../sqlx-sqlite-conn-mgr", version = "0.8.7", optional = true }
+libsqlite3-sys = { version = "0.35.0", features = ["preupdate_hook"] }
+sqlx-sqlite-conn-mgr = { path = "../sqlx-sqlite-conn-mgr", version = "0.9.0", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["full", "macros"] }

@@ -71,7 +71,9 @@ impl AttachedReadConnection {
    pub async fn detach_all(mut self) -> Result<()> {
       for schema_name in &self.schema_names {
          let detach_sql = format!("DETACH DATABASE \"{}\"", schema_name);
-         sqlx::query(&detach_sql).execute(&mut *self.conn).await?;
+         sqlx::query(sqlx::AssertSqlSafe(detach_sql))
+            .execute(&mut *self.conn)
+            .await?;
       }
       Ok(())
    }
@@ -141,7 +143,9 @@ impl AttachedWriteGuard {
    pub async fn detach_all(mut self) -> Result<()> {
       for schema_name in &self.schema_names {
          let detach_sql = format!("DETACH DATABASE \"{}\"", schema_name);
-         sqlx::query(&detach_sql).execute(&mut *self.writer).await?;
+         sqlx::query(sqlx::AssertSqlSafe(detach_sql))
+            .execute(&mut *self.writer)
+            .await?;
       }
       Ok(())
    }
@@ -256,7 +260,9 @@ pub async fn acquire_reader_with_attached(
          "ATTACH DATABASE '{}' AS \"{}\"",
          escaped_path, spec.schema_name
       );
-      sqlx::query(&attach_sql).execute(&mut *conn).await?;
+      sqlx::query(sqlx::AssertSqlSafe(attach_sql))
+         .execute(&mut *conn)
+         .await?;
 
       schema_names.push(spec.schema_name);
    }
@@ -356,7 +362,9 @@ pub async fn acquire_writer_with_attached(
          "ATTACH DATABASE '{}' AS \"{}\"",
          escaped_path, spec.schema_name
       );
-      sqlx::query(&attach_sql).execute(&mut *writer).await?;
+      sqlx::query(sqlx::AssertSqlSafe(attach_sql))
+         .execute(&mut *writer)
+         .await?;
 
       schema_names.push(spec.schema_name);
    }
@@ -378,19 +386,19 @@ mod tests {
 
       // Create a test table
       let mut writer = db.acquire_writer().await.unwrap();
-      sqlx::query(&format!(
+      sqlx::query(sqlx::AssertSqlSafe(format!(
          "CREATE TABLE IF NOT EXISTS {} (id INTEGER PRIMARY KEY, value TEXT)",
          name.replace(".db", "")
-      ))
+      )))
       .execute(&mut *writer)
       .await
       .unwrap();
 
       // Insert test data
-      sqlx::query(&format!(
+      sqlx::query(sqlx::AssertSqlSafe(format!(
          "INSERT INTO {} (value) VALUES ('test_data')",
          name.replace(".db", "")
-      ))
+      )))
       .execute(&mut *writer)
       .await
       .unwrap();

@@ -583,7 +583,7 @@ impl TransactionExecutionBuilder {
       let exec_result = async {
          let mut results = Vec::new();
          for (query, values) in self.statements {
-            let mut q = sqlx::query(&query);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
             for value in values {
                q = bind_value(q, value);
             }
@@ -626,9 +626,9 @@ impl std::future::IntoFuture for TransactionExecutionBuilder {
 
 /// Helper function to bind a JSON value to a SQLx query
 pub fn bind_value<'a>(
-   query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
+   query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
    value: JsonValue,
-) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
+) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
    if value.is_null() {
       query.bind(None::<JsonValue>)
    } else if value.is_string() {

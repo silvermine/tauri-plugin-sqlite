@@ -32,7 +32,7 @@ impl TransactionWriter {
    /// Execute a query on either writer type
    pub async fn execute_query<'a>(
       &mut self,
-      query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
+      query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
    ) -> Result<sqlx::sqlite::SqliteQueryResult> {
       match self {
          Self::Regular(w) => query.execute(&mut **w).await.map_err(Into::into),
@@ -45,7 +45,7 @@ impl TransactionWriter {
    /// Fetch all rows from either writer type
    pub async fn fetch_all<'a>(
       &mut self,
-      query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
+      query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
       match self {
          Self::Regular(w) => query.fetch_all(&mut **w).await.map_err(Into::into),
@@ -149,7 +149,7 @@ impl ActiveInterruptibleTransaction {
       query: String,
       values: Vec<JsonValue>,
    ) -> Result<Vec<IndexMap<String, JsonValue>>> {
-      let mut q = sqlx::query(&query);
+      let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
       for value in values {
          q = crate::wrapper::bind_value(q, value);
       }
@@ -181,7 +181,7 @@ impl ActiveInterruptibleTransaction {
       let writer = self.writer_mut()?;
       for statement in statements {
          let statement = statement.into();
-         let mut q = sqlx::query(&statement.query);
+         let mut q = sqlx::query(sqlx::AssertSqlSafe(statement.query));
          for value in statement.values {
             q = crate::wrapper::bind_value(q, value);
          }

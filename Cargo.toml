@@ -29,7 +29,7 @@ tracing = { version = "0.1.41", default-features = false, features = ["std", "re
 uuid = { version = "1.11.0", features = ["v4"] }
 
 # SQLx for types and queries (time feature enables datetime type decoding)
-sqlx = { version = "0.8.6", features = ["sqlite", "json", "time", "runtime-tokio"] }
+sqlx = { version = "0.9.0", features = ["sqlite", "json", "time", "runtime-tokio"] }
 
 # Connection manager
 sqlx-sqlite-conn-mgr = { path = "crates/sqlx-sqlite-conn-mgr" }

@@ -1,7 +1,7 @@
 [package]
 name = "sqlx-sqlite-conn-mgr"
 # Sync major.minor with major.minor of SQLx crate
-version = "0.8.7"
+version = "0.9.0"
 description = "Wraps SQLx for SQLite, enforcing pragmatic connection policies for mobile and desktop applications"
 authors = ["Jeremy Thomerson"]
 license = "MIT"
@@ -13,7 +13,7 @@ keywords = ["sqlite", "sqlx", "database", "connection-pool", "async"]
 categories = ["database", "asynchronous"]
 
 [dependencies]
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "migrate"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "migrate"] }
 thiserror = "2.0.17"
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_off"] }
