@@ -16,14 +16,23 @@ fn registry() -> &'static RwLock<HashMap<PathBuf, Weak<SqliteDatabase>>> {
    DATABASE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Returns true when a `file:` URI query string contains an exact `mode=memory` parameter.
+fn file_uri_has_mode_memory(path_str: &str) -> bool {
+   let Some(query) = path_str.split_once('?').map(|(_, query)| query) else {
+      return false;
+   };
+   query.split('&').any(|param| param == "mode=memory")
+}
+
 /// Check if a path represents an in-memory SQLite database
 ///
-/// Returns true for `:memory:` and `file::memory:*` URIs
+/// Returns true for `:memory:` and `file::memory:*` URIs, and for `file:` URIs whose
+/// query string includes a `mode=memory` parameter (not merely a substring match).
 pub fn is_memory_database(path: &Path) -> bool {
    let path_str = path.to_str().unwrap_or("");
    path_str == ":memory:"
       || path_str.starts_with("file::memory:")
-      || path_str.contains("mode=memory")
+      || (path_str.starts_with("file:") && file_uri_has_mode_memory(path_str))
 }
 
 /// Get or open a SQLite database connection
@@ -166,5 +175,20 @@ mod tests {
       // Should fail if parent directory doesn't exist
       let result = canonicalize_path(&nonexistent);
       assert!(result.is_err());
+   }
+
+   #[test]
+   fn test_mode_memory_query_param() {
+      assert!(is_memory_database(Path::new("file:test?mode=memory")));
+      assert!(is_memory_database(Path::new(
+         "file:/data/db?cache=shared&mode=memory"
+      )));
+   }
+
+   #[test]
+   fn test_mode_memory_substring_in_value_is_not_memory() {
+      assert!(!is_memory_database(Path::new(
+         "file:/home/user/real.db?x=mode=memory"
+      )));
    }
 }

@@ -31,6 +31,10 @@ pub enum Error {
    #[error("path traversal not allowed: {0}")]
    PathTraversal(String),
 
+   /// Absolute path is not on the registered allowlist.
+   #[error("path not registered in allowlist: {0}")]
+   PathNotRegistered(String),
+
    /// Attempted to access a database that hasn't been loaded.
    #[error("database {0} not loaded")]
    DatabaseNotLoaded(String),
@@ -84,6 +88,7 @@ impl Error {
          Error::Migration(_) => "MIGRATION_ERROR".to_string(),
          Error::InvalidPath(_) => "INVALID_PATH".to_string(),
          Error::PathTraversal(_) => "PATH_TRAVERSAL".to_string(),
+         Error::PathNotRegistered(_) => "PATH_NOT_REGISTERED".to_string(),
          Error::DatabaseNotLoaded(_) => "DATABASE_NOT_LOADED".to_string(),
          Error::ObservationNotEnabled(_) => "OBSERVATION_NOT_ENABLED".to_string(),
          Error::TooManyDatabases(_) => "TOO_MANY_DATABASES".to_string(),
@@ -121,6 +126,26 @@ mod tests {
    fn test_error_code_invalid_path() {
       let err = Error::InvalidPath("/bad/path".into());
       assert_eq!(err.error_code(), "INVALID_PATH");
+   }
+
+   #[test]
+   fn test_error_code_path_not_registered() {
+      let err = Error::PathNotRegistered("/unregistered/db.sqlite".into());
+      assert_eq!(err.error_code(), "PATH_NOT_REGISTERED");
+   }
+
+   #[test]
+   fn test_error_serialization_path_not_registered() {
+      let err = Error::PathNotRegistered("/unregistered/db.sqlite".into());
+      let json = serde_json::to_value(&err).unwrap();
+
+      assert_eq!(json["code"], "PATH_NOT_REGISTERED");
+      assert!(
+         json["message"]
+            .as_str()
+            .unwrap()
+            .contains("not registered in allowlist")
+      );
    }
 
    #[test]

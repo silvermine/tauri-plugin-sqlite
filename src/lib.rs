@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::Serialize;
 use sqlx_sqlite_conn_mgr::Migrator;
-use tauri::{Emitter, Manager, RunEvent, Runtime, plugin::Builder as PluginBuilder};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, plugin::Builder as PluginBuilder};
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
@@ -79,6 +80,16 @@ impl DbInstances {
    }
 }
 
+/// Allowlist of the absolute database paths that may be opened.
+///
+/// A path is only accepted by the resolver if its canonical form exactly matches an entry
+/// here (in-memory databases bypass the allowlist). Entries are canonicalized once at plugin
+/// setup so the equality check is symlink-safe and cheap.
+#[derive(Clone, Default)]
+pub struct AllowedPaths {
+   pub(crate) absolute_database_paths: Arc<Vec<PathBuf>>,
+}
+
 /// Migration status for a database.
 #[derive(Debug, Clone)]
 pub enum MigrationStatus {
@@ -126,7 +137,7 @@ pub struct MigrationStates(pub RwLock<HashMap<String, MigrationState>>);
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationEvent {
-   /// Database path (relative, as registered)
+   /// Database key as registered (an absolute path, or `:memory:` and friends)
    pub db_path: String,
    /// Status: "running", "completed", "failed"
    pub status: String,
@@ -142,6 +153,18 @@ pub struct MigrationEvent {
 ///
 /// Use this to configure the plugin and build the plugin instance.
 ///
+/// # Database path registration
+///
+/// Databases can only be opened by absolute path, and every absolute path must be
+/// **registered** with the plugin before it can be loaded (in-memory databases such as
+/// `:memory:` are the only exception). Unregistered paths are rejected. This keeps the
+/// frontend, which calls `load()` over IPC, from opening arbitrary files on disk.
+///
+/// Because the legitimate paths usually depend on runtime values (for example
+/// `app.path().app_data_dir()`), registration normally happens in the [`Builder::on_setup`]
+/// hook, which runs during plugin setup once the `app` instance exists. Static absolute
+/// paths can be registered up front with [`Builder::register_database`].
+///
 /// # Example
 ///
 /// ```ignore
@@ -151,7 +174,7 @@ pub struct MigrationEvent {
 /// use tauri_plugin_sqlite::Builder;
 ///
 /// # fn main() {
-/// // Basic setup (no migrations):
+/// // Basic setup (no databases registered yet — register them in `on_setup`):
 /// tauri::Builder::default()
 ///     .plugin(Builder::new().build())
 ///     .run(tauri::generate_context!())
@@ -166,49 +189,140 @@ pub struct MigrationEvent {
 /// // tauri::generate_context!() requires tauri.conf.json at compile time,
 /// // which cannot be provided in doc test environments.
 /// use tauri_plugin_sqlite::Builder;
+/// use tauri::Manager;
 ///
 /// # fn main() {
-/// // Setup with migrations:
+/// // Resolve the database path from the app instance and register it with migrations.
+/// // The frontend then calls `Database.load()` with a path that canonicalizes to the
+/// // same location.
 /// tauri::Builder::default()
 ///     .plugin(
 ///         Builder::new()
-///             .add_migrations("main.db", sqlx::migrate!("./migrations/main"))
-///             .add_migrations("cache.db", sqlx::migrate!("./migrations/cache"))
+///             .on_setup(|app, reg| {
+///                 let db = app.path().app_data_dir()?.join("main.db");
+///                 reg.register_database(
+///                     db.to_string_lossy().into_owned(),
+///                     Some(sqlx::migrate!("./migrations/main")),
+///                 );
+///                 Ok(())
+///             })
 ///             .build()
 ///     )
 ///     .run(tauri::generate_context!())
 ///     .expect("error while running tauri application");
 /// # }
 /// ```
-#[derive(Debug, Default)]
-pub struct Builder {
+///
+/// Collects allowlist entries and migrations registered from the [`Builder::on_setup`] hook.
+///
+/// Passed to the `on_setup` closure during plugin setup, where the `app` instance is
+/// available. Use it to register values that can only be computed at runtime (for example,
+/// paths derived from `app.path().app_data_dir()`).
+#[derive(Default)]
+pub struct SetupRegistrar {
+   databases: Vec<RegisteredDatabase>,
+}
+
+#[derive(Debug)]
+pub struct RegisteredDatabase {
+   path: String,
+   migrations: Option<Arc<Migrator>>,
+}
+
+impl SetupRegistrar {
+   /// Register a database path, optionally with migrations. See [`Builder::register_database`].
+   ///
+   /// This invocation is to be used when the database path is known at runtime (such as
+   /// a path dependent on `app.path().app_data_dir()`).
+   ///
+   /// For a path that is known at compile time, use [`Builder::register_database`]
+   /// instead.
+   ///
+   /// If the same path is registered more than once (statically or via this hook), the
+   /// last registration wins after paths are canonicalized at plugin setup.
+   pub fn register_database(&mut self, key: impl Into<String>, migrator: Option<Migrator>) {
+      self.databases.push(RegisteredDatabase {
+         path: key.into(),
+         migrations: migrator.map(Arc::new),
+      });
+   }
+}
+
+/// Canonicalize registered databases once and split into allowlist + migration map.
+///
+/// A later registration for the same canonical path overrides an earlier one.
+fn finalize_registrations(
+   databases: Vec<RegisteredDatabase>,
+) -> Result<(Vec<PathBuf>, HashMap<String, Arc<Migrator>>)> {
+   let mut by_canonical: HashMap<String, Option<Arc<Migrator>>> = HashMap::new();
+
+   for db in databases {
+      let canonical_key = resolve::canonicalize_database_key(&db.path)?;
+      by_canonical.insert(canonical_key, db.migrations);
+   }
+
+   let allowlist: Vec<PathBuf> = by_canonical.keys().map(PathBuf::from).collect();
+   let migrations = by_canonical
+      .into_iter()
+      .filter_map(|(path, migrator)| migrator.map(|m| (path, m)))
+      .collect();
+
+   Ok((allowlist, migrations))
+}
+
+/// Closure type for the deferred [`Builder::on_setup`] hook.
+type OnSetupHook<R> = Box<dyn FnOnce(&AppHandle<R>, &mut SetupRegistrar) -> Result<()> + Send>;
+
+pub struct Builder<R: Runtime> {
    /// Migrations registered per database path
-   migrations: HashMap<String, Arc<Migrator>>,
+   registered_databases: Vec<RegisteredDatabase>,
    /// Timeout for interruptible transactions. Defaults to 5 minutes.
    transaction_timeout: Option<std::time::Duration>,
    /// Maximum number of concurrently loaded databases. Defaults to 50.
    max_databases: Option<usize>,
+   /// Deferred hook run during plugin setup with the app handle. Lets callers register
+   /// paths/migrations computed from `app`. Returning `Err` aborts app startup.
+   on_setup: Option<OnSetupHook<R>>,
 }
 
-impl Builder {
+impl<R: Runtime> Default for Builder<R> {
+   fn default() -> Self {
+      Self::new()
+   }
+}
+
+impl<R: Runtime> std::fmt::Debug for Builder<R> {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_struct("Builder")
+         .field("registered_databases", &self.registered_databases)
+         .field("transaction_timeout", &self.transaction_timeout)
+         .field("max_databases", &self.max_databases)
+         .field("on_setup", &self.on_setup.is_some())
+         .finish()
+   }
+}
+
+impl<R: Runtime> Builder<R> {
    /// Create a new builder instance.
    pub fn new() -> Self {
       Self {
-         migrations: HashMap::new(),
+         registered_databases: Vec::new(),
          transaction_timeout: None,
          max_databases: None,
+         on_setup: None,
       }
    }
 
-   /// Register migrations for a database path.
+   /// Register a database path on the allowlist, optionally with migrations.
    ///
-   /// Migrations will be run automatically at plugin initialization.
-   /// Multiple databases can have their own migrations.
+   /// Every registration allowlists the path. Pass `None` for `migrator` when the database
+   /// has no migrations. Migrations run automatically at plugin initialization when provided.
    ///
-   /// # Arguments
+   /// Use this when the path is known at compile time. For paths derived from the `app`
+   /// instance (for example `app.path().app_data_dir()`), use [`on_setup`](Self::on_setup)
+   /// and [`SetupRegistrar::register_database`] instead.
    ///
-   /// * `path` - Database path (relative to app config directory)
-   /// * `migrator` - Migrator instance, typically from `sqlx::migrate!()`
+   /// The frontend must call `load()` with a path that canonicalizes to the same location.
    ///
    /// # Example
    ///
@@ -216,13 +330,19 @@ impl Builder {
    /// use tauri_plugin_sqlite::Builder;
    ///
    /// # fn example() {
-   /// Builder::new()
-   ///     .add_migrations("main.db", sqlx::migrate!("./doc-test-fixtures/migrations"))
-   ///     .build::<tauri::Wry>();
+   /// Builder::<tauri::Wry>::new()
+   ///     .register_database(
+   ///         "/var/lib/myapp/main.db",
+   ///         Some(sqlx::migrate!("./doc-test-fixtures/migrations")),
+   ///     )
+   ///     .build();
    /// # }
    /// ```
-   pub fn add_migrations(mut self, path: &str, migrator: Migrator) -> Self {
-      self.migrations.insert(path.to_string(), Arc::new(migrator));
+   pub fn register_database(mut self, path: &str, migrator: Option<Migrator>) -> Self {
+      self.registered_databases.push(RegisteredDatabase {
+         path: path.to_string(),
+         migrations: migrator.map(Arc::new),
+      });
       self
    }
 
@@ -258,11 +378,52 @@ impl Builder {
       Ok(self)
    }
 
+   /// Register a hook that runs during plugin setup, once the `app` instance exists.
+   ///
+   /// This is the primary way to register database paths, because the legitimate absolute
+   /// paths usually depend on runtime values — for example paths derived from
+   /// `app.path().app_data_dir()`. The closure receives the app handle and a
+   /// [`SetupRegistrar`] on which you call [`register_database`](SetupRegistrar::register_database).
+   ///
+   /// Entries registered here are merged with those registered statically via
+   /// [`register_database`](Self::register_database); a later registration for the same
+   /// canonical path overrides an earlier one.
+   ///
+   /// Returning `Err` from the hook aborts app startup (fail-fast).
+   ///
+   /// # Example
+   ///
+   /// ```no_run
+   /// use tauri_plugin_sqlite::Builder;
+   /// use tauri::Manager;
+   ///
+   /// # fn example() {
+   /// Builder::<tauri::Wry>::new()
+   ///     .on_setup(|app, reg| {
+   ///         let db = app.path().app_data_dir().unwrap().join("main.db");
+   ///         reg.register_database(
+   ///            db.to_string_lossy().into_owned(),
+   ///            Some(sqlx::migrate!("./doc-test-fixtures/migrations"))
+   ///         );
+   ///         Ok(())
+   ///     })
+   ///     .build();
+   /// # }
+   /// ```
+   pub fn on_setup(
+      mut self,
+      f: impl FnOnce(&AppHandle<R>, &mut SetupRegistrar) -> Result<()> + Send + 'static,
+   ) -> Self {
+      self.on_setup = Some(Box::new(f));
+      self
+   }
+
    /// Build the plugin with command registration and state management.
-   pub fn build<R: Runtime>(self) -> tauri::plugin::TauriPlugin<R> {
-      let migrations = Arc::new(self.migrations);
+   pub fn build(self) -> tauri::plugin::TauriPlugin<R> {
+      let registered_databases = self.registered_databases;
       let transaction_timeout = self.transaction_timeout;
       let max_databases = self.max_databases;
+      let on_setup = self.on_setup;
 
       PluginBuilder::<R>::new("sqlite")
          .invoke_handler(tauri::generate_handler![
@@ -297,7 +458,21 @@ impl Builder {
             app.manage(ActiveRegularTransactions::default());
             app.manage(subscriptions::ActiveSubscriptions::default());
 
-            // Initialize migration states as Pending for all registered databases
+            // Run the deferred setup hook (if any), merge with static registrations, then
+            // canonicalize once. Hook errors abort startup (fail-fast).
+            let mut databases = registered_databases;
+            if let Some(hook) = on_setup {
+               let mut registrar = SetupRegistrar::default();
+               hook(app, &mut registrar)?;
+               databases.extend(registrar.databases);
+            }
+
+            let (canonical_files, migrations) = finalize_registrations(databases)?;
+
+            app.manage(AllowedPaths {
+               absolute_database_paths: Arc::new(canonical_files),
+            });
+
             let migration_states = app.state::<MigrationStates>();
             {
                let mut states = migration_states.0.blocking_write();
@@ -306,15 +481,11 @@ impl Builder {
                }
             }
 
-            // Spawn parallel migration tasks for each registered database
             if !migrations.is_empty() {
                info!("Starting migrations for {} database(s)", migrations.len());
 
-               for (path, migrator) in migrations.iter() {
+               for (path, migrator) in migrations {
                   let app_handle = app.clone();
-                  let path = path.clone();
-                  let migrator = Arc::clone(migrator);
-
                   tauri::async_runtime::spawn(async move {
                      run_migrations_for_database(app_handle, path, migrator).await;
                   });
@@ -452,7 +623,7 @@ impl Builder {
 
 /// Initializes the plugin with default configuration.
 pub fn init<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
-   Builder::new().build()
+   Builder::<R>::new().build()
 }
 
 /// Run migrations for a single database and emit events.
@@ -599,22 +770,129 @@ fn resolve_migration_path<R: Runtime>(
 #[cfg(test)]
 mod tests {
    use super::*;
+   use std::fs;
+   use std::sync::atomic::{AtomicU64, Ordering};
+   use tauri::test::MockRuntime;
+
+   fn make_temp_dir() -> PathBuf {
+      static COUNTER: AtomicU64 = AtomicU64::new(0);
+      let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+      let dir =
+         std::env::temp_dir().join(format!("tauri_sqlite_finalize_test_{}_{}", std::process::id(), n));
+      fs::create_dir_all(&dir).unwrap();
+      dir
+   }
+
+   fn dummy_migrator() -> Arc<Migrator> {
+      Arc::new(sqlx::migrate!("./doc-test-fixtures/migrations"))
+   }
+
+   #[test]
+   fn test_finalize_registrations_empty() {
+      let (allowlist, migrations) = finalize_registrations(vec![]).unwrap();
+      assert!(allowlist.is_empty());
+      assert!(migrations.is_empty());
+   }
+
+   #[test]
+   fn test_finalize_registrations_allow_only() {
+      let dir = make_temp_dir();
+      let db = dir.join("allow-only.db");
+      let db_str = db.to_str().unwrap().to_string();
+      let canonical = resolve::canonicalize_database_key(&db_str).unwrap();
+
+      let (allowlist, migrations) = finalize_registrations(vec![RegisteredDatabase {
+         path: db_str,
+         migrations: None,
+      }])
+      .unwrap();
+
+      assert_eq!(allowlist, vec![PathBuf::from(&canonical)]);
+      assert!(migrations.is_empty());
+   }
+
+   #[test]
+   fn test_finalize_registrations_with_migrations() {
+      let dir = make_temp_dir();
+      let db = dir.join("with-migrations.db");
+      let db_str = db.to_str().unwrap().to_string();
+      let canonical = resolve::canonicalize_database_key(&db_str).unwrap();
+      let migrator = dummy_migrator();
+
+      let (allowlist, migrations) = finalize_registrations(vec![RegisteredDatabase {
+         path: db_str,
+         migrations: Some(Arc::clone(&migrator)),
+      }])
+      .unwrap();
+
+      assert_eq!(allowlist, vec![PathBuf::from(&canonical)]);
+      assert_eq!(migrations.len(), 1);
+      assert!(Arc::ptr_eq(migrations.get(&canonical).unwrap(), &migrator));
+   }
+
+   #[test]
+   fn test_finalize_registrations_last_wins_drops_migrator() {
+      let dir = make_temp_dir();
+      let db = dir.join("last-wins.db");
+      let db_str = db.to_str().unwrap().to_string();
+      let canonical = resolve::canonicalize_database_key(&db_str).unwrap();
+
+      let (allowlist, migrations) = finalize_registrations(vec![
+         RegisteredDatabase {
+            path: db_str.clone(),
+            migrations: Some(dummy_migrator()),
+         },
+         RegisteredDatabase {
+            path: db_str,
+            migrations: None,
+         },
+      ])
+      .unwrap();
+
+      assert_eq!(allowlist, vec![PathBuf::from(&canonical)]);
+      assert!(migrations.is_empty());
+   }
+
+   #[test]
+   fn test_finalize_registrations_last_wins_adds_migrator() {
+      let dir = make_temp_dir();
+      let db = dir.join("last-wins-migrate.db");
+      let db_str = db.to_str().unwrap().to_string();
+      let canonical = resolve::canonicalize_database_key(&db_str).unwrap();
+      let migrator = dummy_migrator();
+
+      let (allowlist, migrations) = finalize_registrations(vec![
+         RegisteredDatabase {
+            path: db_str.clone(),
+            migrations: None,
+         },
+         RegisteredDatabase {
+            path: db_str,
+            migrations: Some(Arc::clone(&migrator)),
+         },
+      ])
+      .unwrap();
+
+      assert_eq!(allowlist, vec![PathBuf::from(&canonical)]);
+      assert_eq!(migrations.len(), 1);
+      assert!(Arc::ptr_eq(migrations.get(&canonical).unwrap(), &migrator));
+   }
 
    #[test]
    fn test_max_databases_rejects_zero() {
-      let err = Builder::new().max_databases(0).unwrap_err();
+      let err = Builder::<MockRuntime>::new().max_databases(0).unwrap_err();
       assert!(matches!(err, Error::InvalidConfig(_)));
    }
 
    #[test]
    fn test_max_databases_accepts_positive() {
-      let builder = Builder::new().max_databases(1).unwrap();
+      let builder = Builder::<MockRuntime>::new().max_databases(1).unwrap();
       assert_eq!(builder.max_databases, Some(1));
    }
 
    #[test]
    fn test_transaction_timeout_rejects_zero() {
-      let err = Builder::new()
+      let err = Builder::<MockRuntime>::new()
          .transaction_timeout(std::time::Duration::ZERO)
          .unwrap_err();
       assert!(matches!(err, Error::InvalidConfig(_)));
@@ -622,7 +900,7 @@ mod tests {
 
    #[test]
    fn test_transaction_timeout_accepts_positive() {
-      let builder = Builder::new()
+      let builder = Builder::<MockRuntime>::new()
          .transaction_timeout(std::time::Duration::from_secs(1))
          .unwrap();
       assert_eq!(

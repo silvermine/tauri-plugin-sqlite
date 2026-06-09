@@ -248,7 +248,7 @@ export interface CustomConfig {
  */
 export interface MigrationEvent {
 
-   /** Database path (relative, as registered with the plugin) */
+   /** Database key as registered with the plugin (an absolute path, or `:memory:`) */
    dbPath: string;
 
    /** Status: "running", "completed", "failed" */
@@ -777,18 +777,29 @@ export default class Database {
     * A static initializer which connects to the underlying SQLite database and
     * returns a `Database` instance once a connection is established.
     *
-    * The path is relative to `tauri::path::BaseDirectory::AppConfig`.
+    * The path must be an absolute path that the Rust side has registered with the plugin
+    * (via `Builder::register_database` / `SetupRegistrar::register_database`),
+    * or an in-memory database such as `:memory:`.
+    * Relative paths throw `INVALID_PATH`; unregistered absolute paths throw
+    * `PATH_NOT_REGISTERED`; `..` segments and null bytes throw `PATH_TRAVERSAL`.
+    * Pass a path that canonicalizes to a registered location.
+    * It is the responsibility of the caller to ensure a consistent passing down
+    * of the needed path.
     *
-    * @param path - Database file path (relative to AppConfig directory)
+    * @param path - Absolute, registered database file path (or `:memory:`)
     * @param customConfig - Optional custom configuration for connection pools
     *
     * @example
     * ```ts
+    * import { appDataDir, join } from '@tauri-apps/api/path';
+    *
+    * const dbPath = await join(await appDataDir(), 'main.db');
+    *
     * // Use default configuration
-    * const db = await Database.load("test.db");
+    * const db = await Database.load(dbPath);
     *
     * // Use custom configuration
-    * const db = await Database.load("test.db", {
+    * const db2 = await Database.load(dbPath, {
     *   maxReadConnections: 10,
     *   idleTimeoutSecs: 60
     * });
@@ -813,11 +824,12 @@ export default class Database {
     * the Database class while deferring the actual database connection
     * until the first invocation or selection on the database.
     *
-    * The path is relative to `tauri::path::BaseDirectory::AppConfig`.
+    * The path must be an absolute path registered with the plugin on the Rust side, or an
+    * in-memory database. See {@link Database.load} for details.
     *
     * @example
     * ```ts
-    * const db = Database.get("test.db");
+    * const db = Database.get("/absolute/registered/path/main.db");
     * ```
     */
    public static get(path: string): Database {
@@ -866,7 +878,7 @@ export default class Database {
     *    "(SELECT todo_id FROM archive.completed)",
     *    [ "archived" ]
     * ).attach([{
-    *    databasePath: "archive.db",
+    *    databasePath: "/var/lib/myapp/archive.db",
     *    schemaName: "archive",
     *    mode: "readOnly"
     * }]);
@@ -918,7 +930,7 @@ export default class Database {
     *    ['INSERT INTO main.orders (user_id, total) VALUES ($1, $2)', [userId, total]],
     *    ['UPDATE archive.stats SET order_count = order_count + 1', []]
     * ]).attach([{
-    *    databasePath: "archive.db",
+    *    databasePath: "/var/lib/myapp/archive.db",
     *    schemaName: "archive",
     *    mode: "readWrite"
     * }]);
@@ -957,7 +969,7 @@ export default class Database {
     *    "SELECT u.name, o.total FROM users u JOIN orders.orders o ON u.id = o.user_id",
     *    []
     * ).attach([{
-    *    databasePath: "orders.db",
+    *    databasePath: "/var/lib/myapp/orders.db",
     *    schemaName: "orders",
     *    mode: "readOnly"
     * }]);
@@ -992,7 +1004,7 @@ export default class Database {
     *    "SELECT COUNT(*) as total FROM users u JOIN orders.orders o ON u.id = o.user_id",
     *    []
     * ).attach([{
-    *    databasePath: "orders.db",
+    *    databasePath: "/var/lib/myapp/orders.db",
     *    schemaName: "orders",
     *    mode: "readOnly"
     * }]);
@@ -1061,7 +1073,7 @@ export default class Database {
     *    keyset,
     *    25,
     * ).attach([{
-    *    databasePath: 'archive.db',
+    *    databasePath: '/var/lib/myapp/archive.db',
     *    schemaName: 'archive',
     *    mode: 'readOnly',
     * }]);
@@ -1292,7 +1304,7 @@ export default class Database {
     * let tx = await db.beginInterruptibleTransaction([
     *    ['DELETE FROM users WHERE archived = 1']
     * ]).attach([{
-    *    databasePath: 'archive.db',
+    *    databasePath: '/var/lib/myapp/archive.db',
     *    schemaName: 'archive',
     *    mode: 'readWrite'
     * }]);

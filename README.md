@@ -125,6 +125,62 @@ fn main() {
 }
 ```
 
+### Registering Database Paths
+
+Databases can only be opened by **absolute path**, and every absolute path must be
+**registered** with the plugin before the frontend can load it. The only exception is
+in-memory databases (`:memory:` and friends), which bypass the allowlist. Relative paths,
+unregistered absolute paths, `..` segments, and null bytes are rejected with
+`INVALID_PATH`, `PATH_NOT_REGISTERED`, or `PATH_TRAVERSAL` respectively.
+
+**Why:** `Database.load()` is callable from the frontend over IPC. Without an allowlist,
+untrusted or buggy frontend code could ask the plugin to open (and create) arbitrary
+files anywhere on disk. Restricting access to an explicit list of absolute paths closes
+that hole.
+
+**How it works:** Registered paths must be absolute, and are canonicalized once during
+plugin setup (so the check is symlink-safe). At load time, the requested path is
+canonicalized and must exactly match a registered entry.
+
+Because the legitimate paths almost always depend on runtime values (such as the
+OS-specific app data directory), registration normally happens in the `on_setup` hook,
+which runs during plugin setup once the `app` instance exists:
+
+```rust
+use tauri_plugin_sqlite::Builder;
+use tauri::Manager;
+
+fn main() {
+   tauri::Builder::default()
+      .plugin(
+         Builder::new()
+            .on_setup(|app, reg| {
+               let db = app.path().app_data_dir()?.join("main.db");
+               reg.register_database(db.to_string_lossy().into_owned(), None);
+               Ok(())
+            })
+            .build()
+      )
+      .run(tauri::generate_context!())
+      .expect("error while running tauri application");
+}
+```
+
+A static, fully-known absolute path can instead be registered up front with
+`register_database`:
+
+```rust
+use tauri_plugin_sqlite::Builder;
+
+# fn main() {
+let _ = Builder::new()
+   .register_database("/var/lib/myapp/main.db", None);
+# }
+```
+
+The frontend then calls `Database.load()` with a path that **canonicalizes to the same
+location** (see [Connecting](#connecting)).
+
 ### Migrations
 
 This plugin uses [SQLx's migration system][sqlx-migrate]. Create numbered `.sql`
@@ -139,22 +195,38 @@ src-tauri/migrations/
 └── 0003_create_posts.sql
 ```
 
-Register migrations using SQLx's `migrate!()` macro, which embeds them at compile time:
+Register migrations using SQLx's `migrate!()` macro, which embeds them at compile time.
+The migration key is a database path, so it follows the same rules as
+[registration](#registering-database-paths). Pass the migrator to
+`register_database` — the path is allowlisted automatically. The `on_setup` hook is the
+usual place to register app-derived paths:
 
 ```rust
 use tauri_plugin_sqlite::Builder;
+use tauri::Manager;
 
 fn main() {
    tauri::Builder::default()
       .plugin(
          Builder::new()
-            .add_migrations("main.db", sqlx::migrate!("./migrations"))
+            .on_setup(|app, reg| {
+               let db = app.path().app_data_dir()?.join("main.db");
+               reg.register_database(
+                  db.to_string_lossy().into_owned(),
+                  Some(sqlx::migrate!("./migrations")),
+               );
+               Ok(())
+            })
             .build()
       )
       .run(tauri::generate_context!())
       .expect("error while running tauri application");
 }
 ```
+
+The path passed to `register_database` is the database key: the frontend must call
+`Database.load()` with a path that canonicalizes to the same path for migrations to be
+awaited correctly.
 
 **Timing:** Migrations start automatically at plugin setup (non-blocking). When
 TypeScript calls `Database.load()`, it waits for migrations to complete before
@@ -168,7 +240,8 @@ Use `getMigrationEvents()` to retrieve cached events:
 ```typescript
 import Database from '@silvermine/tauri-plugin-sqlite';
 
-const db = await Database.load('mydb.db');
+// `dbPath` is the same absolute, registered path used to register migrations
+const db = await Database.load(dbPath);
 
 // Get all migration events (including ones emitted before listener could be registered)
 const events = await db.getMigrationEvents();
@@ -195,21 +268,34 @@ await listen<MigrationEvent>('sqlite:migration', (event) => {
 
 ### Connecting
 
+Pass the **same absolute path** that was registered on the Rust side (see
+[Registering Database Paths](#registering-database-paths)).
+
 ```typescript
 import Database from '@silvermine/tauri-plugin-sqlite';
+import { appDataDir, join } from '@tauri-apps/api/path';
 
-// Path is relative to app config directory (no sqlite: prefix needed)
-let db = await Database.load('mydb.db');
+const dbPath = await join(await appDataDir(), 'main.db');
+
+// Connect (no sqlite: prefix needed)
+let db = await Database.load(dbPath);
 
 // With custom configuration
-db = await Database.load('mydb.db', {
+db = await Database.load(dbPath, {
    maxReadConnections: 10, // default: 6
    idleTimeoutSecs: 60     // default: 30
 });
 
 // Lazy initialization (connects on first query)
-db = Database.get('mydb.db');
+db = Database.get(dbPath);
+
+// In-memory databases bypass the allowlist and need no registration
+const mem = await Database.load(':memory:');
 ```
+
+Loading a relative or malformed path throws `INVALID_PATH`. An unregistered absolute path
+throws `PATH_NOT_REGISTERED`. Paths with `..` segments or null bytes throw
+`PATH_TRAVERSAL`.
 
 ### Parameter Binding
 
@@ -400,7 +486,9 @@ tables.
 
 **Builder Pattern:** All query methods (`execute`, `executeTransaction`,
 `fetchAll`, `fetchOne`, `fetchPage`) return builders that support `.attach()`
-for cross-database operations.
+for cross-database operations. Each `databasePath` must be the same absolute, registered
+path used to load that database (see
+[Registering Database Paths](#registering-database-paths)).
 
 ```typescript
 // Join data from multiple databases
@@ -409,7 +497,7 @@ const results = await db.fetchAll(
    []
 ).attach([
    {
-      databasePath: 'orders.db',
+      databasePath: '/var/lib/myapp/orders.db',
       schemaName: 'orders',
       mode: 'readOnly'
    }
@@ -422,7 +510,7 @@ await db.execute(
    ['archived']
 ).attach([
    {
-      databasePath: 'archive.db',
+      databasePath: '/var/lib/myapp/archive.db',
       schemaName: 'archive',
       mode: 'readOnly'
    }
@@ -438,7 +526,7 @@ await db.executeTransaction([
    ['UPDATE stats.order_count SET count = count + 1', []]
 ]).attach([
    {
-      databasePath: 'stats.db',
+      databasePath: '/var/lib/myapp/stats.db',
       schemaName: 'stats',
       mode: 'readWrite'
    }
@@ -536,7 +624,9 @@ Common error codes:
    * `SQLITE_CONSTRAINT` - Constraint violation (unique, foreign key, etc.)
    * `SQLITE_NOTFOUND` - Table or column not found
    * `DATABASE_NOT_LOADED` - Database hasn't been loaded yet
-   * `INVALID_PATH` - Invalid database path
+   * `INVALID_PATH` - Relative or malformed database path
+   * `PATH_NOT_REGISTERED` - Absolute path not on the registered allowlist
+   * `PATH_TRAVERSAL` - Path contains `..` segments or null bytes
    * `IO_ERROR` - File system error
    * `MIGRATION_ERROR` - Migration failed
    * `MULTIPLE_ROWS_RETURNED` - `fetchOne()` returned multiple rows
@@ -619,7 +709,7 @@ interface CustomConfig {
 }
 
 interface AttachedDatabaseSpec {
-   databasePath: string;  // Path relative to app config directory
+   databasePath: string;  // Absolute, registered path of a database already loaded via load()
    schemaName: string;    // Schema name for accessing tables (e.g., 'orders')
    mode: 'readOnly' | 'readWrite';
 }
@@ -985,9 +1075,14 @@ pagination to keep memory usage bounded on both the Rust and TypeScript sides.
 
 ### Path Validation
 
-Database paths are validated to prevent directory traversal. Absolute paths,
-`..` segments, and null bytes are rejected. All paths are resolved relative to
-the app config directory.
+`Database.load()` is reachable from the frontend over IPC, so the plugin only opens
+databases on an explicit allowlist. A path is accepted only if it is an in-memory database
+or an absolute path that was registered on the Rust side via `Builder::register_database`
+or `SetupRegistrar::register_database` (see
+[Registering Database Paths](#registering-database-paths)).
+Relative paths return `INVALID_PATH`; unregistered absolute paths return
+`PATH_NOT_REGISTERED`; `..` segments and null bytes return `PATH_TRAVERSAL`.
+Registered paths are canonicalized at setup so the match is symlink-safe.
 
 ## Development
 

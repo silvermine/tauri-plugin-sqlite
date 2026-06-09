@@ -94,6 +94,11 @@ fn resolve_attached_specs(
 /// If the database is already loaded, returns the existing connection.
 /// Otherwise, creates a new connection with optional custom configuration.
 ///
+/// `db` must be either an in-memory database or an absolute path that was registered with
+/// the plugin (via `Builder::register_database` / `SetupRegistrar::register_database`).
+/// Unregistered or
+/// relative paths are rejected with a path error.
+///
 /// # Migration Timing
 ///
 /// If migrations are registered for this database, this function waits for them
@@ -109,6 +114,12 @@ pub async fn load<R: Runtime>(
    db: String,
    custom_config: Option<SqliteDatabaseConfig>,
 ) -> Result<String> {
+   // Resolve and canonicalize before cache/migration lookup so equivalent spellings share
+   // one connection and migration state.
+   let db = crate::resolve::resolve_database_path(&db, &app)?
+      .to_string_lossy()
+      .into_owned();
+
    // Wait for migrations to complete if registered for this database
    await_migrations(&migration_states, &db).await?;
 
