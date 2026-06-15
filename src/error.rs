@@ -55,6 +55,10 @@ pub enum Error {
    #[error("invalid configuration: {0}")]
    InvalidConfig(String),
 
+   /// Required plugin managed state was not found.
+   #[error("required plugin state not found: {0}")]
+   MissingState(String),
+
    /// Generic error for operations that don't fit other categories.
    #[error("{0}")]
    Other(String),
@@ -94,6 +98,7 @@ impl Error {
          Error::TooManyDatabases(_) => "TOO_MANY_DATABASES".to_string(),
          Error::TooManySubscriptions(_) => "TOO_MANY_SUBSCRIPTIONS".to_string(),
          Error::InvalidConfig(_) => "INVALID_CONFIG".to_string(),
+         Error::MissingState(_) => "MISSING_STATE".to_string(),
          Error::Other(_) => "ERROR".to_string(),
       }
    }
@@ -144,6 +149,12 @@ mod tests {
          json["message"].as_str().unwrap(),
          "database key not registered: MAIN"
       );
+   }
+
+   #[test]
+   fn test_error_code_missing_state() {
+      let err = Error::MissingState("DbInstances".into());
+      assert_eq!(err.error_code(), "MISSING_STATE");
    }
 
    #[test]

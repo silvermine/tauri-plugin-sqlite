@@ -49,6 +49,14 @@ pub enum Error {
    #[error("transaction timed out for database: {0}")]
    TransactionTimedOut(String),
 
+   /// Transaction was cancelled because the database was closed.
+   #[error("transaction cancelled because database was closed: {0}")]
+   TransactionCancelled(String),
+
+   /// Multiple errors occurred during transaction cleanup.
+   #[error("transaction cleanup failed with {} error(s): {}", .0.len(), Error::format_cleanup_errors(.0))]
+   TransactionCleanupFailed(Vec<Error>),
+
    /// Error from the observer (change notifications).
    #[cfg(feature = "observer")]
    #[error(transparent)]
@@ -100,6 +108,24 @@ pub enum Error {
 }
 
 impl Error {
+   /// Format multiple cleanup errors for display.
+   fn format_cleanup_errors(errors: &[Error]) -> String {
+      errors
+         .iter()
+         .enumerate()
+         .map(|(index, err)| format!("[{index}] {err}"))
+         .collect::<Vec<_>>()
+         .join("; ")
+   }
+
+   /// Returns individual errors when this is a cleanup aggregate.
+   pub fn cleanup_errors(&self) -> Option<&[Error]> {
+      match self {
+         Self::TransactionCleanupFailed(errors) => Some(errors),
+         _ => None,
+      }
+   }
+
    /// Extract a structured error code from the error type.
    ///
    /// This provides machine-readable error codes for error handling.
@@ -120,6 +146,8 @@ impl Error {
          Error::NoActiveTransaction(_) => "NO_ACTIVE_TRANSACTION".to_string(),
          Error::InvalidTransactionToken => "INVALID_TRANSACTION_TOKEN".to_string(),
          Error::TransactionTimedOut(_) => "TRANSACTION_TIMED_OUT".to_string(),
+         Error::TransactionCancelled(_) => "TRANSACTION_CANCELLED".to_string(),
+         Error::TransactionCleanupFailed(_) => "TRANSACTION_CLEANUP_FAILED".to_string(),
          #[cfg(feature = "observer")]
          Error::Observer(_) => "OBSERVER_ERROR".to_string(),
          Error::Io(_) => "IO_ERROR".to_string(),
@@ -204,6 +232,26 @@ mod tests {
       let err = Error::TransactionTimedOut("test.db".into());
       assert_eq!(err.error_code(), "TRANSACTION_TIMED_OUT");
       assert!(err.to_string().contains("test.db"));
+   }
+
+   #[test]
+   fn test_error_code_transaction_cancelled() {
+      let err = Error::TransactionCancelled("MAIN".into());
+      assert_eq!(err.error_code(), "TRANSACTION_CANCELLED");
+      assert!(err.to_string().contains("MAIN"));
+   }
+
+   #[test]
+   fn test_error_code_transaction_cleanup_failed() {
+      let err = Error::TransactionCleanupFailed(vec![
+         Error::Other("first failure".into()),
+         Error::Other("second failure".into()),
+      ]);
+      assert_eq!(err.error_code(), "TRANSACTION_CLEANUP_FAILED");
+      assert!(err.to_string().contains("2 error(s)"));
+      assert!(err.to_string().contains("first failure"));
+      assert!(err.to_string().contains("second failure"));
+      assert_eq!(err.cleanup_errors().unwrap().len(), 2);
    }
 
    #[test]

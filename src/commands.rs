@@ -18,13 +18,13 @@ use tauri::{AppHandle, Runtime, State};
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::connect_to_database;
 use crate::{
    DbInstances, Error, MigrationEvent, MigrationStates, Result,
    subscriptions::{
       ActiveSubscriptions, ObserverConfigParams, TableChangePayload, event_to_payload,
    },
 };
+use crate::{close_all_loaded_databases, close_database, connect_to_database};
 
 /// Token representing an active interruptible transaction
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,8 +164,8 @@ pub async fn execute_transaction(
       .map(|s| (s.query, s.values))
       .collect();
 
-   // Generate unique key for tracking this transaction
-   let tx_key = format!("{}:{}", db_key, Uuid::new_v4());
+   // Generate unique id for tracking this transaction
+   let tx_id = Uuid::new_v4().to_string();
 
    // Resolve attached specs if provided
    let resolved_specs = if let Some(specs) = attached {
@@ -174,10 +174,11 @@ pub async fn execute_transaction(
       None
    };
 
-   // Spawn transaction execution with abort handle for cleanup on exit
+   // Spawn transaction execution with join handle tracked for cleanup on close
    let wrapper_clone = wrapper.clone();
-   let tx_key_clone = tx_key.clone();
+   let tx_id_clone = tx_id.clone();
    let regular_txs_clone = regular_txs.inner().clone();
+   let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
    let handle = tokio::spawn(async move {
       // Convert String to &str for execute_transaction
@@ -195,27 +196,29 @@ pub async fn execute_transaction(
       let result = builder.execute().await;
 
       // Remove from tracking when complete (even if result is Err)
-      regular_txs_clone.remove(&tx_key_clone).await;
-
-      result
+      regular_txs_clone.remove(&tx_id_clone).await;
+      let _ = result_tx.send(result);
    });
 
-   // Track abort handle for cleanup on app exit
    regular_txs
-      .insert(tx_key.clone(), handle.abort_handle())
+      .insert(db_key.clone(), tx_id.clone(), handle)
       .await;
 
-   // Wait for transaction to complete
-   match handle.await {
+   match result_rx.await {
       Ok(result) => Ok(result?),
-      Err(e) => {
-         // Task panicked or was aborted - ensure cleanup
-         regular_txs.remove(&tx_key).await;
-
-         if e.is_cancelled() {
-            Err(Error::Other("Transaction aborted due to app exit".into()))
+      Err(_) => {
+         if let Some(handle) = regular_txs.inner().take_handle(&tx_id).await {
+            match handle.await {
+               Ok(()) => Err(Error::Other("Transaction completed without result".into())),
+               Err(e) if e.is_cancelled() => Err(Error::Toolkit(
+                  sqlx_sqlite_toolkit::Error::TransactionCancelled(db_key),
+               )),
+               Err(e) => Err(Error::Other(format!("Transaction task panicked: {e}"))),
+            }
          } else {
-            Err(Error::Other(format!("Transaction task panicked: {}", e)))
+            Err(Error::Toolkit(
+               sqlx_sqlite_toolkit::Error::TransactionCancelled(db_key),
+            ))
          }
       }
    }
@@ -322,57 +325,53 @@ pub async fn fetch_page(
    Ok(result)
 }
 
-/// Close a specific database connection
+/// Close the loaded instance for a registered database key.
 ///
 /// Returns `true` if the database was loaded and successfully closed.
 /// Returns `false` if the database was not loaded (nothing to close).
-/// Any active subscriptions for this database are aborted before closing.
+/// Returns `Err` if transaction cleanup or pool close fails (database file
+/// may not be safe to delete or recreate).
+/// Active subscriptions for this key are aborted, and in-flight transactions
+/// are cleaned up (interruptible transactions rolled back; regular transaction
+/// tasks aborted and awaited) before the connection pool is closed.
 #[tauri::command]
 pub async fn close(
    db_instances: State<'_, DbInstances>,
    active_subs: State<'_, ActiveSubscriptions>,
+   interruptible_txs: State<'_, ActiveInterruptibleTransactions>,
+   regular_txs: State<'_, ActiveRegularTransactions>,
    db_key: String,
 ) -> Result<bool> {
-   active_subs.remove_for_db(&db_key).await;
-
-   let mut instances = db_instances.inner.write().await;
-
-   if let Some(wrapper) = instances.remove(&db_key) {
-      wrapper.close().await?;
-      Ok(true)
-   } else {
-      Ok(false) // Database wasn't loaded
-   }
+   close_database(
+      &db_key,
+      &db_instances,
+      &active_subs,
+      &interruptible_txs,
+      &regular_txs,
+   )
+   .await
 }
 
-/// Close all database connections
+/// Close all database connections.
 ///
-/// All active subscriptions are aborted before closing. Each wrapper's
-/// `close()` handles disabling its own observer at the crate level.
+/// All active subscriptions are aborted and in-flight transactions are cleaned
+/// up (interruptible transactions rolled back; regular transaction tasks
+/// aborted and awaited) before connection pools are closed.
+/// Returns `Err` if transaction cleanup or any pool close fails.
 #[tauri::command]
 pub async fn close_all(
    db_instances: State<'_, DbInstances>,
    active_subs: State<'_, ActiveSubscriptions>,
+   interruptible_txs: State<'_, ActiveInterruptibleTransactions>,
+   regular_txs: State<'_, ActiveRegularTransactions>,
 ) -> Result<()> {
-   active_subs.abort_all().await;
-
-   let mut instances = db_instances.inner.write().await;
-
-   // Collect all wrappers to close
-   let wrappers: Vec<DatabaseWrapper> = instances.drain().map(|(_, v)| v).collect();
-
-   // Close each connection, continuing on errors to ensure all get closed
-   let mut last_error: Option<Error> = None;
-   for wrapper in wrappers {
-      if let Err(e) = wrapper.close().await {
-         last_error = Some(e.into());
-      }
-   }
-
-   match last_error {
-      Some(e) => Err(e),
-      None => Ok(()),
-   }
+   close_all_loaded_databases(
+      &db_instances,
+      &active_subs,
+      &interruptible_txs,
+      &regular_txs,
+   )
+   .await
 }
 
 /// Close database connection and remove all database files

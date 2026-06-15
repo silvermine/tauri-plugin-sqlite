@@ -24,8 +24,13 @@ pub use sqlx_sqlite_toolkit::{
    TransactionExecutionBuilder, WriteQueryResult,
 };
 
+use crate::subscriptions::ActiveSubscriptions;
+
 /// Default maximum number of concurrently loaded databases.
 const DEFAULT_MAX_DATABASES: usize = 50;
+
+/// Upper bound on how long close/cleanup may run before returning a timeout error.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Tracks cleanup progress during app exit: 0 = not started, 1 = running, 2 = complete.
 static CLEANUP_STATE: AtomicU8 = AtomicU8::new(0);
@@ -548,8 +553,13 @@ impl<R: Runtime> Builder<R> {
             let migration_states = app.state::<MigrationStates>();
             {
                let mut states = migration_states.0.blocking_write();
-               for key in database_info_by_key.keys() {
-                  states.insert(key.clone(), MigrationState::new());
+               // Only track migration state for databases that have a migrator.
+               // Keys without migrations are omitted so `await_migrations` returns
+               // immediately instead of waiting on a Pending state that never runs.
+               for (key, info) in &database_info_by_key {
+                  if info.migrator.is_some() {
+                     states.insert(key.clone(), MigrationState::new());
+                  }
                }
             }
 
@@ -629,31 +639,23 @@ impl<R: Runtime> Builder<R> {
                      // try_read() on the same lock.
                      {
                         let timeout_result = tokio::time::timeout(
-                           std::time::Duration::from_secs(5),
+                           CLOSE_TIMEOUT,
                            async {
-                              // First, abort all subscriptions and transactions
                               debug!("Aborting active subscriptions and transactions");
                               active_subs_clone.abort_all().await;
-                              sqlx_sqlite_toolkit::cleanup_all_transactions(&interruptible_txs_clone, &regular_txs_clone).await;
-
-                              // Close databases (each wrapper's close() disables its own
-                              // observer at the crate level, unregistering SQLite hooks)
-                              let mut guard = instances_clone.inner.write().await;
-                              let wrappers: Vec<DatabaseWrapper> =
-                                 guard.drain().map(|(_, v)| v).collect();
-
-                              // Close databases in parallel
-                              let mut set = tokio::task::JoinSet::new();
-                              for wrapper in wrappers {
-                                 set.spawn(async move { wrapper.close().await });
+                              if let Err(e) = sqlx_sqlite_toolkit::cleanup_all_transactions(
+                                 &interruptible_txs_clone,
+                                 &regular_txs_clone,
+                              )
+                              .await
+                              {
+                                 warn!("Transaction cleanup failed during exit: {e}");
                               }
 
-                              while let Some(result) = set.join_next().await {
-                                 match result {
-                                    Ok(Err(e)) => warn!("Error closing database: {:?}", e),
-                                    Err(e) => warn!("Database close task panicked: {:?}", e),
-                                    Ok(Ok(())) => {}
-                                 }
+                              if let Err(e) =
+                                 close_all_wrappers(&instances_clone).await
+                              {
+                                 warn!("Error closing databases during exit: {e:?}");
                               }
                            },
                         )
@@ -890,6 +892,27 @@ pub trait Connection<R: Runtime> {
       database_key: &str,
       config: SqliteDatabaseConfig,
    ) -> impl Future<Output = Result<DatabaseWrapper>> + Send;
+
+   /// Close the loaded instance for a registered database key.
+   ///
+   /// Returns `true` if the database was loaded and successfully closed.
+   /// Returns `false` if the database was not loaded (nothing to close).
+   /// Returns `Err` if transaction cleanup or pool close fails (database file
+   /// may not be safe to delete or recreate).
+   ///
+   /// On success (`Ok(true)`), connections are closed and WAL is truncated via
+   /// `wal_checkpoint(TRUNCATE)`. The main `.db` file is safe to delete or recreate.
+   /// `-wal` / `-shm` sidecar files may remain as empty artifacts and are harmless.
+   ///
+   /// If close returns `Err`, the database file may still be locked — do not delete it.
+   ///
+   /// Close is bounded by a 5-second timeout; hung pool teardown returns an error
+   /// rather than blocking indefinitely.
+   ///
+   /// Active subscriptions for this key are aborted, and in-flight transactions
+   /// are cleaned up (interruptible transactions rolled back; regular transaction
+   /// tasks aborted and awaited) before the connection pool is closed.
+   fn close(&self, database_key: &str) -> impl Future<Output = Result<bool>> + Send;
 }
 
 /// Delegates to [`connect_to_database`]: same open path as the `load` IPC command.
@@ -906,6 +929,32 @@ impl<R: Runtime> Connection<R> for AppHandle<R> {
    ) -> Result<DatabaseWrapper> {
       let response = connect_to_database(self, database_key, Some(config)).await?;
       Ok(response.wrapper)
+   }
+
+   async fn close(&self, database_key: &str) -> Result<bool> {
+      let instances = self
+         .try_state::<DbInstances>()
+         .ok_or(Error::MissingState("DbInstances".into()))?;
+      let subs = self
+         .try_state::<ActiveSubscriptions>()
+         .ok_or(Error::MissingState("ActiveSubscriptions".into()))?;
+      let interruptible_txs =
+         self
+            .try_state::<ActiveInterruptibleTransactions>()
+            .ok_or(Error::MissingState(
+               "ActiveInterruptibleTransactions".into(),
+            ))?;
+      let regular_txs = self
+         .try_state::<ActiveRegularTransactions>()
+         .ok_or(Error::MissingState("ActiveRegularTransactions".into()))?;
+      close_database(
+         database_key,
+         &instances,
+         &subs,
+         &interruptible_txs,
+         &regular_txs,
+      )
+      .await
    }
 }
 
@@ -1005,6 +1054,144 @@ async fn await_migrations(migration_states: &MigrationStates, db_key: &str) -> R
    }
 }
 
+/// Close a loaded database by key, aborting subscriptions and in-flight transactions first.
+///
+/// Attempts full cleanup even when transaction teardown fails. Returns `Ok(true)` when
+/// the database was loaded and fully closed, `Ok(false)` when it was not loaded,
+/// or `Err` when cleanup or pool close fails.
+///
+/// On success, WAL is truncated and the main `.db` file is safe to delete or recreate.
+pub(crate) async fn close_database(
+   db_key: &str,
+   db_instances: &DbInstances,
+   active_subs: &ActiveSubscriptions,
+   interruptible_txs: &ActiveInterruptibleTransactions,
+   regular_txs: &ActiveRegularTransactions,
+) -> Result<bool> {
+   let db_key = db_key.to_string();
+   let close_result = tokio::time::timeout(
+      CLOSE_TIMEOUT,
+      close_database_inner(
+         &db_key,
+         db_instances,
+         active_subs,
+         interruptible_txs,
+         regular_txs,
+      ),
+   )
+   .await;
+
+   match close_result {
+      Ok(result) => result,
+      Err(_) => Err(Error::Other(format!(
+         "database close timed out after {} seconds",
+         CLOSE_TIMEOUT.as_secs()
+      ))),
+   }
+}
+
+/// Close a loaded database, attempting full cleanup even when transaction teardown fails.
+async fn close_database_inner(
+   db_key: &str,
+   db_instances: &DbInstances,
+   active_subs: &ActiveSubscriptions,
+   interruptible_txs: &ActiveInterruptibleTransactions,
+   regular_txs: &ActiveRegularTransactions,
+) -> Result<bool> {
+   let mut last_error = None;
+
+   active_subs.remove_for_db(db_key).await;
+
+   if let Err(err) =
+      sqlx_sqlite_toolkit::cleanup_transactions_for_db(db_key, interruptible_txs, regular_txs).await
+   {
+      last_error = Some(err.into());
+   }
+
+   let mut instances = db_instances.inner.write().await;
+   let wrapper = instances.remove(db_key);
+   drop(instances);
+
+   let was_loaded = wrapper.is_some();
+   if let Some(wrapper) = wrapper
+      && let Err(err) = wrapper.close().await
+   {
+      last_error = Some(err.into());
+   }
+
+   match last_error {
+      Some(err) => Err(err),
+      None => Ok(was_loaded),
+   }
+}
+
+async fn close_all_wrappers(db_instances: &DbInstances) -> Result<()> {
+   let mut instances = db_instances.inner.write().await;
+   let wrappers: Vec<DatabaseWrapper> = instances.drain().map(|(_, v)| v).collect();
+   drop(instances);
+
+   let mut last_error: Option<Error> = None;
+   for wrapper in wrappers {
+      if let Err(e) = wrapper.close().await {
+         last_error = Some(e.into());
+      }
+   }
+
+   match last_error {
+      Some(e) => Err(e),
+      None => Ok(()),
+   }
+}
+
+/// Close all loaded database instances after aborting subscriptions and
+/// cleaning up in-flight transactions.
+pub(crate) async fn close_all_loaded_databases(
+   db_instances: &DbInstances,
+   active_subs: &ActiveSubscriptions,
+   interruptible_txs: &ActiveInterruptibleTransactions,
+   regular_txs: &ActiveRegularTransactions,
+) -> Result<()> {
+   let close_result = tokio::time::timeout(
+      CLOSE_TIMEOUT,
+      close_all_loaded_databases_inner(db_instances, active_subs, interruptible_txs, regular_txs),
+   )
+   .await;
+
+   match close_result {
+      Ok(result) => result,
+      Err(_) => Err(Error::Other(format!(
+         "database close timed out after {} seconds",
+         CLOSE_TIMEOUT.as_secs()
+      ))),
+   }
+}
+
+async fn close_all_loaded_databases_inner(
+   db_instances: &DbInstances,
+   active_subs: &ActiveSubscriptions,
+   interruptible_txs: &ActiveInterruptibleTransactions,
+   regular_txs: &ActiveRegularTransactions,
+) -> Result<()> {
+   let mut last_error = None;
+
+   active_subs.abort_all().await;
+
+   if let Err(err) =
+      sqlx_sqlite_toolkit::cleanup_all_transactions(interruptible_txs, regular_txs).await
+   {
+      last_error = Some(err.into());
+   }
+
+   if let Err(err) = close_all_wrappers(db_instances).await {
+      last_error = Some(err);
+   }
+
+   match last_error {
+      Some(err) => Err(err),
+      None => Ok(()),
+   }
+}
+
 /// Resolve a registered database path by key.
 ///
 /// The `db_key` must match a key registered via
@@ -1024,10 +1211,112 @@ fn resolve_database_path<R: Runtime>(db_key: &str, app: &AppHandle<R>) -> Result
 #[cfg(test)]
 mod tests {
    use super::*;
+   use crate::commands;
    use std::collections::HashMap;
-   use tauri::Manager;
    use tauri::plugin::Plugin;
    use tauri::test::{MockRuntime, mock_app, mock_builder, mock_context, noop_assets};
+   use uuid::Uuid;
+
+   /// Build and initialize the plugin for a single registered database.
+   ///
+   /// Must run **outside** a Tokio runtime context (or on a `spawn_blocking` thread).
+   /// Plugin `.setup()` calls `tokio::sync::RwLock::blocking_write()`, which panics
+   /// if invoked while the current thread is already driving async tasks (e.g. inside
+   /// `#[tokio::test]`). Integration tests below use `#[test]` + `block_on` and run
+   /// initialization via `spawn_blocking` before awaiting commands.
+   fn init_app_with_registered_db_at_path(
+      key: &str,
+      db_path: PathBuf,
+   ) -> (tauri::App<MockRuntime>, PathBuf) {
+      let mut plugin = Builder::<MockRuntime>::new()
+         .register_database(key, &db_path, None)
+         .unwrap()
+         .build()
+         .unwrap();
+      let app = mock_app();
+      plugin
+         .initialize(app.handle(), serde_json::Value::default())
+         .expect("plugin init should succeed");
+      (app, db_path)
+   }
+
+   fn init_app_with_main_and_other(
+      main_path: PathBuf,
+      other_path: PathBuf,
+   ) -> tauri::App<MockRuntime> {
+      let mut plugin = Builder::<MockRuntime>::new()
+         .register_database("MAIN", &main_path, None)
+         .unwrap()
+         .register_database("OTHER", &other_path, None)
+         .unwrap()
+         .build()
+         .unwrap();
+      let app = mock_app();
+      plugin
+         .initialize(app.handle(), serde_json::Value::default())
+         .expect("plugin init should succeed");
+      app
+   }
+
+   async fn load_and_create_test_table(app: &tauri::App<MockRuntime>, db_key: &str) {
+      connect_to_database(app.handle(), db_key, None)
+         .await
+         .expect("connect should succeed");
+
+      commands::execute(
+         app.state::<DbInstances>(),
+         db_key.to_string(),
+         "CREATE TABLE test (id INTEGER PRIMARY KEY, val TEXT)".to_string(),
+         vec![],
+         None,
+      )
+      .await
+      .expect("create table should succeed");
+   }
+
+   /// Holds a writer mid-transaction so `close` must abort with a checked-out connection.
+   async fn spawn_tracked_mid_write_regular_transaction(
+      app: &tauri::App<MockRuntime>,
+   ) -> tokio::sync::oneshot::Receiver<()> {
+      use sqlx_sqlite_toolkit::TransactionWriter;
+
+      let wrapper = {
+         let instances = app.state::<DbInstances>().inner().inner.read().await;
+         instances
+            .get("MAIN")
+            .expect("MAIN should be loaded")
+            .clone()
+      };
+      let tx_id = Uuid::new_v4().to_string();
+      let regular_txs = app.state::<ActiveRegularTransactions>().inner().clone();
+      let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+      let tx_id_for_task = tx_id.clone();
+
+      let handle = tokio::spawn(async move {
+         let guard = wrapper.acquire_writer().await.expect("acquire writer");
+         let mut writer = TransactionWriter::from(guard);
+         writer
+            .begin_immediate()
+            .await
+            .expect("begin immediate should succeed");
+         writer
+            .execute_query(
+               sqlx::query("INSERT INTO test (val) VALUES (?)").bind("should-not-commit"),
+            )
+            .await
+            .expect("insert should succeed");
+         started_tx.send(()).ok();
+         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+         regular_txs.remove(&tx_id_for_task).await;
+      });
+
+      app.state::<ActiveRegularTransactions>()
+         .inner()
+         .insert("MAIN".into(), tx_id, handle)
+         .await;
+
+      started_rx
+   }
 
    fn builder_with_duplicate_paths(temp_dir: &tempfile::TempDir) -> Builder<MockRuntime> {
       let path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
@@ -1350,5 +1639,388 @@ mod tests {
          builder.transaction_timeout,
          Some(std::time::Duration::from_secs(1))
       );
+   }
+
+   #[test]
+   fn test_connect_without_migrator_does_not_wait_on_migration_state() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         // `plugin.initialize()` must not run on the runtime worker thread — see
+         // `init_app_with_registered_db_at_path` for why we use `spawn_blocking`.
+         let (app, path) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         let migration_states = app.state::<MigrationStates>();
+         assert!(
+            !migration_states.0.read().await.contains_key("MAIN"),
+            "databases without a migrator should not have migration state"
+         );
+
+         let response = connect_to_database(app.handle(), "MAIN", None)
+            .await
+            .expect("connect should not block on migration state");
+         assert_eq!(response.path, path);
+      });
+   }
+
+   #[test]
+   fn test_close_rolls_back_interruptible_transaction() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         commands::begin_interruptible_transaction(
+            app.state::<DbInstances>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            "MAIN".to_string(),
+            vec![Statement {
+               query: "INSERT INTO test (val) VALUES (?)".to_string(),
+               values: vec![serde_json::json!("uncommitted")],
+            }],
+            None,
+         )
+         .await
+         .expect("begin interruptible transaction should succeed");
+
+         let closed = commands::close(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            app.state::<ActiveRegularTransactions>(),
+            "MAIN".to_string(),
+         )
+         .await
+         .expect("close should succeed");
+         assert!(closed);
+
+         assert!(
+            app.state::<DbInstances>()
+               .inner()
+               .inner
+               .read()
+               .await
+               .get("MAIN")
+               .is_none(),
+            "close should remove the loaded instance"
+         );
+
+         let response = connect_to_database(app.handle(), "MAIN", None)
+            .await
+            .expect("reload after close should succeed");
+         let rows = response
+            .wrapper
+            .fetch_all("SELECT val FROM test".into(), vec![])
+            .await
+            .expect("fetch after close should succeed");
+
+         assert!(
+            rows.is_empty(),
+            "close should roll back interruptible transaction before closing"
+         );
+      });
+   }
+
+   #[test]
+   fn test_close_aborts_in_flight_regular_transaction() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, path) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let started_rx = spawn_tracked_mid_write_regular_transaction(&app).await;
+         started_rx
+            .await
+            .expect("regular transaction should hold writer mid-flight");
+
+         let closed = commands::close(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            app.state::<ActiveRegularTransactions>(),
+            "MAIN".to_string(),
+         )
+         .await
+         .expect("close should succeed");
+         assert!(closed);
+
+         assert!(
+            app.state::<DbInstances>()
+               .inner()
+               .inner
+               .read()
+               .await
+               .get("MAIN")
+               .is_none(),
+            "close should remove the loaded instance"
+         );
+
+         let response = connect_to_database(app.handle(), "MAIN", None)
+            .await
+            .expect("reload after close should succeed");
+         let rows = response
+            .wrapper
+            .fetch_all("SELECT val FROM test".into(), vec![])
+            .await
+            .expect("fetch after close should succeed");
+
+         assert!(
+            rows.is_empty(),
+            "close should abort mid-write regular transaction before closing"
+         );
+
+         std::fs::remove_file(&path).expect("database file should be safe to delete after close");
+      });
+   }
+
+   #[test]
+   fn test_close_all_cleans_up_transactions() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let main_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let other_path = validate::validate_database_path(temp_dir.path().join("other.db")).unwrap();
+
+      let main_path_for_delete = main_path.clone();
+
+      tauri::async_runtime::block_on(async {
+         let app = tokio::task::spawn_blocking(move || {
+            init_app_with_main_and_other(main_path, other_path)
+         })
+         .await
+         .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+         load_and_create_test_table(&app, "OTHER").await;
+
+         commands::begin_interruptible_transaction(
+            app.state::<DbInstances>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            "MAIN".to_string(),
+            vec![Statement {
+               query: "INSERT INTO test (val) VALUES (?)".to_string(),
+               values: vec![serde_json::json!("uncommitted")],
+            }],
+            None,
+         )
+         .await
+         .expect("begin interruptible transaction should succeed");
+
+         commands::begin_interruptible_transaction(
+            app.state::<DbInstances>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            "OTHER".to_string(),
+            vec![Statement {
+               query: "INSERT INTO test (val) VALUES (?)".to_string(),
+               values: vec![serde_json::json!("other-uncommitted")],
+            }],
+            None,
+         )
+         .await
+         .expect("begin OTHER interruptible transaction should succeed");
+
+         commands::close_all(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            app.state::<ActiveRegularTransactions>(),
+         )
+         .await
+         .expect("close_all should succeed");
+
+         assert!(
+            app.state::<DbInstances>()
+               .inner()
+               .inner
+               .read()
+               .await
+               .is_empty(),
+            "close_all should remove all loaded instances"
+         );
+
+         let response = connect_to_database(app.handle(), "MAIN", None)
+            .await
+            .expect("reload after close_all should succeed");
+         let rows = response
+            .wrapper
+            .fetch_all("SELECT val FROM test".into(), vec![])
+            .await
+            .expect("fetch after close_all should succeed");
+
+         assert!(
+            rows.is_empty(),
+            "close_all should roll back interruptible transactions before closing"
+         );
+
+         std::fs::remove_file(&main_path_for_delete)
+            .expect("database file should be safe to delete after close_all");
+      });
+   }
+
+   #[test]
+   fn test_close_only_aborts_transactions_for_target_database() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let main_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let other_path = validate::validate_database_path(temp_dir.path().join("other.db")).unwrap();
+
+      tauri::async_runtime::block_on(async {
+         let app = tokio::task::spawn_blocking(move || {
+            init_app_with_main_and_other(main_path, other_path)
+         })
+         .await
+         .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+         load_and_create_test_table(&app, "OTHER").await;
+
+         let main_token = commands::begin_interruptible_transaction(
+            app.state::<DbInstances>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            "MAIN".to_string(),
+            vec![Statement {
+               query: "INSERT INTO test (val) VALUES (?)".to_string(),
+               values: vec![serde_json::json!("main-uncommitted")],
+            }],
+            None,
+         )
+         .await
+         .expect("begin MAIN interruptible transaction should succeed");
+
+         let other_token = commands::begin_interruptible_transaction(
+            app.state::<DbInstances>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            "OTHER".to_string(),
+            vec![Statement {
+               query: "INSERT INTO test (val) VALUES (?)".to_string(),
+               values: vec![serde_json::json!("other-uncommitted")],
+            }],
+            None,
+         )
+         .await
+         .expect("begin OTHER interruptible transaction should succeed");
+
+         let closed = commands::close(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            app.state::<ActiveRegularTransactions>(),
+            "MAIN".to_string(),
+         )
+         .await
+         .expect("close should succeed");
+         assert!(closed);
+
+         assert!(
+            app.state::<DbInstances>()
+               .inner()
+               .inner
+               .read()
+               .await
+               .get("MAIN")
+               .is_none()
+         );
+         assert!(
+            app.state::<DbInstances>()
+               .inner()
+               .inner
+               .read()
+               .await
+               .get("OTHER")
+               .is_some()
+         );
+
+         let err = commands::transaction_continue(
+            app.state::<ActiveInterruptibleTransactions>(),
+            main_token,
+            commands::TransactionAction::Commit,
+         )
+         .await
+         .expect_err("MAIN transaction should have been aborted on close");
+         assert!(matches!(
+            err,
+            Error::Toolkit(sqlx_sqlite_toolkit::Error::NoActiveTransaction(_))
+         ));
+
+         let continued = commands::transaction_continue(
+            app.state::<ActiveInterruptibleTransactions>(),
+            other_token,
+            commands::TransactionAction::Rollback,
+         )
+         .await
+         .expect("OTHER transaction should still be active");
+         assert!(continued.is_none());
+      });
+   }
+
+   #[test]
+   fn test_execute_transaction_returns_cancelled_when_database_closed() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let started_rx = spawn_tracked_mid_write_regular_transaction(&app).await;
+         started_rx
+            .await
+            .expect("regular transaction should hold writer mid-flight");
+
+         let app_for_exec = app.handle().clone();
+         let exec_task = tokio::spawn(async move {
+            commands::execute_transaction(
+               app_for_exec.state::<DbInstances>(),
+               app_for_exec.state::<ActiveRegularTransactions>(),
+               "MAIN".to_string(),
+               vec![Statement {
+                  query: "INSERT INTO test (val) VALUES (?)".to_string(),
+                  values: vec![serde_json::json!("blocked")],
+               }],
+               None,
+            )
+            .await
+         });
+
+         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+         commands::close(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            app.state::<ActiveRegularTransactions>(),
+            "MAIN".to_string(),
+         )
+         .await
+         .expect("close should succeed");
+
+         let err = exec_task.await.unwrap().expect_err("execute should fail");
+         assert!(matches!(
+            err,
+            Error::Toolkit(sqlx_sqlite_toolkit::Error::TransactionCancelled(_))
+         ));
+         assert!(err.to_string().contains("transaction cancelled"));
+      });
    }
 }
