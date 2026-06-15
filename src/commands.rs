@@ -18,8 +18,9 @@ use tauri::{AppHandle, Runtime, State};
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::connect_to_database;
 use crate::{
-   DbInstances, Error, MigrationEvent, MigrationStates, MigrationStatus, Result,
+   DbInstances, Error, MigrationEvent, MigrationStates, Result,
    subscriptions::{
       ActiveSubscriptions, ObserverConfigParams, TableChangePayload, event_to_payload,
    },
@@ -29,7 +30,7 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionToken {
-   pub db_path: String,
+   pub db_key: String,
    pub transaction_id: String,
 }
 
@@ -46,8 +47,8 @@ pub enum TransactionAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachedDatabaseSpec {
-   /// Path to the database to attach (must be loaded via `load()` first)
-   pub database_path: String,
+   /// Key of the database to attach (must be loaded via `load()` first)
+   pub database_key: String,
    /// Schema name to use for the attached database in queries
    pub schema_name: String,
    /// Access mode: "readOnly" or "readWrite"
@@ -71,8 +72,8 @@ fn resolve_attached_specs(
 
    for spec in specs {
       let wrapper = db_instances
-         .get(&spec.database_path)
-         .ok_or_else(|| Error::DatabaseNotLoaded(spec.database_path.clone()))?;
+         .get(&spec.database_key)
+         .ok_or_else(|| Error::DatabaseNotLoaded(spec.database_key.clone()))?;
 
       let mode = match spec.mode {
          AttachedDatabaseMode::ReadOnly => sqlx_sqlite_conn_mgr::AttachedMode::ReadOnly,
@@ -94,6 +95,10 @@ fn resolve_attached_specs(
 /// If the database is already loaded, returns the existing connection.
 /// Otherwise, creates a new connection with optional custom configuration.
 ///
+/// `db_key` must be a registration key from
+/// [`Builder::register_database`] / [`SetupRegistrar::register_database`].
+/// Unregistered keys are rejected with `PATH_NOT_REGISTERED`.
+///
 /// # Migration Timing
 ///
 /// If migrations are registered for this database, this function waits for them
@@ -104,92 +109,18 @@ fn resolve_attached_specs(
 #[tauri::command]
 pub async fn load<R: Runtime>(
    app: AppHandle<R>,
-   db_instances: State<'_, DbInstances>,
-   migration_states: State<'_, MigrationStates>,
-   db: String,
+   db_key: String,
    custom_config: Option<SqliteDatabaseConfig>,
 ) -> Result<String> {
-   // Wait for migrations to complete if registered for this database
-   await_migrations(&migration_states, &db).await?;
-
-   let instances = db_instances.inner.read().await;
-
-   // Return cached if db was already loaded
-   if instances.contains_key(&db) {
-      return Ok(db);
-   }
-
-   drop(instances); // Release read lock before acquiring write lock
-
-   let mut instances = db_instances.inner.write().await;
-
-   // Check database count limit before creating a new connection.
-   // This check is before entry() to avoid borrow conflicts, and the write lock
-   // prevents races between the len() check and the insert.
-   if !instances.contains_key(&db) && instances.len() >= db_instances.max {
-      return Err(Error::TooManyDatabases(db_instances.max));
-   }
-
-   // Use entry API to atomically check and insert, avoiding race conditions
-   // where two callers could both create wrappers
-   use std::collections::hash_map::Entry;
-   match instances.entry(db.clone()) {
-      Entry::Occupied(_) => {
-         // Another caller won the race and inserted while we waited for write lock
-         Ok(db)
-      }
-      Entry::Vacant(entry) => {
-         // We won the race, create and insert the wrapper
-         let wrapper = crate::resolve::connect(&db, &app, custom_config).await?;
-         entry.insert(wrapper);
-         Ok(db)
-      }
-   }
-}
-
-/// Wait for migrations to complete for a database, if any are registered.
-///
-/// Returns Ok(()) if:
-/// - No migrations are registered for this database
-/// - Migrations completed successfully
-///
-/// Returns Err if migrations failed.
-async fn await_migrations(migration_states: &State<'_, MigrationStates>, db: &str) -> Result<()> {
-   loop {
-      // Get notify handle before checking status
-      let notify = {
-         let states = migration_states.0.read().await;
-         match states.get(db) {
-            // No migrations registered for this database
-            None => return Ok(()),
-
-            Some(state) => match &state.status {
-               // Migrations completed successfully
-               MigrationStatus::Complete => return Ok(()),
-
-               // Migrations failed - return the error
-               MigrationStatus::Failed(error) => {
-                  return Err(Error::Migration(sqlx::migrate::MigrateError::Source(
-                     error.clone().into(),
-                  )));
-               }
-
-               // Migrations still pending or running - wait for notification
-               MigrationStatus::Pending | MigrationStatus::Running => state.notify.clone(),
-            },
-         }
-      };
-
-      // Wait for migration state change
-      notify.notified().await;
-   }
+   let response = connect_to_database(&app, &db_key, custom_config).await?;
+   Ok(response.path.to_string_lossy().into_owned())
 }
 
 /// Execute a write query (INSERT, UPDATE, DELETE, etc.)
 #[tauri::command]
 pub async fn execute(
    db_instances: State<'_, DbInstances>,
-   db: String,
+   db_key: String,
    query: String,
    values: Vec<JsonValue>,
    attached: Option<Vec<AttachedDatabaseSpec>>,
@@ -197,8 +128,8 @@ pub async fn execute(
    let instances = db_instances.inner.read().await;
 
    let wrapper = instances
-      .get(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    let mut builder = wrapper.execute(query, values);
 
@@ -217,15 +148,15 @@ pub async fn execute(
 pub async fn execute_transaction(
    db_instances: State<'_, DbInstances>,
    regular_txs: State<'_, ActiveRegularTransactions>,
-   db: String,
+   db_key: String,
    statements: Vec<Statement>,
    attached: Option<Vec<AttachedDatabaseSpec>>,
 ) -> Result<Vec<WriteQueryResult>> {
    let instances = db_instances.inner.read().await;
 
    let wrapper = instances
-      .get(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    // Convert Statement structs to tuples for wrapper
    let stmt_tuples: Vec<(String, Vec<JsonValue>)> = statements
@@ -234,7 +165,7 @@ pub async fn execute_transaction(
       .collect();
 
    // Generate unique key for tracking this transaction
-   let tx_key = format!("{}:{}", db, Uuid::new_v4());
+   let tx_key = format!("{}:{}", db_key, Uuid::new_v4());
 
    // Resolve attached specs if provided
    let resolved_specs = if let Some(specs) = attached {
@@ -297,7 +228,7 @@ pub async fn execute_transaction(
 #[tauri::command]
 pub async fn fetch_all(
    db_instances: State<'_, DbInstances>,
-   db: String,
+   db_key: String,
    query: String,
    values: Vec<JsonValue>,
    attached: Option<Vec<AttachedDatabaseSpec>>,
@@ -305,8 +236,8 @@ pub async fn fetch_all(
    let instances = db_instances.inner.read().await;
 
    let wrapper = instances
-      .get(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    let mut builder = wrapper.fetch_all(query, values);
 
@@ -324,7 +255,7 @@ pub async fn fetch_all(
 #[tauri::command]
 pub async fn fetch_one(
    db_instances: State<'_, DbInstances>,
-   db: String,
+   db_key: String,
    query: String,
    values: Vec<JsonValue>,
    attached: Option<Vec<AttachedDatabaseSpec>>,
@@ -332,8 +263,8 @@ pub async fn fetch_one(
    let instances = db_instances.inner.read().await;
 
    let wrapper = instances
-      .get(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    let mut builder = wrapper.fetch_one(query, values);
 
@@ -352,7 +283,7 @@ pub async fn fetch_one(
 #[tauri::command]
 pub async fn fetch_page(
    db_instances: State<'_, DbInstances>,
-   db: String,
+   db_key: String,
    query: String,
    values: Vec<JsonValue>,
    keyset: Vec<sqlx_sqlite_toolkit::KeysetColumn>,
@@ -370,8 +301,8 @@ pub async fn fetch_page(
    let instances = db_instances.inner.read().await;
 
    let wrapper = instances
-      .get(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    let mut builder = wrapper.fetch_page(query, values, keyset, page_size);
 
@@ -400,13 +331,13 @@ pub async fn fetch_page(
 pub async fn close(
    db_instances: State<'_, DbInstances>,
    active_subs: State<'_, ActiveSubscriptions>,
-   db: String,
+   db_key: String,
 ) -> Result<bool> {
-   active_subs.remove_for_db(&db).await;
+   active_subs.remove_for_db(&db_key).await;
 
    let mut instances = db_instances.inner.write().await;
 
-   if let Some(wrapper) = instances.remove(&db) {
+   if let Some(wrapper) = instances.remove(&db_key) {
       wrapper.close().await?;
       Ok(true)
    } else {
@@ -453,13 +384,13 @@ pub async fn close_all(
 pub async fn remove(
    db_instances: State<'_, DbInstances>,
    active_subs: State<'_, ActiveSubscriptions>,
-   db: String,
+   db_key: String,
 ) -> Result<bool> {
-   active_subs.remove_for_db(&db).await;
+   active_subs.remove_for_db(&db_key).await;
 
    let mut instances = db_instances.inner.write().await;
 
-   if let Some(wrapper) = instances.remove(&db) {
+   if let Some(wrapper) = instances.remove(&db_key) {
       wrapper.remove().await?;
       Ok(true)
    } else {
@@ -476,11 +407,11 @@ pub async fn remove(
 #[tauri::command]
 pub async fn get_migration_events(
    migration_states: State<'_, MigrationStates>,
-   db: String,
+   db_key: String,
 ) -> Result<Vec<MigrationEvent>> {
    let states = migration_states.0.read().await;
 
-   match states.get(&db) {
+   match states.get(&db_key) {
       Some(state) => Ok(state.events.clone()),
       None => Ok(Vec::new()),
    }
@@ -495,15 +426,15 @@ pub async fn get_migration_events(
 pub async fn begin_interruptible_transaction(
    db_instances: State<'_, DbInstances>,
    active_txs: State<'_, ActiveInterruptibleTransactions>,
-   db: String,
+   db_key: String,
    initial_statements: Vec<Statement>,
    attached: Option<Vec<AttachedDatabaseSpec>>,
 ) -> Result<TransactionToken> {
    let instances = db_instances.inner.read().await;
 
    let wrapper = instances
-      .get(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    // Generate unique transaction ID
    let transaction_id = Uuid::new_v4().to_string();
@@ -524,15 +455,15 @@ pub async fn begin_interruptible_transaction(
 
    // Execute initial statements
    let mut active_tx =
-      ActiveInterruptibleTransaction::new(db.clone(), transaction_id.clone(), writer);
+      ActiveInterruptibleTransaction::new(db_key.clone(), transaction_id.clone(), writer);
 
    active_tx.continue_with(initial_statements).await?;
 
    // Store transaction state
-   active_txs.insert(db.clone(), active_tx).await?;
+   active_txs.insert(db_key.clone(), active_tx).await?;
 
    Ok(TransactionToken {
-      db_path: db,
+      db_key,
       transaction_id,
    })
 }
@@ -550,14 +481,14 @@ pub async fn transaction_continue(
       TransactionAction::Continue { statements } => {
          // Remove transaction to get mutable access
          let mut tx = active_txs
-            .remove(&token.db_path, &token.transaction_id)
+            .remove(&token.db_key, &token.transaction_id)
             .await?;
 
          // Execute statements on the transaction
          match tx.continue_with(statements).await {
             Ok(_results) => {
                // Re-insert transaction - if this fails, tx is dropped and auto-rolled back
-               match active_txs.insert(token.db_path.clone(), tx).await {
+               match active_txs.insert(token.db_key.clone(), tx).await {
                   Ok(()) => Ok(Some(token)),
                   Err(e) => {
                      // Transaction lost but will auto-rollback via Drop
@@ -576,7 +507,7 @@ pub async fn transaction_continue(
       TransactionAction::Commit => {
          // Remove transaction and commit
          let tx = active_txs
-            .remove(&token.db_path, &token.transaction_id)
+            .remove(&token.db_key, &token.transaction_id)
             .await?;
 
          tx.commit().await?;
@@ -586,7 +517,7 @@ pub async fn transaction_continue(
       TransactionAction::Rollback => {
          // Remove transaction and rollback
          let tx = active_txs
-            .remove(&token.db_path, &token.transaction_id)
+            .remove(&token.db_key, &token.transaction_id)
             .await?;
 
          tx.rollback().await?;
@@ -608,14 +539,14 @@ pub async fn transaction_read(
 ) -> Result<Vec<IndexMap<String, JsonValue>>> {
    // Remove transaction to get mutable access
    let mut tx = active_txs
-      .remove(&token.db_path, &token.transaction_id)
+      .remove(&token.db_key, &token.transaction_id)
       .await?;
 
    // Execute read on the transaction
    match tx.read(query, values).await {
       Ok(results) => {
          // Re-insert transaction - if this fails, tx is dropped and auto-rolled back
-         match active_txs.insert(token.db_path.clone(), tx).await {
+         match active_txs.insert(token.db_key.clone(), tx).await {
             Ok(()) => Ok(results),
             Err(e) => {
                // Transaction lost but will auto-rollback via Drop
@@ -643,7 +574,7 @@ pub async fn transaction_read(
 pub async fn observe(
    db_instances: State<'_, DbInstances>,
    active_subs: State<'_, ActiveSubscriptions>,
-   db: String,
+   db_key: String,
    tables: Vec<String>,
    config: Option<ObserverConfigParams>,
 ) -> Result<()> {
@@ -659,13 +590,13 @@ pub async fn observe(
 
    // Abort plugin-level subscription tasks before the crate-level
    // enable_observation() drops the old broker
-   active_subs.remove_for_db(&db).await;
+   active_subs.remove_for_db(&db_key).await;
 
    let mut instances = db_instances.inner.write().await;
 
    let wrapper = instances
-      .get_mut(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get_mut(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    let mut observer_config = sqlx_sqlite_observer::ObserverConfig::new().with_tables(tables);
 
@@ -697,13 +628,13 @@ pub async fn observe(
 pub async fn subscribe(
    db_instances: State<'_, DbInstances>,
    active_subs: State<'_, ActiveSubscriptions>,
-   db: String,
+   db_key: String,
    tables: Vec<String>,
    on_event: Channel<TableChangePayload>,
 ) -> Result<String> {
    const MAX_SUBSCRIPTIONS_PER_DATABASE: usize = 100;
 
-   let sub_count = active_subs.count_for_db(&db).await;
+   let sub_count = active_subs.count_for_db(&db_key).await;
    if sub_count >= MAX_SUBSCRIPTIONS_PER_DATABASE {
       return Err(Error::TooManySubscriptions(MAX_SUBSCRIPTIONS_PER_DATABASE));
    }
@@ -711,12 +642,12 @@ pub async fn subscribe(
    let instances = db_instances.inner.read().await;
 
    let wrapper = instances
-      .get(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    let observable = wrapper
       .observable()
-      .ok_or_else(|| Error::ObservationNotEnabled(db.clone()))?;
+      .ok_or_else(|| Error::ObservationNotEnabled(db_key.clone()))?;
 
    // Create subscription stream
    let mut stream = observable.subscribe_stream(tables);
@@ -726,7 +657,7 @@ pub async fn subscribe(
 
    // Spawn task to forward stream events to the Tauri Channel
    let sub_id = subscription_id.clone();
-   let db_path = db.clone();
+   let db_key_clone = db_key.clone();
 
    let handle = tokio::spawn(async move {
       while let Some(event) = stream.next().await {
@@ -738,12 +669,12 @@ pub async fn subscribe(
          }
       }
 
-      debug!("Subscription {} for db {} ended", sub_id, db_path);
+      debug!("Subscription {} for db {} ended", sub_id, &db_key_clone);
    });
 
    // Track subscription
    active_subs
-      .insert(subscription_id.clone(), db.clone(), handle.abort_handle())
+      .insert(subscription_id.clone(), db_key, handle.abort_handle())
       .await;
 
    Ok(subscription_id)
@@ -767,16 +698,16 @@ pub async fn unsubscribe(
 pub async fn unobserve(
    db_instances: State<'_, DbInstances>,
    active_subs: State<'_, ActiveSubscriptions>,
-   db: String,
+   db_key: String,
 ) -> Result<()> {
    // Abort all subscriptions for this database first
-   active_subs.remove_for_db(&db).await;
+   active_subs.remove_for_db(&db_key).await;
 
    let mut instances = db_instances.inner.write().await;
 
    let wrapper = instances
-      .get_mut(&db)
-      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+      .get_mut(&db_key)
+      .ok_or_else(|| Error::DatabaseNotLoaded(db_key.clone()))?;
 
    wrapper.disable_observation();
    Ok(())

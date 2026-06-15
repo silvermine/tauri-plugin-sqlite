@@ -119,11 +119,96 @@ Register the plugin in your Tauri application:
 ```rust
 fn main() {
    tauri::Builder::default()
-      .plugin(tauri_plugin_sqlite::Builder::new().build())
+      .plugin(tauri_plugin_sqlite::Builder::new().build().expect("failed to build sqlite plugin"))
       .run(tauri::generate_context!())
       .expect("error while running tauri application");
 }
 ```
+
+### Registering Databases
+
+Every database must be **registered** on the Rust side before it can be opened.
+Registration assigns a stable **key** (for example `"MAIN"`) to a filesystem path or
+in-memory URI. The frontend and Rust callers open databases by **key**, not by path.
+
+**Registration rules** (enforced when you call `register_database`):
+
+   * File paths must be **absolute**, with no `..` components or null bytes
+   * File paths are **canonicalized** once at registration (symlink-safe when the path or
+     parent exists)
+   * In-memory URIs (`:memory:`, `file::memory:*`, and `file:` URIs with an exact
+     `mode=memory` query parameter) are accepted as-is
+   * Each registration **key** must map to a **distinct** database path; two keys for the
+     same path fail with `INVALID_CONFIG` when calling `build()` or during plugin setup
+     after `on_setup` merges registrations
+
+Invalid registration paths fail at startup with `INVALID_PATH` or `PATH_TRAVERSAL`.
+
+**Why keys:**
+
+1) `Database.load()` is callable from the frontend over IPC. The frontend sends
+   only a registration key; unregistered keys are rejected with `PATH_NOT_REGISTERED`.
+   This prevents untrusted frontend code from opening arbitrary files on disk.
+
+2) Keys avoid cross-language path string mismatches. With path-at-load, TS and Rust would
+   need identical canonical path strings on every open (slashes, symlinks, etc.). Keys
+   resolve the path once at registration; all later opens use the plain string key.
+
+3) Without registration keys, every call site would repeat that path discovery or keep its
+   own `PathBuf`. Registration stores the key-to-path mapping once; `connect` reuses the
+   key so callers do not supply a filesystem path on every open.
+   On mobile, path discovery is not a cheap string join. Resolvers such as
+   [tauri-plugin-fs-resolver](https://github.com/silvermine/tauri-plugin-fs-resolver)
+   call platform-native APIs so paths match OS sandbox rules. On Android that means a
+   JNI call into Kotlin `Context` (e.g. `getFilesDir()`) on each resolve — noticeably
+   more expensive than a local HashMap lookup, and a different kind of boundary than
+   TypeScript-to-Rust IPC (in-process JNI vs webview bridge). Register the resolved
+   `PathBuf` once in `on_setup`; every later `connect(database_key)` only looks up that
+   key in [`RegisteredDatabases`] — no repeat native or JNI work.
+
+Because legitimate paths usually depend on runtime values (app data directory, platform
+path resolvers, etc.), registration normally happens in the `on_setup` hook:
+
+```rust
+use tauri_plugin_sqlite::Builder;
+use tauri::Manager;
+
+const MAIN_DB_KEY: &str = "MAIN";
+
+fn main() {
+   tauri::Builder::default()
+      .plugin(
+         Builder::new()
+            .on_setup(|app, reg| {
+               let db = app.path().app_data_dir()?.join("main.db");
+               reg.register_database(MAIN_DB_KEY, db, None)?;
+               Ok(())
+            })
+            .build()
+            .expect("failed to build sqlite plugin")
+      )
+      .run(tauri::generate_context!())
+      .expect("error while running tauri application");
+}
+```
+
+A static registration (compile-time path) can be registered on the builder directly:
+
+```rust
+use tauri_plugin_sqlite::Builder;
+use std::path::PathBuf;
+
+const MAIN_DB_KEY: &str = "MAIN";
+
+# fn main() -> tauri_plugin_sqlite::Result<()> {
+let _plugin = Builder::new()
+   .register_database(MAIN_DB_KEY, PathBuf::from("/var/lib/myapp/main.db"), None)?
+   .build()?;
+# Ok(())
+# }
+```
+
+The frontend then calls `Database.load(MAIN_DB_KEY)` (see [Connecting](#connecting)).
 
 ### Migrations
 
@@ -139,22 +224,39 @@ src-tauri/migrations/
 └── 0003_create_posts.sql
 ```
 
-Register migrations using SQLx's `migrate!()` macro, which embeds them at compile time:
+Register migrations using SQLx's `migrate!()` macro, which embeds them at compile time.
+Pass the migrator as the third argument to `register_database`. The `on_setup` hook is the
+usual place to register app-derived paths:
 
 ```rust
 use tauri_plugin_sqlite::Builder;
+use tauri::Manager;
+
+const MAIN_DB_KEY: &str = "MAIN";
 
 fn main() {
    tauri::Builder::default()
       .plugin(
          Builder::new()
-            .add_migrations("main.db", sqlx::migrate!("./migrations"))
+            .on_setup(|app, reg| {
+               let db = app.path().app_data_dir()?.join("main.db");
+               reg.register_database(
+                  MAIN_DB_KEY,
+                  db,
+                  Some(sqlx::migrate!("./migrations")),
+               )?;
+               Ok(())
+            })
             .build()
+            .expect("failed to build sqlite plugin")
       )
       .run(tauri::generate_context!())
       .expect("error while running tauri application");
 }
 ```
+
+The frontend must call `Database.load()` with the same **registration key** so migrations
+are awaited correctly.
 
 **Timing:** Migrations start automatically at plugin setup (non-blocking). When
 TypeScript calls `Database.load()`, it waits for migrations to complete before
@@ -168,12 +270,15 @@ Use `getMigrationEvents()` to retrieve cached events:
 ```typescript
 import Database from '@silvermine/tauri-plugin-sqlite';
 
-const db = await Database.load('mydb.db');
+const MAIN_DB_KEY = 'MAIN';
+
+// Same registration key used in Rust `register_database`
+const db = await Database.load(MAIN_DB_KEY);
 
 // Get all migration events (including ones emitted before listener could be registered)
 const events = await db.getMigrationEvents();
 for (const event of events) {
-   console.info(`${event.status}: ${event.dbPath}`);
+   console.info(`${event.status}: ${event.dbKey} (${event.dbPath})`);
    if (event.status === 'failed') {
       console.error(`Migration error: ${event.error}`);
    }
@@ -188,28 +293,40 @@ import { listen } from '@tauri-apps/api/event';
 import type { MigrationEvent } from '@silvermine/tauri-plugin-sqlite';
 
 await listen<MigrationEvent>('sqlite:migration', (event) => {
-   const { dbPath, status, migrationCount, error } = event.payload;
-   console.info(`Migration ${status} for ${dbPath}: ${migrationCount} migrations`, error);
+   const { dbKey, dbPath, status, migrationCount, error } = event.payload;
+   console.info(`Migration ${status} for ${dbKey} (${dbPath}): ${migrationCount} migrations`, error);
 });
 ```
 
 ### Connecting
 
+Pass the **registration key** from Rust `register_database` (see
+[Registering Databases](#registering-databases)).
+
 ```typescript
 import Database from '@silvermine/tauri-plugin-sqlite';
 
-// Path is relative to app config directory (no sqlite: prefix needed)
-let db = await Database.load('mydb.db');
+const MAIN_DB_KEY = 'MAIN';
+
+// Connect (no sqlite: prefix needed)
+let db = await Database.load(MAIN_DB_KEY);
 
 // With custom configuration
-db = await Database.load('mydb.db', {
+db = await Database.load(MAIN_DB_KEY, {
    maxReadConnections: 10, // default: 6
    idleTimeoutSecs: 60     // default: 30
 });
 
-// Lazy initialization (connects on first query)
-db = Database.get('mydb.db');
+// Lazy initialization (connects on first query; sync — no await)
+db = Database.get(MAIN_DB_KEY);
+
+// In-memory: register first, then load by key
+// reg.register_database('MEM', ':memory:', None)? in on_setup
+const mem = await Database.load('MEM');
 ```
+
+An unregistered key throws `PATH_NOT_REGISTERED`. Invalid paths are rejected at
+registration time on the Rust side (`INVALID_PATH`, `PATH_TRAVERSAL`).
 
 ### Parameter Binding
 
@@ -400,16 +517,20 @@ tables.
 
 **Builder Pattern:** All query methods (`execute`, `executeTransaction`,
 `fetchAll`, `fetchOne`, `fetchPage`) return builders that support `.attach()`
-for cross-database operations.
+for cross-database operations. Each attached database must already be loaded and is
+identified by its **registration key** (see
+[Registering Databases](#registering-databases)).
 
 ```typescript
+const ORDERS_DB_KEY = 'ORDERS';
+
 // Join data from multiple databases
 const results = await db.fetchAll(
    'SELECT u.name, o.total FROM users u JOIN orders.orders o ON u.id = o.user_id',
    []
 ).attach([
    {
-      databasePath: 'orders.db',
+      databaseKey: ORDERS_DB_KEY,
       schemaName: 'orders',
       mode: 'readOnly'
    }
@@ -422,14 +543,13 @@ await db.execute(
    ['archived']
 ).attach([
    {
-      databasePath: 'archive.db',
+      databaseKey: 'ARCHIVE',
       schemaName: 'archive',
       mode: 'readOnly'
    }
 ]);
 
 // Atomic writes across multiple databases
-// Assuming userId and total are defined in your application context
 const userId = 123;
 const total = 99.99;
 
@@ -438,7 +558,7 @@ await db.executeTransaction([
    ['UPDATE stats.order_count SET count = count + 1', []]
 ]).attach([
    {
-      databasePath: 'stats.db',
+      databaseKey: 'STATS',
       schemaName: 'stats',
       mode: 'readWrite'
    }
@@ -536,7 +656,9 @@ Common error codes:
    * `SQLITE_CONSTRAINT` - Constraint violation (unique, foreign key, etc.)
    * `SQLITE_NOTFOUND` - Table or column not found
    * `DATABASE_NOT_LOADED` - Database hasn't been loaded yet
-   * `INVALID_PATH` - Invalid database path
+   * `INVALID_PATH` - Invalid path at registration (relative or failed canonicalization)
+   * `PATH_NOT_REGISTERED` - Registration key not found
+   * `PATH_TRAVERSAL` - Registration path contains `..` or null bytes
    * `IO_ERROR` - File system error
    * `MIGRATION_ERROR` - Migration failed
    * `MULTIPLE_ROWS_RETURNED` - `fetchOne()` returned multiple rows
@@ -557,8 +679,8 @@ await db.remove();           // Close and DELETE database file(s) - irreversible
 
 | Method | Description |
 | ------ | ----------- |
-| `Database.load(path, config?)` | Connect and return Database instance (or existing) |
-| `Database.get(path)` | Get instance without connecting (lazy init) |
+| `Database.load(dbKey, config?)` | Connect eagerly and return Database instance (or existing) |
+| `Database.get(dbKey)` | Sync handle; connects on first query (no `customConfig`) |
 | `Database.close_all()` | Close all database connections |
 
 ### Instance Methods
@@ -619,7 +741,7 @@ interface CustomConfig {
 }
 
 interface AttachedDatabaseSpec {
-   databasePath: string;  // Path relative to app config directory
+   databaseKey: string;  // Registration key of a database already loaded via load()
    schemaName: string;    // Schema name for accessing tables (e.g., 'orders')
    mode: 'readOnly' | 'readWrite';
 }
@@ -672,25 +794,44 @@ type TableChangeEvent =
 
 ## Rust-Only API
 
-For Rust code that needs direct database access without going through Tauri commands,
-use `DatabaseWrapper`.
+For Rust code in a Tauri app, register databases first, then open by key using the
+[`Connection`](src/lib.rs) trait on `AppHandle`. This uses the same open path as the
+frontend `load` command (`connect_to_database`).
 
-### Setup (Rust)
+For standalone Rust projects without the plugin, use `DatabaseWrapper::connect(path)`
+from [`sqlx-sqlite-toolkit`](crates/sqlx-sqlite-toolkit/) directly (no registration).
+
+### Setup (Tauri plugin)
 
 ```rust
-use tauri_plugin_sqlite::DatabaseWrapper;
-use std::path::PathBuf;
+use tauri::{Manager, Runtime};
+use tauri_plugin_sqlite::{Builder, Connection, SqliteDatabaseConfig};
 
-// Load a database
-let mut db = DatabaseWrapper::load(PathBuf::from("/path/to/mydb.db"), None).await?;
+const MAIN_DB_KEY: &str = "MAIN";
 
-// With custom configuration
-use tauri_plugin_sqlite::CustomConfig;
-let config = CustomConfig {
-   max_read_connections: Some(10),
-   idle_timeout_secs: Some(60),
-};
-db = DatabaseWrapper::load(PathBuf::from("/path/to/mydb.db"), Some(config)).await?;
+// In lib.rs setup — register key + path
+Builder::new()
+   .on_setup(|app, reg| {
+      let db = app.path().app_data_dir()?.join("main.db");
+      reg.register_database(MAIN_DB_KEY, db, None)?;
+      Ok(())
+   })
+   .build()?;
+
+// Anywhere with AppHandle
+async fn example<R: Runtime>(app: tauri::AppHandle<R>) -> tauri_plugin_sqlite::Result<()> {
+   let db = app.connect(MAIN_DB_KEY).await?;
+
+   let db = app.connect_with_config(
+      MAIN_DB_KEY,
+      SqliteDatabaseConfig {
+         max_read_connections: 10,
+         idle_timeout_secs: 60,
+      },
+   ).await?;
+
+   Ok(())
+}
 ```
 
 ### Basic Operations
@@ -824,17 +965,17 @@ tx.commit().await?;
 
 ### Cross-Database Operations
 
-Attach other databases for cross-database queries. For Rust API usage, you need to load
-both databases first, then create `AttachedSpec` instances using their inner database
-references:
+Attach other databases for cross-database queries. Load each database by registration
+key first (`app.connect("STATS").await?`), then create `AttachedSpec` instances using
+their inner database references:
 
 ```rust
-use tauri_plugin_sqlite::{DatabaseWrapper, AttachedSpec, AttachedMode};
+use tauri_plugin_sqlite::{Connection, AttachedSpec, AttachedMode};
 use std::sync::Arc;
 
-// Load both databases
-let main_db = DatabaseWrapper::load("/path/to/main.db".into(), None).await?;
-let stats_db = DatabaseWrapper::load("/path/to/stats.db".into(), None).await?;
+// After registering and connecting both databases by key
+let main_db = app.connect("MAIN").await?;
+let stats_db = app.connect("STATS").await?;
 
 // Create attached spec using the inner database reference
 let stats_spec = AttachedSpec {
@@ -853,8 +994,7 @@ let results = main_db.execute_transaction(vec![
 println!("Cross-database transaction completed: {} statements", results.len());
 
 // Interruptible transaction with attached database
-// Load the inventory database
-let inventory_db = DatabaseWrapper::load("/path/to/inventory.db".into(), None).await?;
+let inventory_db = app.connect("INVENTORY").await?;
 
 // Create spec for inventory database
 let inv_spec = AttachedSpec {
@@ -888,7 +1028,7 @@ db.remove().await?;  // Close and DELETE database file(s)
 
 | Method | Description |
 | ------ | ----------- |
-| `load(path, config?)` | Load database, returns `DatabaseWrapper` |
+| `connect(path, config?)` | Open database by path, returns `DatabaseWrapper` |
 | `execute(query, values)` | Execute write query |
 | `execute_transaction(statements)` | Execute statements atomically (builder) |
 | `begin_interruptible_transaction()` | Begin interruptible transaction (builder) |
@@ -936,7 +1076,7 @@ fn init_tracing() {}
 fn main() {
    init_tracing();
    tauri::Builder::default()
-      .plugin(tauri_plugin_sqlite::Builder::new().build())
+      .plugin(tauri_plugin_sqlite::Builder::new().build().expect("failed to build sqlite plugin"))
       .run(tauri::generate_context!())
       .expect("error while running tauri application");
 }
@@ -985,9 +1125,10 @@ pagination to keep memory usage bounded on both the Rust and TypeScript sides.
 
 ### Path Validation
 
-Database paths are validated to prevent directory traversal. Absolute paths,
-`..` segments, and null bytes are rejected. All paths are resolved relative to
-the app config directory.
+Registration validates filesystem paths once (absolute, no traversal, canonicalized).
+In-memory URIs are accepted as-is. At runtime, `Database.load(dbKey)` and
+`Connection::connect(dbKey)` only accept **registered keys**; unknown keys return
+`PATH_NOT_REGISTERED`.
 
 ## Development
 

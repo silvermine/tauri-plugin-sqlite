@@ -1,5 +1,9 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 
+async function ensureDatabaseLoaded(db: Database): Promise<void> {
+   await db.load();
+}
+
 /**
  * Valid SQLite parameter binding value types.
  *
@@ -23,9 +27,9 @@ export type AttachedDatabaseMode = 'readOnly' | 'readWrite';
 export interface AttachedDatabaseSpec {
 
    /**
-    * Path to the database to attach (must be loaded via `Database.load()` first)
+    * Database key for identifying the database to attach
     */
-   databasePath: string;
+   databaseKey: string;
 
    /**
     * Schema name to use for the attached database in queries
@@ -77,11 +81,11 @@ export interface SqliteError {
  * Provides methods to read uncommitted data and execute additional statements.
  */
 export class InterruptibleTransaction {
-   private readonly _dbPath: string;
+   private readonly _dbKey: string;
    private readonly _transactionId: string;
 
-   public constructor(dbPath: string, transactionId: string) {
-      this._dbPath = dbPath;
+   public constructor(dbKey: string, transactionId: string) {
+      this._dbKey = dbKey;
       this._transactionId = transactionId;
    }
 
@@ -112,7 +116,7 @@ export class InterruptibleTransaction {
     */
    public async read<T>(query: string, bindValues?: SqlValue[]): Promise<T> {
       return await invoke<T>('plugin:sqlite|transaction_read', {
-         token: { dbPath: this._dbPath, transactionId: this._transactionId },
+         token: { dbKey: this._dbKey, transactionId: this._transactionId },
          query,
          values: bindValues ?? [],
       });
@@ -137,10 +141,10 @@ export class InterruptibleTransaction {
     * ```
     */
    public async continueWith(statements: Array<[string, SqlValue[]?]>): Promise<InterruptibleTransaction> {
-      const token = await invoke<{ dbPath: string; transactionId: string }>(
+      const token = await invoke<{ dbKey: string; transactionId: string }>(
          'plugin:sqlite|transaction_continue',
          {
-            token: { dbPath: this._dbPath, transactionId: this._transactionId },
+            token: { dbKey: this._dbKey, transactionId: this._transactionId },
             action: {
                type: 'Continue',
                statements: statements.map(([ query, values ]) => {
@@ -153,7 +157,7 @@ export class InterruptibleTransaction {
          }
       );
 
-      return new InterruptibleTransaction(token.dbPath, token.transactionId);
+      return new InterruptibleTransaction(token.dbKey, token.transactionId);
    }
 
    /**
@@ -170,7 +174,7 @@ export class InterruptibleTransaction {
     */
    public async commit(): Promise<void> {
       await invoke<void>('plugin:sqlite|transaction_continue', {
-         token: { dbPath: this._dbPath, transactionId: this._transactionId },
+         token: { dbKey: this._dbKey, transactionId: this._transactionId },
          action: { type: 'Commit' },
       });
    }
@@ -189,7 +193,7 @@ export class InterruptibleTransaction {
     */
    public async rollback(): Promise<void> {
       await invoke<void>('plugin:sqlite|transaction_continue', {
-         token: { dbPath: this._dbPath, transactionId: this._transactionId },
+         token: { dbKey: this._dbKey, transactionId: this._transactionId },
          action: { type: 'Rollback' },
       });
    }
@@ -220,7 +224,7 @@ export interface CustomConfig {
  * // Get all migration events (including ones emitted before registering listener)
  * const events = await db.getMigrationEvents()
  * for (const event of events) {
- *    console.log(`${event.status}: ${event.dbPath}`)
+ *    console.log(`${event.status}: ${event.dbKey}`)
  *    if (event.status === 'failed') {
  *       console.error(`Migration error: ${event.error}`)
  *    }
@@ -230,17 +234,17 @@ export interface CustomConfig {
  *
  * // Listen for real-time events (may miss early events)
  * await listen<MigrationEvent>('sqlite:migration', (event) => {
- *    const { dbPath, status, migrationCount, error } = event.payload
+ *    const { dbKey, dbPath, status, migrationCount, error } = event.payload
  *
  *    switch (status) {
  *       case 'running':
- *          console.log(`Running migrations for ${dbPath}`)
+ *          console.log(`Running migrations for ${dbKey}`)
  *          break
  *       case 'completed':
- *          console.log(`Completed ${migrationCount} migrations for ${dbPath}`)
+ *          console.log(`Completed ${migrationCount} migrations for ${dbKey}`)
  *          break
  *       case 'failed':
- *          console.error(`Migration failed for ${dbPath}: ${error}`)
+ *          console.error(`Migration failed for ${dbKey}: ${error}`)
  *          break
  *    }
  * })
@@ -248,7 +252,12 @@ export interface CustomConfig {
  */
 export interface MigrationEvent {
 
-   /** Database path (relative, as registered with the plugin) */
+   /** Database registration key (such as `MAIN`) */
+   dbKey: string;
+
+   /** Database path, the absolute path to the database file, such as
+    * `/var/lib/myapp/main.db`.
+    */
    dbPath: string;
 
    /** Status: "running", "completed", "failed" */
@@ -448,8 +457,10 @@ class FetchAllBuilder<T> implements PromiseLike<T> {
    }
 
    private async _execute(): Promise<T> {
+      await ensureDatabaseLoaded(this._db);
+
       return await invoke<T>('plugin:sqlite|fetch_all', {
-         db: this._db.path,
+         dbKey: this._db.key,
          query: this._query,
          values: this._bindValues,
          attached: this._attached.length > 0 ? this._attached : null,
@@ -497,8 +508,10 @@ class FetchOneBuilder<T> implements PromiseLike<T | undefined> {
    }
 
    private async _execute(): Promise<T | undefined> {
+      await ensureDatabaseLoaded(this._db);
+
       return await invoke<T | undefined>('plugin:sqlite|fetch_one', {
-         db: this._db.path,
+         dbKey: this._db.key,
          query: this._query,
          values: this._bindValues,
          attached: this._attached.length > 0 ? this._attached : null,
@@ -577,8 +590,10 @@ class FetchPageBuilder<T> implements PromiseLike<KeysetPage<T>> {
    }
 
    private async _execute(): Promise<KeysetPage<T>> {
+      await ensureDatabaseLoaded(this._db);
+
       return await invoke<KeysetPage<T>>('plugin:sqlite|fetch_page', {
-         db: this._db.path,
+         dbKey: this._db.key,
          query: this._query,
          values: this._bindValues,
          keyset: this._keyset,
@@ -630,10 +645,12 @@ class ExecuteBuilder implements PromiseLike<WriteQueryResult> {
    }
 
    private async _execute(): Promise<WriteQueryResult> {
+      await ensureDatabaseLoaded(this._db);
+
       const [ rowsAffected, lastInsertId ] = await invoke<[number, number]>(
          'plugin:sqlite|execute',
          {
-            db: this._db.path,
+            dbKey: this._db.key,
             query: this._query,
             values: this._bindValues,
             attached: this._attached.length > 0 ? this._attached : null,
@@ -684,10 +701,12 @@ class InterruptibleTransactionBuilder implements PromiseLike<InterruptibleTransa
    }
 
    private async _execute(): Promise<InterruptibleTransaction> {
-      const token = await invoke<{ dbPath: string; transactionId: string }>(
+      await ensureDatabaseLoaded(this._db);
+
+      const token = await invoke<{ dbKey: string; transactionId: string }>(
          'plugin:sqlite|begin_interruptible_transaction',
          {
-            db: this._db.path,
+            dbKey: this._db.key,
             initialStatements: this._initialStatements.map(([ query, values ]) => {
                return {
                   query,
@@ -698,7 +717,7 @@ class InterruptibleTransactionBuilder implements PromiseLike<InterruptibleTransa
          }
       );
 
-      return new InterruptibleTransaction(token.dbPath, token.transactionId);
+      return new InterruptibleTransaction(token.dbKey, token.transactionId);
    }
 }
 
@@ -739,8 +758,10 @@ class TransactionBuilder implements PromiseLike<WriteQueryResult[]> {
    }
 
    private async _execute(): Promise<WriteQueryResult[]> {
+      await ensureDatabaseLoaded(this._db);
+
       return await invoke<WriteQueryResult[]>('plugin:sqlite|execute_transaction', {
-         db: this._db.path,
+         dbKey: this._db.key,
          statements: this._statements.map(([ query, values ]) => {
             return {
                query,
@@ -765,63 +786,80 @@ class TransactionBuilder implements PromiseLike<WriteQueryResult[]> {
  * visible to reads in another, and closing a database affects all windows.
  */
 export default class Database {
-   public path: string;
 
-   public constructor(path: string) {
-      this.path = path;
+   /** Database key for identifying the database */
+   public readonly key: string;
+
+   /** Database path, the absolute path to the database file, such as
+    * `/var/lib/myapp/main.db`.
+    *
+    * This will only be set after the database has been loaded, and cannot be publicly
+    * set.
+    */
+   private _path: string | null = null;
+
+   private _loadPromise: Promise<void> | null = null;
+
+   public constructor(key: string) {
+      this.key = key;
    }
 
    /**
     * **load**
     *
-    * A static initializer which connects to the underlying SQLite database and
+    * An initializer which connects to the underlying SQLite database and
     * returns a `Database` instance once a connection is established.
     *
-    * The path is relative to `tauri::path::BaseDirectory::AppConfig`.
+    * The key must be a key that the Rust side has registered with the plugin
+    * (via `Builder::register_database` / `SetupRegistrar::register_database`),
+    * or an in-memory database such as `:memory:`.
     *
-    * @param path - Database file path (relative to AppConfig directory)
+    * @param key - The key of the database to load
     * @param customConfig - Optional custom configuration for connection pools
     *
     * @example
     * ```ts
+    * const dbKey = 'MAIN';
+    *
     * // Use default configuration
-    * const db = await Database.load("test.db");
+    * const db = await Database.load(dbKey);
     *
     * // Use custom configuration
-    * const db = await Database.load("test.db", {
+    * const db2 = await Database.load(dbKey, {
     *   maxReadConnections: 10,
     *   idleTimeoutSecs: 60
     * });
     * ```
     */
    public static async load(
-      path: string,
+      dbKey: string,
       customConfig?: CustomConfig
    ): Promise<Database> {
-      const resolvedPath = await invoke<string>('plugin:sqlite|load', {
-         db: path,
-         customConfig,
-      });
+      const database = new Database(dbKey);
 
-      return new Database(resolvedPath);
+      await database.load(customConfig);
+      return database;
    }
 
    /**
     * **get**
     *
-    * A static initializer which synchronously returns an instance of
-    * the Database class while deferring the actual database connection
-    * until the first invocation or selection on the database.
+    * Synchronously returns a `Database` handle for a registered key while deferring
+    * the actual connection until the first query or other operation that requires a
+    * loaded connection. Use {@link Database.load} when you need to pass
+    * `customConfig` or connect eagerly.
     *
-    * The path is relative to `tauri::path::BaseDirectory::AppConfig`.
+    * The key must be registered with the plugin on the Rust side
+    * (via `Builder::register_database` / `SetupRegistrar::register_database`).
     *
     * @example
     * ```ts
-    * const db = Database.get("test.db");
+    * const db = Database.get('MAIN');
+    * await db.fetchAll('SELECT 1');
     * ```
     */
-   public static get(path: string): Database {
-      return new Database(path);
+   public static get(dbKey: string): Database {
+      return new Database(dbKey);
    }
 
    /**
@@ -836,6 +874,74 @@ export default class Database {
     */
    public static async close_all(): Promise<void> {
       await invoke<void>('plugin:sqlite|close_all');
+   }
+
+   /**
+    * **path**
+    *
+    * The absolute path to the database file, such as
+    * `/var/lib/myapp/main.db`.
+    *
+    * This will only be set after the database has been loaded, and cannot be publicly
+    * set.
+    */
+   public getPath(): string | null {
+      return this._path;
+   }
+
+   /**
+    * **load**
+    *
+    * An initializer which connects to the underlying SQLite database and
+    * returns a `Database` instance once a connection is established.
+    *
+    * The key must be a key that the Rust side has registered with the plugin
+    * (via `Builder::register_database` / `SetupRegistrar::register_database`),
+    * or an in-memory database such as `:memory:`.
+    *
+    * @param key - The key of the database to load
+    * @param customConfig - Optional custom configuration for connection pools
+    *
+    * @example
+    * ```ts
+    * const dbKey = 'MAIN';
+    *
+    * // Use default configuration
+    * const db = await Database.load(dbKey);
+    *
+    * // Use custom configuration
+    * const db2 = await Database.load(dbKey, {
+    *   maxReadConnections: 10,
+    *   idleTimeoutSecs: 60
+    * });
+    * ```
+    */
+   public async load(
+      customConfig?: CustomConfig
+   ): Promise<void> {
+      if (this._path !== null) {
+         return;
+      }
+
+      if (this._loadPromise) {
+         return this._loadPromise;
+      }
+
+      this._loadPromise = (async () => {
+         try {
+            const resolvedPath = await invoke<string>('plugin:sqlite|load', {
+               dbKey: this.key,
+               customConfig,
+            });
+
+            this._path = resolvedPath;
+         } catch(err) {
+            this._loadPromise = null;
+            throw err;
+         }
+      })();
+
+      await this._loadPromise;
    }
 
    /**
@@ -866,7 +972,7 @@ export default class Database {
     *    "(SELECT todo_id FROM archive.completed)",
     *    [ "archived" ]
     * ).attach([{
-    *    databasePath: "archive.db",
+    *    databaseKey: "ARCHIVE",
     *    schemaName: "archive",
     *    mode: "readOnly"
     * }]);
@@ -918,7 +1024,7 @@ export default class Database {
     *    ['INSERT INTO main.orders (user_id, total) VALUES ($1, $2)', [userId, total]],
     *    ['UPDATE archive.stats SET order_count = order_count + 1', []]
     * ]).attach([{
-    *    databasePath: "archive.db",
+    *    databaseKey: "ARCHIVE",
     *    schemaName: "archive",
     *    mode: "readWrite"
     * }]);
@@ -957,7 +1063,7 @@ export default class Database {
     *    "SELECT u.name, o.total FROM users u JOIN orders.orders o ON u.id = o.user_id",
     *    []
     * ).attach([{
-    *    databasePath: "orders.db",
+    *    databaseKey: "ORDERS",
     *    schemaName: "orders",
     *    mode: "readOnly"
     * }]);
@@ -992,7 +1098,7 @@ export default class Database {
     *    "SELECT COUNT(*) as total FROM users u JOIN orders.orders o ON u.id = o.user_id",
     *    []
     * ).attach([{
-    *    databasePath: "orders.db",
+    *    databaseKey: "ORDERS",
     *    schemaName: "orders",
     *    mode: "readOnly"
     * }]);
@@ -1061,7 +1167,7 @@ export default class Database {
     *    keyset,
     *    25,
     * ).attach([{
-    *    databasePath: 'archive.db',
+    *    databaseKey: 'ARCHIVE',
     *    schemaName: 'archive',
     *    mode: 'readOnly',
     * }]);
@@ -1106,8 +1212,10 @@ export default class Database {
     * ```
     */
    public async observe(tables: string[], config?: ObserverConfig): Promise<void> {
+      await ensureDatabaseLoaded(this);
+
       await invoke<void>('plugin:sqlite|observe', {
-         db: this.path,
+         dbKey: this.key,
          tables,
          config: config ?? null,
       });
@@ -1148,12 +1256,14 @@ export default class Database {
       tables: string[],
       onEvent: (event: TableChangeEvent) => void
    ): Promise<Subscription> {
+      await ensureDatabaseLoaded(this);
+
       const channel = new Channel<TableChangeEvent>();
 
       channel.onmessage = onEvent;
 
       const subscriptionId = await invoke<string>('plugin:sqlite|subscribe', {
-         db: this.path,
+         dbKey: this.key,
          tables,
          onEvent: channel,
       });
@@ -1174,8 +1284,10 @@ export default class Database {
     * ```
     */
    public async unobserve(): Promise<void> {
+      await ensureDatabaseLoaded(this);
+
       await invoke<void>('plugin:sqlite|unobserve', {
-         db: this.path,
+         dbKey: this.key,
       });
    }
 
@@ -1199,8 +1311,12 @@ export default class Database {
     */
    public async close(): Promise<boolean> {
       const success = await invoke<boolean>('plugin:sqlite|close', {
-         db: this.path,
+         dbKey: this.key,
       });
+
+      if (success) {
+         this._resetLoadState();
+      }
 
       return success;
    }
@@ -1229,8 +1345,12 @@ export default class Database {
     */
    public async remove(): Promise<boolean> {
       const success = await invoke<boolean>('plugin:sqlite|remove', {
-         db: this.path,
+         dbKey: this.key,
       });
+
+      if (success) {
+         this._resetLoadState();
+      }
 
       return success;
    }
@@ -1292,7 +1412,7 @@ export default class Database {
     * let tx = await db.beginInterruptibleTransaction([
     *    ['DELETE FROM users WHERE archived = 1']
     * ]).attach([{
-    *    databasePath: 'archive.db',
+    *    databaseKey: 'ARCHIVE',
     *    schemaName: 'archive',
     *    mode: 'readWrite'
     * }]);
@@ -1328,7 +1448,7 @@ export default class Database {
     * // Get all migration events (including ones that happened before we could listen)
     * const events = await db.getMigrationEvents()
     * for (const event of events) {
-    *    console.log(`${event.status}: ${event.dbPath}`)
+    *    console.log(`${event.status}: ${event.dbKey}`)
     *    if (event.status === 'failed') {
     *       console.error(`Migration error: ${event.error}`)
     *    }
@@ -1337,7 +1457,12 @@ export default class Database {
     */
    public async getMigrationEvents(): Promise<MigrationEvent[]> {
       return await invoke<MigrationEvent[]>('plugin:sqlite|get_migration_events', {
-         db: this.path,
+         dbKey: this.key,
       });
+   }
+
+   private _resetLoadState(): void {
+      this._path = null;
+      this._loadPromise = null;
    }
 }

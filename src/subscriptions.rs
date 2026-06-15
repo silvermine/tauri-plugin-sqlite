@@ -113,8 +113,8 @@ pub struct ObserverConfigParams {
 struct ActiveSubscription {
    /// Abort handle for the subscription forwarding task.
    abort_handle: tokio::task::AbortHandle,
-   /// Database path this subscription is for.
-   db_path: String,
+   /// Database key this subscription is for.
+   db_key: String,
 }
 
 /// Global state tracking all active observer subscriptions.
@@ -123,13 +123,13 @@ pub struct ActiveSubscriptions(Arc<RwLock<HashMap<String, ActiveSubscription>>>)
 
 impl ActiveSubscriptions {
    /// Insert a new subscription.
-   pub async fn insert(&self, id: String, db_path: String, abort_handle: tokio::task::AbortHandle) {
+   pub async fn insert(&self, id: String, db_key: String, abort_handle: tokio::task::AbortHandle) {
       let mut subs = self.0.write().await;
       subs.insert(
          id,
          ActiveSubscription {
             abort_handle,
-            db_path,
+            db_key,
          },
       );
    }
@@ -146,11 +146,11 @@ impl ActiveSubscriptions {
    }
 
    /// Remove and abort all subscriptions for a specific database.
-   pub async fn remove_for_db(&self, db_path: &str) {
+   pub async fn remove_for_db(&self, db_key: &str) {
       let mut subs = self.0.write().await;
       let keys_to_remove: Vec<String> = subs
          .iter()
-         .filter(|(_, sub)| sub.db_path == db_path)
+         .filter(|(_, sub)| sub.db_key == db_key)
          .map(|(k, _)| k.clone())
          .collect();
 
@@ -162,9 +162,9 @@ impl ActiveSubscriptions {
    }
 
    /// Count active subscriptions for a specific database.
-   pub async fn count_for_db(&self, db_path: &str) -> usize {
+   pub async fn count_for_db(&self, db_key: &str) -> usize {
       let subs = self.0.read().await;
-      subs.values().filter(|sub| sub.db_path == db_path).count()
+      subs.values().filter(|sub| sub.db_key == db_key).count()
    }
 
    /// Abort all subscriptions (for cleanup on app exit).
