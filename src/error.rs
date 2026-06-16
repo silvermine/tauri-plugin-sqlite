@@ -31,6 +31,10 @@ pub enum Error {
    #[error("path traversal not allowed: {0}")]
    PathTraversal(String),
 
+   /// Database key is not registered with the plugin.
+   #[error("database key not registered: {0}")]
+   PathNotRegistered(String),
+
    /// Attempted to access a database that hasn't been loaded.
    #[error("database {0} not loaded")]
    DatabaseNotLoaded(String),
@@ -84,6 +88,7 @@ impl Error {
          Error::Migration(_) => "MIGRATION_ERROR".to_string(),
          Error::InvalidPath(_) => "INVALID_PATH".to_string(),
          Error::PathTraversal(_) => "PATH_TRAVERSAL".to_string(),
+         Error::PathNotRegistered(_) => "PATH_NOT_REGISTERED".to_string(),
          Error::DatabaseNotLoaded(_) => "DATABASE_NOT_LOADED".to_string(),
          Error::ObservationNotEnabled(_) => "OBSERVATION_NOT_ENABLED".to_string(),
          Error::TooManyDatabases(_) => "TOO_MANY_DATABASES".to_string(),
@@ -121,6 +126,24 @@ mod tests {
    fn test_error_code_invalid_path() {
       let err = Error::InvalidPath("/bad/path".into());
       assert_eq!(err.error_code(), "INVALID_PATH");
+   }
+
+   #[test]
+   fn test_error_code_path_not_registered() {
+      let err = Error::PathNotRegistered("MAIN".into());
+      assert_eq!(err.error_code(), "PATH_NOT_REGISTERED");
+   }
+
+   #[test]
+   fn test_error_serialization_path_not_registered() {
+      let err = Error::PathNotRegistered("MAIN".into());
+      let json = serde_json::to_value(&err).unwrap();
+
+      assert_eq!(json["code"], "PATH_NOT_REGISTERED");
+      assert_eq!(
+         json["message"].as_str().unwrap(),
+         "database key not registered: MAIN"
+      );
    }
 
    #[test]

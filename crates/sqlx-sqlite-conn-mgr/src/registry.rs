@@ -16,14 +16,23 @@ fn registry() -> &'static RwLock<HashMap<PathBuf, Weak<SqliteDatabase>>> {
    DATABASE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Returns true when a `file:` URI query string contains an exact `mode=memory` parameter.
+fn file_uri_has_mode_memory(path_str: &str) -> bool {
+   let Some(query) = path_str.split_once('?').map(|(_, query)| query) else {
+      return false;
+   };
+   query.split('&').any(|param| param == "mode=memory")
+}
+
 /// Check if a path represents an in-memory SQLite database
 ///
-/// Returns true for `:memory:` and `file::memory:*` URIs
+/// Returns true for `:memory:` and `file::memory:*` URIs, and for `file:` URIs whose
+/// query string includes a `mode=memory` parameter (not merely a substring match).
 pub fn is_memory_database(path: &Path) -> bool {
    let path_str = path.to_str().unwrap_or("");
    path_str == ":memory:"
       || path_str.starts_with("file::memory:")
-      || path_str.contains("mode=memory")
+      || (path_str.starts_with("file:") && file_uri_has_mode_memory(path_str))
 }
 
 /// Get or open a SQLite database connection
@@ -44,7 +53,7 @@ where
    }
 
    // Canonicalize the path for consistent lookups
-   let canonical_path = canonicalize_path(path)?;
+   let canonical_path = canonicalize_database_path(path)?;
 
    // Try to get existing database with read lock (allows concurrent reads)
    {
@@ -82,10 +91,9 @@ where
    Ok(arc_db)
 }
 
-/// Helper to canonicalize a database path
+/// Canonicalize a database file path for consistent registry lookups.
 ///
-/// This function attempts to resolve paths to their canonical form to ensure
-/// consistent cache lookups. It handles:
+/// This function attempts to resolve paths to their canonical form. It handles:
 /// - Absolute path resolution
 /// - Symlink resolution (when file exists)
 /// - Parent directory canonicalization (when file doesn't exist yet)
@@ -97,7 +105,7 @@ where
 ///   least until the file is created and can be canonicalized properly.
 /// - Symlinks in filename: If the filename itself will be a symlink (rare for SQLite),
 ///   different symlink names won't be resolved until the file exists.
-fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
+pub fn canonicalize_database_path(path: &Path) -> std::io::Result<PathBuf> {
    match path.canonicalize() {
       Ok(p) => Ok(p),
       Err(_) => {
@@ -132,7 +140,7 @@ pub async fn uncache_database(path: &Path) -> std::io::Result<()> {
    }
 
    // Canonicalize path
-   let canonical_path = canonicalize_path(path)?;
+   let canonical_path = canonicalize_database_path(path)?;
 
    let mut registry = registry().write().await;
    registry.remove(&canonical_path);
@@ -149,12 +157,12 @@ mod tests {
       let test_path = temp_dir.join("test.db");
 
       // Test that path is canonicalized to absolute path
-      let canonical = canonicalize_path(&test_path).unwrap();
+      let canonical = canonicalize_database_path(&test_path).unwrap();
       assert!(canonical.is_absolute());
 
       // Test relative path
       let relative_path = Path::new("./test_relative.db");
-      let canonical_relative = canonicalize_path(relative_path).unwrap();
+      let canonical_relative = canonicalize_database_path(relative_path).unwrap();
       assert!(canonical_relative.is_absolute());
    }
 
@@ -164,7 +172,22 @@ mod tests {
       let nonexistent = temp_dir.join("nonexistent_dir").join("test.db");
 
       // Should fail if parent directory doesn't exist
-      let result = canonicalize_path(&nonexistent);
+      let result = canonicalize_database_path(&nonexistent);
       assert!(result.is_err());
+   }
+
+   #[test]
+   fn test_mode_memory_query_param() {
+      assert!(is_memory_database(Path::new("file:test?mode=memory")));
+      assert!(is_memory_database(Path::new(
+         "file:/data/db?cache=shared&mode=memory"
+      )));
+   }
+
+   #[test]
+   fn test_mode_memory_substring_in_value_is_not_memory() {
+      assert!(!is_memory_database(Path::new(
+         "file:/home/user/real.db?x=mode=memory"
+      )));
    }
 }

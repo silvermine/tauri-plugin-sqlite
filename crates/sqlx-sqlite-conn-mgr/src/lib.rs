@@ -80,5 +80,7 @@ pub use write_guard::WriteGuard;
 // Re-export sqlx migrate types for convenience
 pub use sqlx::migrate::Migrator;
 
+pub use registry::{canonicalize_database_path, is_memory_database};
+
 /// A type alias for Results with our custom Error type
 pub type Result<T> = std::result::Result<T, Error>;

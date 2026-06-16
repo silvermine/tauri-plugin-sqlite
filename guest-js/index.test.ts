@@ -16,12 +16,49 @@ import Database, {
 let lastCmd = '',
     lastArgs: Record<string, unknown> = {};
 
+const DATABASE_KEYS = {
+   T: 'T',
+   TEST: 'TEST',
+   ARCHIVE: 'ARCHIVE',
+   STATS: 'STATS',
+   ORDERS: 'ORDERS',
+   MAIN: 'MAIN',
+};
+
+function getDatabasePath(key: string): string {
+   if (key === DATABASE_KEYS.ARCHIVE) {
+      return 'archive.db';
+   }
+
+   if (key === DATABASE_KEYS.STATS) {
+      return 'stats.db';
+   }
+
+   if (key === DATABASE_KEYS.ORDERS) {
+      return 'orders.db';
+   }
+
+   if (key === DATABASE_KEYS.T) {
+      return 't.db';
+   }
+
+   if (key === DATABASE_KEYS.TEST) {
+      return 'test.db';
+   }
+
+   if (key === DATABASE_KEYS.MAIN) {
+      return 'main.db';
+   }
+
+   throw new Error(`Unknown database key: ${key}`);
+}
+
 beforeEach(() => {
    mockIPC((cmd, args) => {
       lastCmd = cmd;
       lastArgs = args as Record<string, unknown>;
       if (cmd === 'plugin:sqlite|load') {
-         return (args as { db: string }).db;
+         return getDatabasePath((args as { dbKey: string }).dbKey);
       }
       if (cmd === 'plugin:sqlite|execute') {
          return [ 1, 1 ];
@@ -30,13 +67,13 @@ beforeEach(() => {
          return [];
       }
       if (cmd === 'plugin:sqlite|begin_interruptible_transaction') {
-         return { dbPath: (args as { db: string }).db, transactionId: 'test-tx-id' };
+         return { dbKey: (args as { dbKey: string }).dbKey, transactionId: 'test-tx-id' };
       }
       if (cmd === 'plugin:sqlite|transaction_continue') {
          const action = (args as { action: { type: string } }).action;
 
          if (action.type === 'Continue') {
-            return { dbPath: 'test.db', transactionId: 'test-tx-id' };
+            return { dbKey: DATABASE_KEYS.TEST, transactionId: 'test-tx-id' };
          }
          return undefined;
       }
@@ -84,32 +121,194 @@ afterEach(() => { return clearMocks(); });
 
 describe('Database commands', () => {
    it('load', async () => {
-      await Database.load('test.db');
+      await Database.load(DATABASE_KEYS.TEST);
       expect(lastCmd).toBe('plugin:sqlite|load');
-      expect(lastArgs.db).toBe('test.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.TEST);
+   });
+
+   it('get is lazy until first operation', async () => {
+      const db = Database.get(DATABASE_KEYS.TEST);
+
+      expect(db.getPath()).toBeNull();
+
+      await db.fetchAll('SELECT 1');
+      expect(db.getPath()).toBe(getDatabasePath(DATABASE_KEYS.TEST));
+   });
+
+   it('get retries load after a transient failure', async () => {
+      let loadAttempts = 0;
+
+      mockIPC((cmd, args) => {
+         lastCmd = cmd;
+         lastArgs = args as Record<string, unknown>;
+         if (cmd === 'plugin:sqlite|load') {
+            loadAttempts += 1;
+            if (loadAttempts === 1) {
+               throw new Error('PATH_NOT_REGISTERED');
+            }
+            return getDatabasePath((args as { dbKey: string }).dbKey);
+         }
+         if (cmd === 'plugin:sqlite|fetch_all') {
+            return [];
+         }
+         return undefined;
+      });
+
+      const db = Database.get(DATABASE_KEYS.TEST);
+
+      await expect(db.fetchAll('SELECT 1')).rejects.toThrow('PATH_NOT_REGISTERED');
+      expect(loadAttempts).toBe(1);
+      expect(db.getPath()).toBeNull();
+
+      await db.fetchAll('SELECT 1');
+      expect(loadAttempts).toBe(2);
+      expect(db.getPath()).toBe(getDatabasePath(DATABASE_KEYS.TEST));
+      expect(lastCmd).toBe('plugin:sqlite|fetch_all');
+   });
+
+   it('load is idempotent', async () => {
+      let loadAttempts = 0;
+
+      mockIPC((cmd, args) => {
+         lastCmd = cmd;
+         lastArgs = args as Record<string, unknown>;
+         if (cmd === 'plugin:sqlite|load') {
+            loadAttempts += 1;
+            return getDatabasePath((args as { dbKey: string }).dbKey);
+         }
+         return undefined;
+      });
+
+      const db = Database.get(DATABASE_KEYS.TEST);
+
+      await db.load();
+      await db.load();
+
+      expect(loadAttempts).toBe(1);
+      expect(db.getPath()).toBe(getDatabasePath(DATABASE_KEYS.TEST));
+   });
+
+   it('load coalesces concurrent calls', async () => {
+      let loadAttempts = 0,
+          releaseLoad!: () => void;
+
+      const loadBlocked = new Promise<void>((resolve) => {
+         releaseLoad = resolve;
+      });
+
+      mockIPC((cmd, args) => {
+         lastCmd = cmd;
+         lastArgs = args as Record<string, unknown>;
+         if (cmd === 'plugin:sqlite|load') {
+            loadAttempts += 1;
+            return loadBlocked.then(() => {
+               return getDatabasePath((args as { dbKey: string }).dbKey);
+            });
+         }
+         return undefined;
+      });
+
+      const db = Database.get(DATABASE_KEYS.TEST);
+
+      const firstLoad = db.load(),
+            secondLoad = db.load();
+
+      await Promise.resolve();
+      expect(loadAttempts).toBe(1);
+
+      releaseLoad();
+      await Promise.all([ firstLoad, secondLoad ]);
+
+      expect(loadAttempts).toBe(1);
+      expect(db.getPath()).toBe(getDatabasePath(DATABASE_KEYS.TEST));
+   });
+
+   it('close resets load state and allows reload', async () => {
+      let loadAttempts = 0;
+
+      mockIPC((cmd, args) => {
+         lastCmd = cmd;
+         lastArgs = args as Record<string, unknown>;
+         if (cmd === 'plugin:sqlite|load') {
+            loadAttempts += 1;
+            return getDatabasePath((args as { dbKey: string }).dbKey);
+         }
+         if (cmd === 'plugin:sqlite|close') {
+            return true;
+         }
+         return undefined;
+      });
+
+      const db = Database.get(DATABASE_KEYS.TEST);
+
+      await db.load();
+      expect(loadAttempts).toBe(1);
+      expect(db.getPath()).toBe(getDatabasePath(DATABASE_KEYS.TEST));
+
+      const wasClosed = await db.close();
+
+      expect(wasClosed).toBe(true);
+      expect(lastCmd).toBe('plugin:sqlite|close');
+      expect(db.getPath()).toBeNull();
+
+      await db.load();
+      expect(loadAttempts).toBe(2);
+      expect(db.getPath()).toBe(getDatabasePath(DATABASE_KEYS.TEST));
+   });
+
+   it('remove resets load state and allows reload', async () => {
+      let loadAttempts = 0;
+
+      mockIPC((cmd, args) => {
+         lastCmd = cmd;
+         lastArgs = args as Record<string, unknown>;
+         if (cmd === 'plugin:sqlite|load') {
+            loadAttempts += 1;
+            return getDatabasePath((args as { dbKey: string }).dbKey);
+         }
+         if (cmd === 'plugin:sqlite|remove') {
+            return true;
+         }
+         return undefined;
+      });
+
+      const db = Database.get(DATABASE_KEYS.TEST);
+
+      await db.load();
+      expect(loadAttempts).toBe(1);
+
+      const wasRemoved = await db.remove();
+
+      expect(wasRemoved).toBe(true);
+      expect(lastCmd).toBe('plugin:sqlite|remove');
+      expect(db.getPath()).toBeNull();
+
+      await db.load();
+      expect(loadAttempts).toBe(2);
+      expect(db.getPath()).toBe(getDatabasePath(DATABASE_KEYS.TEST));
    });
 
    it('execute', async () => {
-      await Database.get('t.db').execute('INSERT INTO t VALUES ($1)', [ 1 ]);
+      await Database.get(DATABASE_KEYS.T).execute('INSERT INTO t VALUES ($1)', [ 1 ]);
       expect(lastCmd).toBe('plugin:sqlite|execute');
-      expect(lastArgs).toMatchObject({ db: 't.db', query: 'INSERT INTO t VALUES ($1)', values: [ 1 ], attached: null });
+      expect(lastArgs).toMatchObject({ dbKey: DATABASE_KEYS.T, query: 'INSERT INTO t VALUES ($1)', values: [ 1 ], attached: null });
    });
 
    it('execute with attached databases', async () => {
-      await Database.get('main.db')
+      await Database.get(DATABASE_KEYS.MAIN)
          .execute('UPDATE todos SET status = $1 WHERE id IN (SELECT todo_id FROM archive.completed)', [ 'archived' ])
          .attach([
             {
-               databasePath: 'archive.db',
+               databaseKey: DATABASE_KEYS.ARCHIVE,
                schemaName: 'archive',
                mode: 'readOnly',
             },
          ]);
       expect(lastCmd).toBe('plugin:sqlite|execute');
-      expect(lastArgs.db).toBe('main.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.MAIN);
       expect(lastArgs.attached).toEqual([
          {
-            databasePath: 'archive.db',
+            databaseKey: 'ARCHIVE',
             schemaName: 'archive',
             mode: 'readOnly',
          },
@@ -117,30 +316,30 @@ describe('Database commands', () => {
    });
 
    it('execute_transaction', async () => {
-      await Database.get('t.db').executeTransaction([ [ 'DELETE FROM t' ] ]);
+      await Database.get(DATABASE_KEYS.T).executeTransaction([ [ 'DELETE FROM t' ] ]);
       expect(lastCmd).toBe('plugin:sqlite|execute_transaction');
       expect(lastArgs.statements).toEqual([ { query: 'DELETE FROM t', values: [] } ]);
       expect(lastArgs.attached).toBe(null);
    });
 
    it('execute_transaction with attached databases', async () => {
-      await Database.get('main.db')
+      await Database.get(DATABASE_KEYS.MAIN)
          .executeTransaction([
             [ 'INSERT INTO orders (user_id, total) VALUES ($1, $2)', [ 1, 99.99 ] ],
             [ 'UPDATE stats.order_stats SET order_count = order_count + 1', [] ],
          ])
          .attach([
             {
-               databasePath: 'stats.db',
+               databaseKey: DATABASE_KEYS.STATS,
                schemaName: 'stats',
                mode: 'readWrite',
             },
          ]);
       expect(lastCmd).toBe('plugin:sqlite|execute_transaction');
-      expect(lastArgs.db).toBe('main.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.MAIN);
       expect(lastArgs.attached).toEqual([
          {
-            databasePath: 'stats.db',
+            databaseKey: DATABASE_KEYS.STATS,
             schemaName: 'stats',
             mode: 'readWrite',
          },
@@ -148,26 +347,26 @@ describe('Database commands', () => {
    });
 
    it('fetch_all', async () => {
-      await Database.get('t.db').fetchAll('SELECT * FROM t');
+      await Database.get(DATABASE_KEYS.T).fetchAll('SELECT * FROM t');
       expect(lastCmd).toBe('plugin:sqlite|fetch_all');
-      expect(lastArgs).toMatchObject({ db: 't.db', query: 'SELECT * FROM t', attached: null });
+      expect(lastArgs).toMatchObject({ dbKey: DATABASE_KEYS.T, query: 'SELECT * FROM t', attached: null });
    });
 
    it('fetch_all with attached databases', async () => {
-      await Database.get('main.db')
+      await Database.get(DATABASE_KEYS.MAIN)
          .fetchAll('SELECT u.name, o.total FROM users u JOIN orders.orders o ON u.id = o.user_id', [])
          .attach([
             {
-               databasePath: 'orders.db',
+               databaseKey: DATABASE_KEYS.ORDERS,
                schemaName: 'orders',
                mode: 'readOnly',
             },
          ]);
       expect(lastCmd).toBe('plugin:sqlite|fetch_all');
-      expect(lastArgs.db).toBe('main.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.MAIN);
       expect(lastArgs.attached).toEqual([
          {
-            databasePath: 'orders.db',
+            databaseKey: DATABASE_KEYS.ORDERS,
             schemaName: 'orders',
             mode: 'readOnly',
          },
@@ -175,26 +374,26 @@ describe('Database commands', () => {
    });
 
    it('fetch_one', async () => {
-      await Database.get('t.db').fetchOne('SELECT * FROM t WHERE id = $1', [ 1 ]);
+      await Database.get(DATABASE_KEYS.T).fetchOne('SELECT * FROM t WHERE id = $1', [ 1 ]);
       expect(lastCmd).toBe('plugin:sqlite|fetch_one');
-      expect(lastArgs).toMatchObject({ db: 't.db', values: [ 1 ], attached: null });
+      expect(lastArgs).toMatchObject({ dbKey: DATABASE_KEYS.T, values: [ 1 ], attached: null });
    });
 
    it('fetch_one with attached databases', async () => {
-      await Database.get('main.db')
+      await Database.get(DATABASE_KEYS.MAIN)
          .fetchOne('SELECT COUNT(*) as total FROM users u JOIN orders.orders o ON u.id = o.user_id', [])
          .attach([
             {
-               databasePath: 'orders.db',
+               databaseKey: DATABASE_KEYS.ORDERS,
                schemaName: 'orders',
                mode: 'readOnly',
             },
          ]);
       expect(lastCmd).toBe('plugin:sqlite|fetch_one');
-      expect(lastArgs.db).toBe('main.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.MAIN);
       expect(lastArgs.attached).toEqual([
          {
-            databasePath: 'orders.db',
+            databaseKey: DATABASE_KEYS.ORDERS,
             schemaName: 'orders',
             mode: 'readOnly',
          },
@@ -206,10 +405,10 @@ describe('Database commands', () => {
          { name: 'id', direction: 'asc' },
       ];
 
-      await Database.get('t.db').fetchPage('SELECT * FROM posts', [], keyset, 25);
+      await Database.get(DATABASE_KEYS.T).fetchPage('SELECT * FROM posts', [], keyset, 25);
       expect(lastCmd).toBe('plugin:sqlite|fetch_page');
       expect(lastArgs).toMatchObject({
-         db: 't.db',
+         dbKey: DATABASE_KEYS.T,
          query: 'SELECT * FROM posts',
          values: [],
          keyset: [ { name: 'id', direction: 'asc' } ],
@@ -225,7 +424,7 @@ describe('Database commands', () => {
          { name: 'id', direction: 'asc' },
       ];
 
-      await Database.get('t.db')
+      await Database.get(DATABASE_KEYS.T)
          .fetchPage('SELECT * FROM posts', [], keyset, 25)
          .after([ 100 ]);
 
@@ -239,7 +438,7 @@ describe('Database commands', () => {
          { name: 'id', direction: 'asc' },
       ];
 
-      await Database.get('t.db')
+      await Database.get(DATABASE_KEYS.T)
          .fetchPage('SELECT * FROM posts', [], keyset, 25)
          .before([ 50 ]);
 
@@ -253,22 +452,22 @@ describe('Database commands', () => {
          { name: 'id', direction: 'asc' },
       ];
 
-      await Database.get('main.db')
+      await Database.get(DATABASE_KEYS.MAIN)
          .fetchPage('SELECT * FROM posts', [], keyset, 25)
          .attach([
             {
-               databasePath: 'archive.db',
+               databaseKey: DATABASE_KEYS.ARCHIVE,
                schemaName: 'archive',
                mode: 'readOnly',
             },
          ]);
       expect(lastCmd).toBe('plugin:sqlite|fetch_page');
-      expect(lastArgs.db).toBe('main.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.MAIN);
       expect(lastArgs.after).toBeNull();
       expect(lastArgs.before).toBeNull();
       expect(lastArgs.attached).toEqual([
          {
-            databasePath: 'archive.db',
+            databaseKey: DATABASE_KEYS.ARCHIVE,
             schemaName: 'archive',
             mode: 'readOnly',
          },
@@ -282,7 +481,7 @@ describe('Database commands', () => {
          { name: 'id', direction: 'asc' },
       ];
 
-      await Database.get('t.db')
+      await Database.get(DATABASE_KEYS.T)
          .fetchPage('SELECT * FROM posts WHERE active = $1', [ true ], keyset, 50)
          .after([ 'tech', 95, 42 ]);
 
@@ -305,7 +504,7 @@ describe('Database commands', () => {
          { name: 'id', direction: 'asc' },
       ];
 
-      await Database.get('t.db')
+      await Database.get(DATABASE_KEYS.T)
          .fetchPage('SELECT * FROM posts WHERE active = $1', [ true ], keyset, 50)
          .before([ 'tech', 95, 42 ]);
 
@@ -322,9 +521,9 @@ describe('Database commands', () => {
    });
 
    it('close', async () => {
-      await Database.get('t.db').close();
+      await Database.get(DATABASE_KEYS.T).close();
       expect(lastCmd).toBe('plugin:sqlite|close');
-      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.T);
    });
 
    it('close_all', async () => {
@@ -333,15 +532,15 @@ describe('Database commands', () => {
    });
 
    it('remove', async () => {
-      await Database.get('t.db').remove();
+      await Database.get(DATABASE_KEYS.T).remove();
       expect(lastCmd).toBe('plugin:sqlite|remove');
-      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.T);
    });
 
    it('getMigrationEvents', async () => {
       const mockEvents: MigrationEvent[] = [
-         { dbPath: 't.db', status: 'running' },
-         { dbPath: 't.db', status: 'completed', migrationCount: 5 },
+         { dbKey: DATABASE_KEYS.T, dbPath: 't.db', status: 'running' },
+         { dbKey: DATABASE_KEYS.T, dbPath: 't.db', status: 'completed', migrationCount: 5 },
       ];
 
       mockIPC((cmd, args) => {
@@ -353,28 +552,28 @@ describe('Database commands', () => {
          return undefined;
       });
 
-      const events = await Database.get('t.db').getMigrationEvents();
+      const events = await Database.get(DATABASE_KEYS.T).getMigrationEvents();
 
       expect(lastCmd).toBe('plugin:sqlite|get_migration_events');
-      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.T);
       expect(events).toEqual(mockEvents);
    });
 
    it('getMigrationEvents - empty array', async () => {
-      const events = await Database.get('test.db').getMigrationEvents();
+      const events = await Database.get(DATABASE_KEYS.TEST).getMigrationEvents();
 
       expect(lastCmd).toBe('plugin:sqlite|get_migration_events');
-      expect(lastArgs.db).toBe('test.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.TEST);
       expect(events).toEqual([]);
    });
 
    it('beginInterruptibleTransaction', async () => {
-      const tx = await Database.get('t.db').beginInterruptibleTransaction([
+      const tx = await Database.get(DATABASE_KEYS.T).beginInterruptibleTransaction([
          [ 'INSERT INTO users (name) VALUES ($1)', [ 'Alice' ] ],
       ]);
 
       expect(lastCmd).toBe('plugin:sqlite|begin_interruptible_transaction');
-      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.T);
       expect(lastArgs.initialStatements).toEqual([
          { query: 'INSERT INTO users (name) VALUES ($1)', values: [ 'Alice' ] },
       ]);
@@ -383,26 +582,26 @@ describe('Database commands', () => {
    });
 
    it('beginInterruptibleTransaction with attached databases', async () => {
-      const tx = await Database.get('main.db')
+      const tx = await Database.get(DATABASE_KEYS.MAIN)
          .beginInterruptibleTransaction([
             [ 'DELETE FROM users WHERE id IN (SELECT user_id FROM archive.archived_users)' ],
          ])
          .attach([
             {
-               databasePath: 'archive.db',
+               databaseKey: DATABASE_KEYS.ARCHIVE,
                schemaName: 'archive',
                mode: 'readOnly',
             },
          ]);
 
       expect(lastCmd).toBe('plugin:sqlite|begin_interruptible_transaction');
-      expect(lastArgs.db).toBe('main.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.MAIN);
       expect(lastArgs.initialStatements).toEqual([
          { query: 'DELETE FROM users WHERE id IN (SELECT user_id FROM archive.archived_users)', values: [] },
       ]);
       expect(lastArgs.attached).toEqual([
          {
-            databasePath: 'archive.db',
+            databaseKey: DATABASE_KEYS.ARCHIVE,
             schemaName: 'archive',
             mode: 'readOnly',
          },
@@ -411,7 +610,7 @@ describe('Database commands', () => {
    });
 
    it('InterruptibleTransaction.continueWith()', async () => {
-      const tx = await Database.get('test.db').beginInterruptibleTransaction([
+      const tx = await Database.get(DATABASE_KEYS.TEST).beginInterruptibleTransaction([
          [ 'INSERT INTO users (name) VALUES ($1)', [ 'Alice' ] ],
       ]);
 
@@ -420,67 +619,70 @@ describe('Database commands', () => {
       ]);
 
       expect(lastCmd).toBe('plugin:sqlite|transaction_continue');
-      expect(lastArgs.token).toEqual({ dbPath: 'test.db', transactionId: 'test-tx-id' });
+      expect(lastArgs.token).toEqual({ dbKey: DATABASE_KEYS.TEST, transactionId: 'test-tx-id' });
       expect((lastArgs.action as { type: string }).type).toBe('Continue');
       expect(tx2).toBeInstanceOf(Object);
    });
 
    it('InterruptibleTransaction.commit()', async () => {
-      const tx = await Database.get('test.db').beginInterruptibleTransaction([
+      const tx = await Database.get(DATABASE_KEYS.TEST).beginInterruptibleTransaction([
          [ 'INSERT INTO users (name) VALUES ($1)', [ 'Alice' ] ],
       ]);
 
       await tx.commit();
       expect(lastCmd).toBe('plugin:sqlite|transaction_continue');
-      expect(lastArgs.token).toEqual({ dbPath: 'test.db', transactionId: 'test-tx-id' });
+      expect(lastArgs.token).toEqual({ dbKey: DATABASE_KEYS.TEST, transactionId: 'test-tx-id' });
       expect((lastArgs.action as { type: string }).type).toBe('Commit');
    });
 
    it('InterruptibleTransaction.rollback()', async () => {
-      const tx = await Database.get('test.db').beginInterruptibleTransaction([
+      const tx = await Database.get(DATABASE_KEYS.TEST).beginInterruptibleTransaction([
          [ 'INSERT INTO users (name) VALUES ($1)', [ 'Alice' ] ],
       ]);
 
       await tx.rollback();
       expect(lastCmd).toBe('plugin:sqlite|transaction_continue');
-      expect(lastArgs.token).toEqual({ dbPath: 'test.db', transactionId: 'test-tx-id' });
+      expect(lastArgs.token).toEqual({ dbKey: DATABASE_KEYS.TEST, transactionId: 'test-tx-id' });
       expect((lastArgs.action as { type: string }).type).toBe('Rollback');
    });
 
    it('InterruptibleTransaction.read()', async () => {
-      const tx = await Database.get('test.db').beginInterruptibleTransaction([
+      const tx = await Database.get(DATABASE_KEYS.TEST).beginInterruptibleTransaction([
          [ 'INSERT INTO users (name) VALUES ($1)', [ 'Alice' ] ],
       ]);
 
       await tx.read('SELECT * FROM users WHERE name = $1', [ 'Alice' ]);
       expect(lastCmd).toBe('plugin:sqlite|transaction_read');
-      expect(lastArgs.token).toEqual({ dbPath: 'test.db', transactionId: 'test-tx-id' });
+      expect(lastArgs.token).toEqual({ dbKey: DATABASE_KEYS.TEST, transactionId: 'test-tx-id' });
       expect(lastArgs.query).toBe('SELECT * FROM users WHERE name = $1');
       expect(lastArgs.values).toEqual([ 'Alice' ]);
    });
 
    it('handles errors from backend', async () => {
+      const db = new Database(DATABASE_KEYS.T);
+
       mockIPC(() => {
          throw new Error('Database error');
       });
-      await expect(Database.get('t.db').execute('SELECT 1', [])).rejects.toThrow('Database error');
+
+      await expect(db.execute('SELECT 1', [])).rejects.toThrow('Database error');
    });
 });
 
 describe('Database.load with customConfig', () => {
    it('passes customConfig to backend', async () => {
-      await Database.load('test.db', { maxReadConnections: 10, idleTimeoutSecs: 60 });
+      await Database.load(DATABASE_KEYS.TEST, { maxReadConnections: 10, idleTimeoutSecs: 60 });
       expect(lastCmd).toBe('plugin:sqlite|load');
-      expect(lastArgs.db).toBe('test.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.TEST);
       expect(lastArgs.customConfig).toEqual({ maxReadConnections: 10, idleTimeoutSecs: 60 });
    });
 });
 
 describe('Observer commands', () => {
    it('observe', async () => {
-      await Database.get('t.db').observe([ 'users', 'posts' ]);
+      await Database.get(DATABASE_KEYS.T).observe([ 'users', 'posts' ]);
       expect(lastCmd).toBe('plugin:sqlite|observe');
-      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.T);
       expect(lastArgs.tables).toEqual([ 'users', 'posts' ]);
       expect(lastArgs.config).toBe(null);
    });
@@ -488,7 +690,7 @@ describe('Observer commands', () => {
    it('observe with config', async () => {
       const config: ObserverConfig = { channelCapacity: 512, captureValues: false };
 
-      await Database.get('t.db').observe([ 'users' ], config);
+      await Database.get(DATABASE_KEYS.T).observe([ 'users' ], config);
       expect(lastCmd).toBe('plugin:sqlite|observe');
       expect(lastArgs.tables).toEqual([ 'users' ]);
       expect(lastArgs.config).toEqual({ channelCapacity: 512, captureValues: false });
@@ -497,10 +699,10 @@ describe('Observer commands', () => {
    it('subscribe', async () => {
       const events: TableChangeEvent[] = [];
 
-      const sub = await Database.get('t.db').subscribe([ 'users' ], (e) => { events.push(e); });
+      const sub = await Database.get(DATABASE_KEYS.T).subscribe([ 'users' ], (e) => { events.push(e); });
 
       expect(lastCmd).toBe('plugin:sqlite|subscribe');
-      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.T);
       expect(lastArgs.tables).toEqual([ 'users' ]);
       expect(lastArgs.onEvent).toBeDefined();
       expect(sub).toBeInstanceOf(Subscription);
@@ -520,15 +722,16 @@ describe('Observer commands', () => {
    });
 
    it('unobserve', async () => {
-      await Database.get('t.db').unobserve();
+      await Database.get(DATABASE_KEYS.T).unobserve();
       expect(lastCmd).toBe('plugin:sqlite|unobserve');
-      expect(lastArgs.db).toBe('t.db');
+      expect(lastArgs.dbKey).toBe(DATABASE_KEYS.T);
    });
 });
 
 describe('MigrationEvent type', () => {
    it('accepts running status', () => {
       const event: MigrationEvent = {
+         dbKey: 'TEST',
          dbPath: 'test.db',
          status: 'running',
       };
@@ -540,6 +743,7 @@ describe('MigrationEvent type', () => {
 
    it('accepts completed status with migrationCount', () => {
       const event: MigrationEvent = {
+         dbKey: 'TEST',
          dbPath: 'test.db',
          status: 'completed',
          migrationCount: 3,
@@ -551,6 +755,7 @@ describe('MigrationEvent type', () => {
 
    it('accepts failed status with error', () => {
       const event: MigrationEvent = {
+         dbKey: 'TEST',
          dbPath: 'test.db',
          status: 'failed',
          error: 'Migration failed: syntax error',

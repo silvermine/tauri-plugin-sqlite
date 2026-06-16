@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SqliteDatabaseConfig {
    /// Maximum number of concurrent read connections
    ///

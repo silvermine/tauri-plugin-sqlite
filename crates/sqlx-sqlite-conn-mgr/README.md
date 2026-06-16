@@ -89,7 +89,8 @@ Migrations are tracked in `_sqlx_migrations` — calling `run_migrations()` mult
 times is safe (already-applied migrations are skipped).
 
 > **Note:** When using the Tauri plugin, migrations are handled automatically via
-> `Builder::add_migrations()`. The plugin starts migrations at setup and waits for
+> `Builder::register_database(..., Some(migrator))`. The plugin starts migrations at setup
+> and waits for
 > completion when `load()` is called.
 
 ### Attached Databases
