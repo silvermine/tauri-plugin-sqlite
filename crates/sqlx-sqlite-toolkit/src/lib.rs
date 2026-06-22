@@ -46,7 +46,7 @@ pub use error::{Error, Result};
 pub use pagination::{KeysetColumn, KeysetPage, SortDirection};
 pub use transactions::{
    ActiveInterruptibleTransaction, ActiveInterruptibleTransactions, ActiveRegularTransactions,
-   Statement, TransactionWriter, cleanup_all_transactions,
+   Statement, TransactionWriter, cleanup_all_transactions, cleanup_transactions_for_db,
 };
 pub use wrapper::{
    DatabaseWrapper, InterruptibleTransaction, InterruptibleTransactionBuilder,

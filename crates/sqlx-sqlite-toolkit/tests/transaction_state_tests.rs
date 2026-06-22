@@ -134,11 +134,39 @@ async fn test_abort_all_clears_transactions() {
    let tx_id = tx.transaction_id().to_string();
 
    state.insert("abort.db".into(), tx).await.unwrap();
-   state.abort_all().await;
+   state.abort_all().await.unwrap();
 
    // After abort_all, remove should fail (transaction was cleared)
    let err = expect_err(state.remove("abort.db", &tx_id).await);
    assert_eq!(err.error_code(), "NO_ACTIVE_TRANSACTION");
+}
+
+#[tokio::test]
+async fn test_abort_for_db_clears_only_matching_interruptible() {
+   let (db1, _temp1) = create_test_db("main.db").await;
+   let (db2, _temp2) = create_test_db("other.db").await;
+
+   for db in [&db1, &db2] {
+      db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)".into(), vec![])
+         .await
+         .unwrap();
+   }
+
+   let state = ActiveInterruptibleTransactions::default();
+   let main_tx = begin_transaction(&db1, "main").await;
+   let main_tx_id = main_tx.transaction_id().to_string();
+   let other_tx = begin_transaction(&db2, "other").await;
+   let other_tx_id = other_tx.transaction_id().to_string();
+
+   state.insert("main".into(), main_tx).await.unwrap();
+   state.insert("other".into(), other_tx).await.unwrap();
+
+   state.abort_for_db("main").await.unwrap();
+
+   let err = expect_err(state.remove("main", &main_tx_id).await);
+   assert_eq!(err.error_code(), "NO_ACTIVE_TRANSACTION");
+
+   assert!(state.remove("other", &other_tx_id).await.is_ok());
 }
 
 #[tokio::test]
@@ -165,7 +193,7 @@ async fn test_abort_all_auto_rollbacks_uncommitted_writes() {
 
    // Store and abort (should auto-rollback on drop)
    state.insert("rollback.db".into(), tx).await.unwrap();
-   state.abort_all().await;
+   state.abort_all().await.unwrap();
 
    // The uncommitted write should not be visible
    let rows = db
@@ -195,7 +223,7 @@ async fn test_insert_after_abort_all_succeeds() {
 
    let tx = begin_transaction(&db1, "reuse-key").await;
    state.insert("reuse-key".into(), tx).await.unwrap();
-   state.abort_all().await;
+   state.abort_all().await.unwrap();
 
    // Should be able to insert again after abort
    let tx2 = begin_transaction(&db2, "reuse-key").await;
@@ -285,7 +313,7 @@ async fn test_regular_insert_and_remove() {
    let state = ActiveRegularTransactions::default();
 
    let handle = tokio::spawn(async { /* no-op */ });
-   state.insert("tx-1".into(), handle.abort_handle()).await;
+   state.insert("main".into(), "tx-1".into(), handle).await;
 
    // Remove should succeed (no panic, no error)
    state.remove("tx-1").await;
@@ -298,18 +326,14 @@ async fn test_regular_insert_and_remove() {
 async fn test_regular_abort_all_cancels_tasks() {
    let state = ActiveRegularTransactions::default();
 
-   // Spawn a long-running task
    let handle = tokio::spawn(async {
       tokio::time::sleep(std::time::Duration::from_secs(60)).await;
    });
-   let abort_handle = handle.abort_handle();
 
-   state.insert("long-task".into(), abort_handle).await;
-   state.abort_all().await;
-
-   // The task should have been aborted
-   let result = handle.await;
-   assert!(result.unwrap_err().is_cancelled());
+   state
+      .insert("main".into(), "long-task".into(), handle)
+      .await;
+   state.abort_all().await.unwrap();
 }
 
 #[tokio::test]
@@ -319,14 +343,58 @@ async fn test_regular_abort_all_clears_state() {
    let h1 = tokio::spawn(async {});
    let h2 = tokio::spawn(async {});
 
-   state.insert("a".into(), h1.abort_handle()).await;
-   state.insert("b".into(), h2.abort_handle()).await;
+   state.insert("main".into(), "a".into(), h1).await;
+   state.insert("other".into(), "b".into(), h2).await;
 
-   state.abort_all().await;
+   state.abort_all().await.unwrap();
 
    // State should be empty — inserting new keys should work
    let h3 = tokio::spawn(async {});
-   state.insert("a".into(), h3.abort_handle()).await;
+   state.insert("main".into(), "a".into(), h3).await;
+}
+
+#[tokio::test]
+async fn test_regular_abort_for_db_only_matching_db_key() {
+   let state = ActiveRegularTransactions::default();
+
+   let main_handle = tokio::spawn(async {
+      tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+   });
+   let other_handle = tokio::spawn(async {
+      tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+   });
+
+   state
+      .insert("main".into(), "main-one".into(), main_handle)
+      .await;
+   state
+      .insert("other".into(), "other-two".into(), other_handle)
+      .await;
+
+   state.abort_for_db("main").await.unwrap();
+
+   // Other database transaction should still be tracked and abortable.
+   state.abort_for_db("other").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_regular_abort_for_db_does_not_match_colon_prefix_alias() {
+   let state = ActiveRegularTransactions::default();
+
+   let a_handle = tokio::spawn(async {
+      tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+   });
+   let ab_handle = tokio::spawn(async {
+      tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+   });
+
+   state.insert("a".into(), "a-tx".into(), a_handle).await;
+   state.insert("a:b".into(), "ab-tx".into(), ab_handle).await;
+
+   state.abort_for_db("a").await.unwrap();
+
+   // Closing `a` must not abort the transaction belonging to database `a:b`.
+   state.abort_for_db("a:b").await.unwrap();
 }
 
 // ============================================================================
@@ -353,16 +421,15 @@ async fn test_cleanup_all_transactions() {
       tokio::time::sleep(std::time::Duration::from_secs(60)).await;
    });
    regular
-      .insert("regular-1".into(), handle.abort_handle())
+      .insert("cleanup.db".into(), "regular-1".into(), handle)
       .await;
 
    // Cleanup should clear both
-   cleanup_all_transactions(&interruptible, &regular).await;
+   cleanup_all_transactions(&interruptible, &regular)
+      .await
+      .unwrap();
 
    // Interruptible should be empty
    let err = expect_err(interruptible.remove("cleanup.db", "any").await);
    assert_eq!(err.error_code(), "NO_ACTIVE_TRANSACTION");
-
-   // Regular task should be cancelled
-   assert!(handle.await.unwrap_err().is_cancelled());
 }

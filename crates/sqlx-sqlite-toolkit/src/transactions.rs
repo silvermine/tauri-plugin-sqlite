@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use sqlx::{Column, Row};
 use sqlx_sqlite_conn_mgr::{AttachedWriteGuard, WriteGuard};
 use tokio::sync::{Mutex, RwLock};
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 #[cfg(feature = "observer")]
@@ -106,6 +106,8 @@ pub struct ActiveInterruptibleTransaction {
    // call sqlx's rt::spawn and panic with "this functionality requires a Tokio
    // context".
    runtime_handle: tokio::runtime::Handle,
+   #[cfg(test)]
+   force_rollback_failure: bool,
 }
 
 impl ActiveInterruptibleTransaction {
@@ -121,7 +123,16 @@ impl ActiveInterruptibleTransaction {
          writer: Some(writer),
          created_at: Instant::now(),
          runtime_handle: tokio::runtime::Handle::current(),
+         #[cfg(test)]
+         force_rollback_failure: false,
       }
+   }
+
+   /// Test-only: force `rollback()` to fail when aborting via transaction state.
+   #[cfg(test)]
+   pub fn force_rollback_failure_for_test(mut self) -> Self {
+      self.force_rollback_failure = true;
+      self
    }
 
    fn writer_mut(&mut self) -> Result<&mut TransactionWriter> {
@@ -208,6 +219,15 @@ impl ActiveInterruptibleTransaction {
 
    /// Rollback this transaction
    pub async fn rollback(mut self) -> Result<()> {
+      #[cfg(test)]
+      if self.force_rollback_failure {
+         let db_path = self.db_path.clone();
+         drop(self.take_writer()?);
+         return Err(Error::Other(format!(
+            "forced rollback failure for test (db: {db_path})"
+         )));
+      }
+
       let mut writer = self.take_writer()?;
       writer.rollback().await?;
 
@@ -305,6 +325,38 @@ impl Drop for ActiveInterruptibleTransaction {
 /// Default transaction timeout (5 minutes).
 const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Collects errors from best-effort cleanup loops.
+struct CleanupErrors {
+   errors: Vec<Error>,
+}
+
+impl CleanupErrors {
+   fn new() -> Self {
+      Self { errors: Vec::new() }
+   }
+
+   fn push(&mut self, err: Error) {
+      match err {
+         Error::TransactionCleanupFailed(nested) => self.errors.extend(nested),
+         other => self.errors.push(other),
+      }
+   }
+
+   fn push_result(&mut self, result: Result<()>) {
+      if let Err(err) = result {
+         self.push(err);
+      }
+   }
+
+   fn into_result(self) -> Result<()> {
+      match self.errors.len() {
+         0 => Ok(()),
+         1 => Err(self.errors.into_iter().next().expect("one error")),
+         _ => Err(Error::TransactionCleanupFailed(self.errors)),
+      }
+   }
+}
+
 /// Global state tracking all active interruptible transactions.
 ///
 /// Enforces one interruptible transaction per database path and applies a configurable
@@ -369,7 +421,7 @@ impl ActiveInterruptibleTransactions {
       }
    }
 
-   pub async fn abort_all(&self) {
+   pub async fn abort_all(&self) -> Result<()> {
       // Drain under the lock, then release it before awaiting rollbacks so we
       // don't hold the mutex across a chain of awaits.
       let drained: Vec<(String, ActiveInterruptibleTransaction)> = {
@@ -378,6 +430,7 @@ impl ActiveInterruptibleTransactions {
          txs.drain().collect()
       };
 
+      let mut cleanup_errors = CleanupErrors::new();
       for (db_path, tx) in drained {
          debug!(
             "Rolling back interruptible transaction for database: {}",
@@ -385,8 +438,29 @@ impl ActiveInterruptibleTransactions {
          );
          if let Err(err) = tx.rollback().await {
             warn!("rollback during abort_all failed (db: {db_path}): {err}");
+            cleanup_errors.push(err);
          }
       }
+
+      cleanup_errors.into_result()
+   }
+
+   /// Roll back and remove the interruptible transaction for a single database, if any.
+   pub async fn abort_for_db(&self, db_key: &str) -> Result<()> {
+      let maybe_tx = {
+         let mut txs = self.inner.lock().await;
+         txs.remove(db_key)
+      };
+
+      if let Some(tx) = maybe_tx {
+         debug!(
+            "Rolling back interruptible transaction for database: {}",
+            db_key
+         );
+         tx.rollback().await?;
+      }
+
+      Ok(())
    }
 
    /// Remove and return transaction for commit/rollback.
@@ -433,33 +507,84 @@ impl ActiveInterruptibleTransactions {
    }
 }
 
+/// A single in-flight regular transaction tracked for cleanup on close.
+struct TrackedRegularTransaction {
+   db_key: String,
+   handle: JoinHandle<()>,
+}
+
 /// Tracking for regular (non-pausable) transactions that are in-flight.
 ///
-/// Holds abort handles so transactions can be cancelled on app exit.
+/// Holds join handles so transactions can be cancelled and awaited on close.
 #[derive(Clone, Default)]
-pub struct ActiveRegularTransactions(Arc<RwLock<HashMap<String, AbortHandle>>>);
+pub struct ActiveRegularTransactions(Arc<RwLock<HashMap<String, TrackedRegularTransaction>>>);
+
+async fn abort_and_await_regular_handles(handles: Vec<(String, JoinHandle<()>)>) -> Result<()> {
+   let mut cleanup_errors = CleanupErrors::new();
+
+   for (tx_id, handle) in handles {
+      debug!("Aborting regular transaction: {}", tx_id);
+      handle.abort();
+      match handle.await {
+         Ok(()) => {}
+         Err(e) if e.is_cancelled() => {}
+         Err(e) => {
+            let err = Error::Other(format!("regular transaction task panicked: {e}"));
+            warn!("abort during close failed (tx: {tx_id}): {err}");
+            cleanup_errors.push(err);
+         }
+      }
+   }
+
+   cleanup_errors.into_result()
+}
 
 impl ActiveRegularTransactions {
-   pub async fn insert(&self, key: String, abort_handle: AbortHandle) {
+   pub async fn insert(&self, db_key: String, tx_id: String, handle: JoinHandle<()>) {
       let mut txs = self.0.write().await;
-      txs.insert(key, abort_handle);
+      txs.insert(tx_id, TrackedRegularTransaction { db_key, handle });
    }
 
-   pub async fn remove(&self, key: &str) {
+   pub async fn remove(&self, tx_id: &str) {
       let mut txs = self.0.write().await;
-      txs.remove(key);
+      txs.remove(tx_id);
    }
 
-   pub async fn abort_all(&self) {
+   /// Remove and return a tracked handle so the caller can await task completion.
+   pub async fn take_handle(&self, tx_id: &str) -> Option<JoinHandle<()>> {
       let mut txs = self.0.write().await;
-      debug!("Aborting {} active regular transaction(s)", txs.len());
+      txs.remove(tx_id).map(|tracked| tracked.handle)
+   }
 
-      for (key, abort_handle) in txs.iter() {
-         debug!("Aborting regular transaction: {}", key);
-         abort_handle.abort();
-      }
+   pub async fn abort_all(&self) -> Result<()> {
+      let handles: Vec<(String, JoinHandle<()>)> = {
+         let mut txs = self.0.write().await;
+         debug!("Aborting {} active regular transaction(s)", txs.len());
+         txs.drain()
+            .map(|(tx_id, tracked)| (tx_id, tracked.handle))
+            .collect()
+      };
 
-      txs.clear();
+      abort_and_await_regular_handles(handles).await
+   }
+
+   /// Abort in-flight regular transactions for a single database.
+   pub async fn abort_for_db(&self, db_key: &str) -> Result<()> {
+      let handles: Vec<(String, JoinHandle<()>)> = {
+         let mut txs = self.0.write().await;
+         let keys_to_remove: Vec<String> = txs
+            .iter()
+            .filter(|(_, tracked)| tracked.db_key == db_key)
+            .map(|(tx_id, _)| tx_id.clone())
+            .collect();
+
+         keys_to_remove
+            .into_iter()
+            .filter_map(|tx_id| txs.remove(&tx_id).map(|tracked| (tx_id, tracked.handle)))
+            .collect()
+      };
+
+      abort_and_await_regular_handles(handles).await
    }
 }
 
@@ -467,11 +592,206 @@ impl ActiveRegularTransactions {
 pub async fn cleanup_all_transactions(
    interruptible: &ActiveInterruptibleTransactions,
    regular: &ActiveRegularTransactions,
-) {
+) -> Result<()> {
    debug!("Cleaning up all active transactions");
 
-   interruptible.abort_all().await;
-   regular.abort_all().await;
+   let mut cleanup_errors = CleanupErrors::new();
+   cleanup_errors.push_result(interruptible.abort_all().await);
+   cleanup_errors.push_result(regular.abort_all().await);
 
-   debug!("Transaction cleanup initiated");
+   debug!("Transaction cleanup complete");
+
+   cleanup_errors.into_result()
+}
+
+pub async fn cleanup_transactions_for_db(
+   db_key: &str,
+   interruptible_txs: &ActiveInterruptibleTransactions,
+   regular_txs: &ActiveRegularTransactions,
+) -> Result<()> {
+   let mut cleanup_errors = CleanupErrors::new();
+   cleanup_errors.push_result(interruptible_txs.abort_for_db(db_key).await);
+   cleanup_errors.push_result(regular_txs.abort_for_db(db_key).await);
+   cleanup_errors.into_result()
+}
+
+#[cfg(test)]
+mod abort_error_tests {
+   use super::*;
+   use crate::DatabaseWrapper;
+   use serde_json::json;
+
+   async fn begin_test_transaction(
+      db: &DatabaseWrapper,
+      db_path: &str,
+   ) -> ActiveInterruptibleTransaction {
+      let guard = db.acquire_writer().await.unwrap();
+      let mut writer = TransactionWriter::from(guard);
+      writer.begin_immediate().await.unwrap();
+      ActiveInterruptibleTransaction::new(
+         db_path.to_string(),
+         uuid::Uuid::new_v4().to_string(),
+         writer,
+      )
+   }
+
+   #[tokio::test]
+   async fn test_abort_for_db_propagates_rollback_failure() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = temp_dir.path().join("fail.db");
+      let db = DatabaseWrapper::connect(&db_path, None).await.unwrap();
+      db.execute(
+         "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)".into(),
+         vec![],
+      )
+      .await
+      .unwrap();
+
+      let state = ActiveInterruptibleTransactions::default();
+      let mut tx = begin_test_transaction(&db, "fail.db").await;
+      tx.continue_with(vec![(
+         "INSERT INTO t (val) VALUES (?)",
+         vec![json!("uncommitted")],
+      )])
+      .await
+      .unwrap();
+      let tx = tx.force_rollback_failure_for_test();
+      state.insert("fail.db".into(), tx).await.unwrap();
+
+      let err = state.abort_for_db("fail.db").await.unwrap_err();
+      assert!(err.to_string().contains("forced rollback failure"));
+   }
+
+   #[tokio::test]
+   async fn test_abort_all_propagates_rollback_failure() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = temp_dir.path().join("fail-all.db");
+      let db = DatabaseWrapper::connect(&db_path, None).await.unwrap();
+      db.execute(
+         "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)".into(),
+         vec![],
+      )
+      .await
+      .unwrap();
+
+      let state = ActiveInterruptibleTransactions::default();
+      let mut tx = begin_test_transaction(&db, "fail-all.db").await;
+      tx.continue_with(vec![(
+         "INSERT INTO t (val) VALUES (?)",
+         vec![json!("uncommitted")],
+      )])
+      .await
+      .unwrap();
+      let tx = tx.force_rollback_failure_for_test();
+      state.insert("fail-all.db".into(), tx).await.unwrap();
+
+      let err = state.abort_all().await.unwrap_err();
+      assert!(err.to_string().contains("forced rollback failure"));
+   }
+
+   #[tokio::test]
+   async fn test_abort_all_attempts_all_rollbacks_before_returning_error() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path1 = temp_dir.path().join("fail-first.db");
+      let db_path2 = temp_dir.path().join("fail-second.db");
+      let db1 = DatabaseWrapper::connect(&db_path1, None).await.unwrap();
+      let db2 = DatabaseWrapper::connect(&db_path2, None).await.unwrap();
+      for db in [&db1, &db2] {
+         db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)".into(),
+            vec![],
+         )
+         .await
+         .unwrap();
+      }
+
+      let state = ActiveInterruptibleTransactions::default();
+
+      let mut tx1 = begin_test_transaction(&db1, "first.db").await;
+      tx1.continue_with(vec![(
+         "INSERT INTO t (val) VALUES (?)",
+         vec![json!("first")],
+      )])
+      .await
+      .unwrap();
+      let tx1 = tx1.force_rollback_failure_for_test();
+      state.insert("first.db".into(), tx1).await.unwrap();
+
+      let mut tx2 = begin_test_transaction(&db2, "second.db").await;
+      tx2.continue_with(vec![(
+         "INSERT INTO t (val) VALUES (?)",
+         vec![json!("second")],
+      )])
+      .await
+      .unwrap();
+      state.insert("second.db".into(), tx2).await.unwrap();
+
+      let err = state.abort_all().await.unwrap_err();
+      assert!(err.to_string().contains("forced rollback failure"));
+
+      let rows = db2
+         .fetch_all("SELECT val FROM t".into(), vec![])
+         .await
+         .unwrap();
+      assert!(
+         rows.is_empty(),
+         "second transaction should still be rolled back after first rollback failed"
+      );
+   }
+
+   #[tokio::test]
+   async fn test_abort_all_returns_aggregate_error_for_multiple_failures() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path1 = temp_dir.path().join("aggregate-first.db");
+      let db_path2 = temp_dir.path().join("aggregate-second.db");
+      let db1 = DatabaseWrapper::connect(&db_path1, None).await.unwrap();
+      let db2 = DatabaseWrapper::connect(&db_path2, None).await.unwrap();
+      for db in [&db1, &db2] {
+         db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)".into(),
+            vec![],
+         )
+         .await
+         .unwrap();
+      }
+
+      let state = ActiveInterruptibleTransactions::default();
+
+      let mut tx1 = begin_test_transaction(&db1, "first.db").await;
+      tx1.continue_with(vec![(
+         "INSERT INTO t (val) VALUES (?)",
+         vec![json!("first")],
+      )])
+      .await
+      .unwrap();
+      let tx1 = tx1.force_rollback_failure_for_test();
+      state.insert("first.db".into(), tx1).await.unwrap();
+
+      let mut tx2 = begin_test_transaction(&db2, "second.db").await;
+      tx2.continue_with(vec![(
+         "INSERT INTO t (val) VALUES (?)",
+         vec![json!("second")],
+      )])
+      .await
+      .unwrap();
+      let tx2 = tx2.force_rollback_failure_for_test();
+      state.insert("second.db".into(), tx2).await.unwrap();
+
+      let err = state.abort_all().await.unwrap_err();
+      let cleanup_errors = err
+         .cleanup_errors()
+         .expect("multiple cleanup failures should return aggregate error");
+      assert_eq!(cleanup_errors.len(), 2);
+      assert!(
+         cleanup_errors[0]
+            .to_string()
+            .contains("forced rollback failure")
+      );
+      assert!(
+         cleanup_errors[1]
+            .to_string()
+            .contains("forced rollback failure")
+      );
+      assert_eq!(err.error_code(), "TRANSACTION_CLEANUP_FAILED");
+   }
 }

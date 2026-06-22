@@ -35,6 +35,26 @@ Databases must be registered on the Rust side with a stable key before they can 
 - Parent directory auto-creation during registration validation for file paths.
 - CI check that committed `api-iife.js` matches a fresh Rollup build.
 
+### Changed
+
+#### `close` aborts active transactions before closing
+
+`Database.close()` (IPC `plugin:sqlite|close`), `Database.close_all()` (IPC `plugin:sqlite|close_all`), and the Rust [`Connection::close`](src/lib.rs) API now roll back or cancel in-flight transactions before closing connection pools.
+
+- **Interruptible transactions** (`beginInterruptibleTransaction`): explicitly rolled back via `ROLLBACK` before the pool is closed.
+- **Regular transactions** (`executeTransaction`): the in-flight task is aborted and awaited so pooled connections are released before the pool closes.
+
+Previously, `close` only aborted active subscriptions; open transactions could block a clean shutdown or leave uncommitted work on pooled connections. The same cleanup logic is available to Rust callers through [`close_database`](src/lib.rs) and [`close_all_loaded_databases`](src/lib.rs).
+
+Transaction cleanup failures propagate as errors rather than being logged and ignored, so a successful close indicates the database file is safe to delete or recreate.
+
 ### Fixed
 
+- Regular transaction cleanup no longer uses string-prefix matching on database keys, which could abort transactions belonging to a different registered database when keys contain `:` (for example `:memory:` or `a` vs `a:b`).
+- Transaction cleanup attempts all rollbacks/aborts before returning, rather than stopping at the first failure.
+- `close` / `close_all` now attempt pool teardown even when transaction cleanup fails, avoiding a half-closed state where subscriptions are gone but the pool remains loaded.
+- `close` / `close_all` are bounded by a 5-second timeout.
+- Regular transactions cancelled by `close` now return `TRANSACTION_CANCELLED` instead of a generic "task dropped" error; task panics remain distinct.
+- Transaction cleanup now returns `TRANSACTION_CLEANUP_FAILED` with all collected errors when multiple rollbacks or aborts fail, instead of discarding earlier failures.
+- `load()` no longer hangs forever for databases registered without a migrator. Migration state is only tracked when a migrator is provided; otherwise `await_migrations` proceeds immediately.
 - Regenerated `api-iife.js` so all IPC calls use `dbKey` consistently.
