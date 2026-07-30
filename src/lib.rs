@@ -24,7 +24,7 @@ pub use sqlx_sqlite_toolkit::{
    TransactionExecutionBuilder, WriteQueryResult,
 };
 
-use crate::subscriptions::ActiveSubscriptions;
+use crate::subscriptions::{ActiveSubscriptions, ObserverRegistrations};
 
 /// Default maximum number of concurrently loaded databases.
 const DEFAULT_MAX_DATABASES: usize = 50;
@@ -533,6 +533,7 @@ impl<R: Runtime> Builder<R> {
             });
             app.manage(ActiveRegularTransactions::default());
             app.manage(subscriptions::ActiveSubscriptions::default());
+            app.manage(subscriptions::ObserverRegistrations::default());
 
             // Run the deferred setup hook (if any), merge with static registrations.
             // Paths are validated and canonicalized at registration time. Hook errors
@@ -627,6 +628,7 @@ impl<R: Runtime> Builder<R> {
                   let interruptible_txs_clone = app.state::<ActiveInterruptibleTransactions>().inner().clone();
                   let regular_txs_clone = app.state::<ActiveRegularTransactions>().inner().clone();
                   let active_subs_clone = app.state::<subscriptions::ActiveSubscriptions>().inner().clone();
+                  let observer_regs_clone = app.state::<subscriptions::ObserverRegistrations>().inner().clone();
 
                   // Run cleanup on the async runtime (without blocking the event loop),
                   // then trigger a programmatic exit when done. ExitGuard ensures
@@ -652,8 +654,10 @@ impl<R: Runtime> Builder<R> {
                                  warn!("Transaction cleanup failed during exit: {e}");
                               }
 
+                              // observer_regs_clone is cleared inside close_all_wrappers,
+                              // under the same db lock used to drain the instances map.
                               if let Err(e) =
-                                 close_all_wrappers(&instances_clone).await
+                                 close_all_wrappers(&instances_clone, &observer_regs_clone).await
                               {
                                  warn!("Error closing databases during exit: {e:?}");
                               }
@@ -688,6 +692,59 @@ impl<R: Runtime> Builder<R> {
                         warn!("Exit event: could not check database state (lock held - cleanup may still be in progress)");
                      }
                   }
+               }
+               // A window closing without ever calling unobserve() would otherwise
+               // leak its observer registration(s) forever, keeping affected
+               // brokers alive with no one left listening (the "phantom
+               // registration" gap from the #54 review). The webview label
+               // matches the window label for a `WebviewWindow` (the shape this
+               // whole design targets); a window hosting multiple independent
+               // webviews with distinct labels would need each webview's own
+               // Destroyed/close event, which this single window-level hook does
+               // not cover. Labels are also reusable across a window's lifetime:
+               // a window later recreated with the same static label silently
+               // "inherits" any registration left behind here - harmless for a
+               // fixed label, but worth knowing for dynamically labeled windows.
+               RunEvent::WindowEvent {
+                  label,
+                  event: tauri::WindowEvent::Destroyed,
+                  ..
+               } => {
+                  let observer_regs = app.state::<subscriptions::ObserverRegistrations>().inner().clone();
+                  let active_subs = app.state::<subscriptions::ActiveSubscriptions>().inner().clone();
+                  let db_instances = app.state::<DbInstances>().inner().clone();
+                  let label = label.clone();
+
+                  tauri::async_runtime::spawn(async move {
+                     // Lock order: db_instances write lock, then
+                     // observer_regs (same order as observe()/unobserve()
+                     // and close_database_inner - see the module doc in
+                     // src/commands.rs). Held across the whole
+                     // release+disable sequence: a concurrent observe() must
+                     // not be able to register into a broker in the window
+                     // between "registrations released" and "broker actually
+                     // disabled" below.
+                     let mut instances = db_instances.write().await;
+                     let newly_unobserved = observer_regs
+                        .release_all_for_label(&mut instances, &label)
+                        .await;
+                     if newly_unobserved.is_empty() {
+                        return;
+                     }
+
+                     debug!(
+                        "Window '{}' destroyed - tearing down observation for {} database(s) with no remaining observers",
+                        label,
+                        newly_unobserved.len()
+                     );
+
+                     for db_key in newly_unobserved {
+                        active_subs.remove_for_db(&db_key).await;
+                        if let Some(wrapper) = instances.get_mut(&db_key) {
+                           wrapper.disable_observation();
+                        }
+                     }
+                  });
                }
                _ => {
                   // Other events don't require action
@@ -938,6 +995,9 @@ impl<R: Runtime> Connection<R> for AppHandle<R> {
       let subs = self
          .try_state::<ActiveSubscriptions>()
          .ok_or(Error::MissingState("ActiveSubscriptions".into()))?;
+      let observer_regs = self
+         .try_state::<ObserverRegistrations>()
+         .ok_or(Error::MissingState("ObserverRegistrations".into()))?;
       let interruptible_txs =
          self
             .try_state::<ActiveInterruptibleTransactions>()
@@ -951,6 +1011,7 @@ impl<R: Runtime> Connection<R> for AppHandle<R> {
          database_key,
          &instances,
          &subs,
+         &observer_regs,
          &interruptible_txs,
          &regular_txs,
       )
@@ -1065,6 +1126,7 @@ pub(crate) async fn close_database(
    db_key: &str,
    db_instances: &DbInstances,
    active_subs: &ActiveSubscriptions,
+   observer_regs: &ObserverRegistrations,
    interruptible_txs: &ActiveInterruptibleTransactions,
    regular_txs: &ActiveRegularTransactions,
 ) -> Result<bool> {
@@ -1075,6 +1137,7 @@ pub(crate) async fn close_database(
          &db_key,
          db_instances,
          active_subs,
+         observer_regs,
          interruptible_txs,
          regular_txs,
       ),
@@ -1095,6 +1158,7 @@ async fn close_database_inner(
    db_key: &str,
    db_instances: &DbInstances,
    active_subs: &ActiveSubscriptions,
+   observer_regs: &ObserverRegistrations,
    interruptible_txs: &ActiveInterruptibleTransactions,
    regular_txs: &ActiveRegularTransactions,
 ) -> Result<bool> {
@@ -1108,8 +1172,21 @@ async fn close_database_inner(
       last_error = Some(err.into());
    }
 
-   let mut instances = db_instances.inner.write().await;
+   // Lock order: db_instances write lock, then observer_regs - same order as
+   // observe()/unobserve() (see the module doc in src/commands.rs), and for the
+   // same reason: clearing registrations while STILL holding the db lock (not
+   // before, and not after dropping it) prevents a concurrent observe() from
+   // registering into - and enabling observation on - this wrapper in the
+   // window between "registrations cleared" and "wrapper actually removed
+   // below". Without this, that race would leave a phantom registration for a
+   // wrapper that's about to be destroyed, i.e. reintroducing the exact
+   // problem this whole feature exists to prevent, for the close() path.
+   let mut instances = db_instances.write().await;
    let wrapper = instances.remove(db_key);
+   // Observation is torn down unconditionally on a full close, regardless of how
+   // many windows had registered via observe() - a closed database has no live
+   // broker for anyone to observe.
+   observer_regs.clear_for_db(&mut instances, db_key).await;
    drop(instances);
 
    let was_loaded = wrapper.is_some();
@@ -1125,9 +1202,17 @@ async fn close_database_inner(
    }
 }
 
-async fn close_all_wrappers(db_instances: &DbInstances) -> Result<()> {
-   let mut instances = db_instances.inner.write().await;
+/// Drains and closes every loaded database, clearing their observer
+/// registrations under the same db lock (see `close_database_inner` for why
+/// `observer_regs` must be touched while still holding `db_instances`'s lock,
+/// not before or after).
+async fn close_all_wrappers(
+   db_instances: &DbInstances,
+   observer_regs: &ObserverRegistrations,
+) -> Result<()> {
+   let mut instances = db_instances.write().await;
    let wrappers: Vec<DatabaseWrapper> = instances.drain().map(|(_, v)| v).collect();
+   observer_regs.clear_all(&mut instances).await;
    drop(instances);
 
    let mut last_error: Option<Error> = None;
@@ -1148,12 +1233,19 @@ async fn close_all_wrappers(db_instances: &DbInstances) -> Result<()> {
 pub(crate) async fn close_all_loaded_databases(
    db_instances: &DbInstances,
    active_subs: &ActiveSubscriptions,
+   observer_regs: &ObserverRegistrations,
    interruptible_txs: &ActiveInterruptibleTransactions,
    regular_txs: &ActiveRegularTransactions,
 ) -> Result<()> {
    let close_result = tokio::time::timeout(
       CLOSE_TIMEOUT,
-      close_all_loaded_databases_inner(db_instances, active_subs, interruptible_txs, regular_txs),
+      close_all_loaded_databases_inner(
+         db_instances,
+         active_subs,
+         observer_regs,
+         interruptible_txs,
+         regular_txs,
+      ),
    )
    .await;
 
@@ -1169,6 +1261,7 @@ pub(crate) async fn close_all_loaded_databases(
 async fn close_all_loaded_databases_inner(
    db_instances: &DbInstances,
    active_subs: &ActiveSubscriptions,
+   observer_regs: &ObserverRegistrations,
    interruptible_txs: &ActiveInterruptibleTransactions,
    regular_txs: &ActiveRegularTransactions,
 ) -> Result<()> {
@@ -1182,7 +1275,9 @@ async fn close_all_loaded_databases_inner(
       last_error = Some(err.into());
    }
 
-   if let Err(err) = close_all_wrappers(db_instances).await {
+   // observer_regs is cleared inside close_all_wrappers, under the same db
+   // lock used to drain the instances map - see its doc comment.
+   if let Err(err) = close_all_wrappers(db_instances, observer_regs).await {
       last_error = Some(err);
    }
 
@@ -1212,6 +1307,7 @@ fn resolve_database_path<R: Runtime>(db_key: &str, app: &AppHandle<R>) -> Result
 mod tests {
    use super::*;
    use crate::commands;
+   use crate::subscriptions::ObserverConfigParams;
    use std::collections::HashMap;
    use tauri::plugin::Plugin;
    use tauri::test::{MockRuntime, mock_app, mock_builder, mock_context, noop_assets};
@@ -1698,6 +1794,7 @@ mod tests {
          let closed = commands::close(
             app.state::<DbInstances>(),
             app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
             app.state::<ActiveInterruptibleTransactions>(),
             app.state::<ActiveRegularTransactions>(),
             "MAIN".to_string(),
@@ -1755,6 +1852,7 @@ mod tests {
          let closed = commands::close(
             app.state::<DbInstances>(),
             app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
             app.state::<ActiveInterruptibleTransactions>(),
             app.state::<ActiveRegularTransactions>(),
             "MAIN".to_string(),
@@ -1839,6 +1937,7 @@ mod tests {
          commands::close_all(
             app.state::<DbInstances>(),
             app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
             app.state::<ActiveInterruptibleTransactions>(),
             app.state::<ActiveRegularTransactions>(),
          )
@@ -1919,6 +2018,7 @@ mod tests {
          let closed = commands::close(
             app.state::<DbInstances>(),
             app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
             app.state::<ActiveInterruptibleTransactions>(),
             app.state::<ActiveRegularTransactions>(),
             "MAIN".to_string(),
@@ -1969,6 +2069,121 @@ mod tests {
       });
    }
 
+   /// Regression test for the app-wide freeze fixed alongside `remove()`
+   /// holding `db_instances`'s write lock across `wrapper.remove()`: an
+   /// abandoned interruptible transaction on the database being removed must
+   /// not stall operations on a *different*, unrelated loaded database, and
+   /// `remove()` itself must not hang forever waiting on a connection it is
+   /// itself holding.
+   ///
+   /// Before the fix, `wrapper.remove()`'s `Pool::close()` (no timeout of its
+   /// own) waited forever for the write connection an abandoned interruptible
+   /// transaction had checked out - `ActiveInterruptibleTransactions` only
+   /// reaps an abandoned transaction lazily, so nothing else was ever going
+   /// to release it. Because `db_instances`'s write lock is a single lock
+   /// shared by every loaded database, not one per key, that indefinite wait
+   /// blocked *every* database, not just the one being removed.
+   ///
+   /// Both assertions below are bounded well under `CLOSE_TIMEOUT` (5s) so
+   /// this test fails fast, rather than hanging the test binary, if either
+   /// half of the fix (transaction cleanup before teardown, or the
+   /// `CLOSE_TIMEOUT` wrap around the whole operation) regresses.
+   ///
+   /// What this does *not* prove: with the fix in place, `remove()`'s
+   /// critical section is fast enough (cleanup happens before the db lock is
+   /// even taken) that this test cannot reliably force the OTHER-database
+   /// query to land *inside* the brief window `remove()` still holds the
+   /// lock. That's fine for detecting a regression - in a reverted build the
+   /// lock is held for seconds, not microseconds, so the bounded query below
+   /// would time out regardless of exact scheduling - but it means a passing
+   /// run here doesn't demonstrate true concurrent interleaving on the fixed
+   /// code path, only that neither operation is ever left waiting past its
+   /// bound.
+   #[test]
+   fn test_remove_with_abandoned_transaction_does_not_stall_other_database() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let main_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let other_path = validate::validate_database_path(temp_dir.path().join("other.db")).unwrap();
+
+      tauri::async_runtime::block_on(async {
+         let app = tokio::task::spawn_blocking(move || {
+            init_app_with_main_and_other(main_path, other_path)
+         })
+         .await
+         .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+         load_and_create_test_table(&app, "OTHER").await;
+
+         // Begin an interruptible transaction on MAIN and never continue,
+         // commit, or roll it back. This checks the write connection out of
+         // MAIN's pool for good unless something reclaims it - here,
+         // `remove()`'s own cleanup.
+         commands::begin_interruptible_transaction(
+            app.state::<DbInstances>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            "MAIN".to_string(),
+            vec![Statement {
+               query: "INSERT INTO test (val) VALUES (?)".to_string(),
+               values: vec![serde_json::json!("abandoned")],
+            }],
+            None,
+         )
+         .await
+         .expect("begin MAIN interruptible transaction should succeed");
+
+         let app_for_remove = app.handle().clone();
+         let remove_task = tokio::spawn(async move {
+            commands::remove(
+               app_for_remove.state::<DbInstances>(),
+               app_for_remove.state::<ActiveSubscriptions>(),
+               app_for_remove.state::<ObserverRegistrations>(),
+               app_for_remove.state::<ActiveInterruptibleTransactions>(),
+               app_for_remove.state::<ActiveRegularTransactions>(),
+               "MAIN".to_string(),
+            )
+            .await
+         });
+
+         // Give the spawned remove() a chance to be scheduled and start
+         // running before we race it with the OTHER-database query below -
+         // mirrors the same dance in
+         // `test_execute_transaction_returns_cancelled_when_database_closed`.
+         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+         let other_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            commands::execute(
+               app.state::<DbInstances>(),
+               "OTHER".to_string(),
+               "INSERT INTO test (val) VALUES ('unaffected')".to_string(),
+               vec![],
+               None,
+            ),
+         )
+         .await;
+
+         assert!(
+            other_result.is_ok(),
+            "a query on an unrelated database must not be blocked by remove() cleaning up \
+             an abandoned transaction on a different database"
+         );
+         other_result
+            .unwrap()
+            .expect("OTHER query should succeed while MAIN is being removed");
+
+         let removed = tokio::time::timeout(std::time::Duration::from_secs(2), remove_task)
+            .await
+            .expect(
+               "remove() must not hang forever on an abandoned transaction - it should finish \
+                well within its own CLOSE_TIMEOUT",
+            )
+            .expect("remove task should not panic")
+            .expect("remove() should succeed once the abandoned transaction is cleaned up");
+         assert!(removed, "MAIN was loaded and should have been removed");
+      });
+   }
+
    #[test]
    fn test_execute_transaction_returns_cancelled_when_database_closed() {
       let temp_dir = tempfile::tempdir().unwrap();
@@ -2008,6 +2223,7 @@ mod tests {
          commands::close(
             app.state::<DbInstances>(),
             app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
             app.state::<ActiveInterruptibleTransactions>(),
             app.state::<ActiveRegularTransactions>(),
             "MAIN".to_string(),
@@ -2021,6 +2237,1382 @@ mod tests {
             Error::Toolkit(sqlx_sqlite_toolkit::Error::TransactionCancelled(_))
          ));
          assert!(err.to_string().contains("transaction cancelled"));
+      });
+   }
+
+   /// Returns whether observation is currently enabled for `db_key`.
+   async fn is_observing(app: &tauri::App<MockRuntime>, db_key: &str) -> bool {
+      app.state::<DbInstances>()
+         .inner()
+         .inner
+         .read()
+         .await
+         .get(db_key)
+         .expect("database should be loaded")
+         .is_observing()
+   }
+
+   /// Polls `db_instances`'s write lock via `try_write()` until some other
+   /// task is holding it (i.e. our own `try_write()` starts failing), instead
+   /// of assuming a fixed sleep gave a spawned task enough time to reach the
+   /// point of contention.
+   ///
+   /// Used by the deterministic lock-order tests below: without this, a fixed
+   /// sleep followed by a single timed acquisition attempt is a CI flake risk.
+   /// If task scheduling is slow enough that the spawned command hasn't taken
+   /// the db lock yet by the time the sleep ends, the acquisition attempt
+   /// succeeds (there's nothing contending it yet) and the test fails for a
+   /// reason that has nothing to do with the invariant it's guarding.
+   /// Polling for the *first sign* of contention, with a
+   /// generous overall budget, turns "was the task scheduled fast enough"
+   /// from a pass/fail race into something we simply wait out.
+   async fn wait_until_db_instances_write_contended(
+      app: &tauri::App<MockRuntime>,
+      budget: std::time::Duration,
+   ) {
+      let deadline = std::time::Instant::now() + budget;
+      loop {
+         if app
+            .state::<DbInstances>()
+            .inner()
+            .inner
+            .try_write()
+            .is_err()
+         {
+            return;
+         }
+         assert!(
+            std::time::Instant::now() < deadline,
+            "db_instances write lock was never observed to be contended within {budget:?} - \
+             the command under test may not have started, or may not be taking the lock at all"
+         );
+         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+      }
+   }
+
+   /// Regression test for issue #54: re-calling `observe()` (from the same or a
+   /// different window) must not tear down subscriptions that were already active.
+   /// A subscriber created before a second `observe()` call - with a *different*
+   /// table set - must still receive events published after that second call.
+   #[test]
+   fn test_observe_reenable_with_different_tables_preserves_existing_subscriber() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+         commands::execute(
+            app.state::<DbInstances>(),
+            "MAIN".to_string(),
+            "CREATE TABLE other (id INTEGER PRIMARY KEY, val TEXT)".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .expect("create other table should succeed");
+
+         let webview = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("first observe should succeed");
+
+         let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+         let channel = tauri::ipc::Channel::new(move |body| {
+            let value: serde_json::Value = body
+               .deserialize()
+               .expect("payload should deserialize as JSON");
+            tx.send(value).ok();
+            Ok(())
+         });
+
+         commands::subscribe(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            channel,
+         )
+         .await
+         .expect("subscribe should succeed");
+
+         // Re-observe with a DIFFERENT table set. Under the old (destructive)
+         // behavior, this would drop the broker and silently end the
+         // subscription created above.
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["other".to_string()],
+            None,
+         )
+         .await
+         .expect("second observe should succeed");
+
+         commands::execute(
+            app.state::<DbInstances>(),
+            "MAIN".to_string(),
+            "INSERT INTO test (val) VALUES ('hello')".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .expect("insert should succeed");
+
+         let received = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_millis(500))
+         })
+         .await
+         .expect("blocking recv task should not panic");
+
+         let payload =
+            received.expect("subscriber should still receive events after the second observe()");
+         assert_eq!(payload["event"], "change");
+         assert_eq!(payload["data"]["table"], "test");
+      });
+   }
+
+   /// Refcount teardown boundary: the broker stays live while at least one
+   /// window is registered as an observer, and is only torn down once the last
+   /// registered window releases via `unobserve()`. A non-final `unobserve()`
+   /// must leave every other window's subscriptions running untouched (#54);
+   /// only the final `unobserve()` - the one that drops the refcount to zero -
+   /// aborts them.
+   #[test]
+   fn test_unobserve_refcount_teardown_boundary() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window A should build");
+         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
+            .build()
+            .expect("webview window B should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("window A observe should succeed");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_b.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("window B observe should succeed");
+
+         assert!(
+            is_observing(&app, "MAIN").await,
+            "broker should be live with two registered observers"
+         );
+
+         // Window A subscribes before releasing its observer registration, so
+         // window A's own (non-final) unobserve() below can be checked for not
+         // aborting a subscription that isn't its own to tear down.
+         let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+         let channel = tauri::ipc::Channel::new(move |body| {
+            let value: serde_json::Value = body
+               .deserialize()
+               .expect("payload should deserialize as JSON");
+            tx.send(value).ok();
+            Ok(())
+         });
+
+         commands::subscribe(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            channel,
+         )
+         .await
+         .expect("subscribe on window A should succeed");
+
+         commands::unobserve(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+         )
+         .await
+         .expect("window A unobserve should succeed");
+
+         assert!(
+            is_observing(&app, "MAIN").await,
+            "broker should stay live while window B is still registered (rc=1)"
+         );
+
+         // Timing-free: catches a non-final unobserve() aborting subscriptions
+         // it doesn't own (moving/duplicating the `remove_for_db` call above
+         // the `remaining > 0` early return - see #54).
+         assert_eq!(
+            app.state::<ActiveSubscriptions>()
+               .count_for_db("MAIN")
+               .await,
+            1,
+            "a non-final unobserve() must not abort another window's subscription (#54)"
+         );
+
+         // Real round-trip: the only thing proving events still actually flow
+         // to the surviving subscription after window A's unobserve().
+         commands::execute(
+            app.state::<DbInstances>(),
+            "MAIN".to_string(),
+            "INSERT INTO test (val) VALUES ('hello')".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .expect("insert should succeed");
+
+         let received =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(2)))
+               .await
+               .expect("blocking recv task should not panic");
+
+         let payload = received
+            .expect("subscription should still receive events after a non-final unobserve()");
+         assert_eq!(payload["event"], "change");
+         assert_eq!(payload["data"]["table"], "test");
+
+         commands::unobserve(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview_b.as_ref().clone(),
+            "MAIN".to_string(),
+         )
+         .await
+         .expect("window B unobserve should succeed");
+
+         assert!(
+            !is_observing(&app, "MAIN").await,
+            "broker should be torn down once the last observer releases (rc=0)"
+         );
+
+         // Catches deleting the `remove_for_db` call entirely: without it,
+         // nothing asserts the final unobserve() aborts subscriptions. Not
+         // deterministic, though: subscribe()'s own forwarding task self-reaps
+         // its `active_subs` entry once its stream ends (see the reap comment
+         // in `commands::subscribe`), and tearing down the broker here also
+         // ends that stream - so the self-reaper can independently drive this
+         // count to 0 even with `remove_for_db` deleted, racing the assertion
+         // below. Measured detection of that mutation: 9 of 10 runs.
+         assert_eq!(
+            app.state::<ActiveSubscriptions>()
+               .count_for_db("MAIN")
+               .await,
+            0,
+            "the last unobserve() must abort remaining subscriptions"
+         );
+      });
+   }
+
+   /// A second window's explicit `captureValues` request that conflicts with
+   /// the value already active for a database must be rejected with
+   /// `OBSERVATION_CONFIG_CONFLICT`, without mutating the live broker or
+   /// recording that window's registration - the check must return before
+   /// `register()` runs.
+   #[test]
+   fn test_observe_conflicting_capture_values_rejected() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window A should build");
+         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
+            .build()
+            .expect("webview window B should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("window A observe with default config should succeed");
+
+         let err = commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_b.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            Some(ObserverConfigParams {
+               channel_capacity: None,
+               capture_values: Some(false),
+            }),
+         )
+         .await
+         .expect_err("conflicting captureValues should be rejected");
+
+         assert!(matches!(err, Error::ObservationConfigConflict(_)));
+
+         let (capacity, capture) = {
+            let instances = app.state::<DbInstances>().inner().inner.read().await;
+            let observable = instances
+               .get("MAIN")
+               .expect("MAIN should be loaded")
+               .observable()
+               .expect("observation should be enabled");
+            (
+               observable.broker().channel_capacity(),
+               observable.broker().capture_values(),
+            )
+         };
+         assert_eq!(
+            capacity, 256,
+            "the live broker's channelCapacity must be unchanged by a rejected observe()"
+         );
+         assert!(
+            capture,
+            "the live broker's captureValues must be unchanged by a rejected observe()"
+         );
+
+         assert!(
+            !app
+               .state::<ObserverRegistrations>()
+               .is_registered("MAIN", webview_b.label())
+               .await,
+            "window B's registration must not be recorded when its observe() is rejected"
+         );
+      });
+   }
+
+   /// Same as `test_observe_conflicting_capture_values_rejected`, but for a
+   /// conflicting `channelCapacity` request.
+   #[test]
+   fn test_observe_conflicting_channel_capacity_rejected() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window A should build");
+         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
+            .build()
+            .expect("webview window B should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("window A observe with default config should succeed");
+
+         let err = commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_b.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            Some(ObserverConfigParams {
+               channel_capacity: Some(512),
+               capture_values: None,
+            }),
+         )
+         .await
+         .expect_err("conflicting channelCapacity should be rejected");
+
+         assert!(matches!(err, Error::ObservationConfigConflict(_)));
+
+         let (capacity, capture) = {
+            let instances = app.state::<DbInstances>().inner().inner.read().await;
+            let observable = instances
+               .get("MAIN")
+               .expect("MAIN should be loaded")
+               .observable()
+               .expect("observation should be enabled");
+            (
+               observable.broker().channel_capacity(),
+               observable.broker().capture_values(),
+            )
+         };
+         assert_eq!(
+            capacity, 256,
+            "the live broker's channelCapacity must be unchanged by a rejected observe()"
+         );
+         assert!(
+            capture,
+            "the live broker's captureValues must be unchanged by a rejected observe()"
+         );
+
+         assert!(
+            !app
+               .state::<ObserverRegistrations>()
+               .is_registered("MAIN", webview_b.label())
+               .await,
+            "window B's registration must not be recorded when its observe() is rejected"
+         );
+      });
+   }
+
+   /// An explicit config that matches the live broker's already-active values
+   /// exactly is not a conflict and must succeed.
+   #[test]
+   fn test_observe_identical_explicit_config_succeeds() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window A should build");
+         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
+            .build()
+            .expect("webview window B should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("window A observe with default config should succeed");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_b.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            Some(ObserverConfigParams {
+               channel_capacity: Some(256),
+               capture_values: Some(true),
+            }),
+         )
+         .await
+         .expect("explicit config identical to the live broker's values should succeed");
+
+         assert!(
+            app.state::<ObserverRegistrations>()
+               .is_registered("MAIN", webview_b.label())
+               .await,
+            "window B's registration must be recorded once its observe() succeeds"
+         );
+      });
+   }
+
+   /// Guards the `seeded` block in `observe()`: once window A has enabled
+   /// observation with a non-default explicit config, a second window calling
+   /// `observe()` with `config: None` must succeed - its defaults must never be
+   /// compared against the live broker's (already non-default) values as if
+   /// they were an explicit, conflicting request.
+   #[test]
+   fn test_observe_omitted_config_after_explicit_config_succeeds() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window A should build");
+         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
+            .build()
+            .expect("webview window B should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            Some(ObserverConfigParams {
+               channel_capacity: Some(512),
+               capture_values: Some(false),
+            }),
+         )
+         .await
+         .expect("window A observe with explicit non-default config should succeed");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_b.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("window B observe with config: None should succeed");
+
+         assert!(
+            app.state::<ObserverRegistrations>()
+               .is_registered("MAIN", webview_b.label())
+               .await,
+            "window B's registration must be recorded once its observe() succeeds"
+         );
+      });
+   }
+
+   /// `subscribe()` must reject a window that never called `observe()` for
+   /// `db_key` itself with `OBSERVATION_NOT_ENABLED`, even while another
+   /// window's registration keeps a broker active for that database (#54),
+   /// and must not disturb that other window's already-established
+   /// subscription.
+   #[test]
+   fn test_subscribe_without_observe_rejected() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window A should build");
+         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
+            .build()
+            .expect("webview window B should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("window A observe should succeed");
+
+         let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+         let channel = tauri::ipc::Channel::new(move |body| {
+            let value: serde_json::Value = body
+               .deserialize()
+               .expect("payload should deserialize as JSON");
+            tx.send(value).ok();
+            Ok(())
+         });
+
+         commands::subscribe(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview_a.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            channel,
+         )
+         .await
+         .expect("subscribe on window A, which observed, should succeed");
+
+         // Window B never called observe() - the broker is only live because
+         // of window A's registration.
+         let (tx_b, _rx_b) = std::sync::mpsc::channel::<serde_json::Value>();
+         let channel_b = tauri::ipc::Channel::new(move |body| {
+            let value: serde_json::Value = body
+               .deserialize()
+               .expect("payload should deserialize as JSON");
+            tx_b.send(value).ok();
+            Ok(())
+         });
+
+         let err = commands::subscribe(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview_b.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            channel_b,
+         )
+         .await
+         .expect_err("subscribe from a window that never observed should be rejected");
+
+         assert!(matches!(err, Error::ObservationNotEnabled(_)));
+
+         assert_eq!(
+            app.state::<ActiveSubscriptions>()
+               .count_for_db("MAIN")
+               .await,
+            1,
+            "window A's subscription must be unaffected by window B's rejected subscribe()"
+         );
+
+         commands::execute(
+            app.state::<DbInstances>(),
+            "MAIN".to_string(),
+            "INSERT INTO test (val) VALUES ('hello')".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .expect("insert should succeed");
+
+         let received =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(2)))
+               .await
+               .expect("blocking recv task should not panic");
+
+         let payload = received
+            .expect("window A's subscription should still receive events after window B's rejected subscribe()");
+         assert_eq!(payload["event"], "change");
+         assert_eq!(payload["data"]["table"], "test");
+      });
+   }
+
+   /// Lock-order regression guard: `observe()`/`unobserve()` must hold a single lock
+   /// (db_instances, then observer_regs) across their whole enable/register or
+   /// release/disable sequence, or a concurrent pair on different webviews can
+   /// interleave such that `is_observing()` and "has registrations" disagree -
+   /// e.g. a window's `observe()` registers into a broker a concurrent
+   /// `unobserve()` from another window just destroyed.
+   ///
+   /// This is a probabilistic guard, not a proof, and its detection rate is
+   /// asymmetric: a regressed `unobserve()` side fails reliably, but a regressed
+   /// `observe()` side has been measured as low as 1 in 10 runs. `ITERATIONS` is
+   /// 2000 because more attempts are the only lever available against a window
+   /// this narrow, not because a higher count is known to detect more - that has
+   /// not been demonstrated. At ~0.14s the attempts are cheap either way.
+   /// Re-measure before lowering it, and do not rely on this test alone.
+   ///
+   /// Do not delete this test as redundant. It is the *only* guard for a
+   /// distinct regression the other two structurally cannot see: releasing the
+   /// db guard mid-sequence and immediately reacquiring a fresh one before
+   /// `register()`/`release()`. That shape compiles (a real guard satisfies the
+   /// `DbInstancesGuard` witness) and passes both deterministic tests 3/3 (a
+   /// guard genuinely *is* held at the call), yet still reopens the race - a
+   /// concurrent `unobserve()` can take the db lock in the drop/reacquire
+   /// window, see the refcount reach zero, and tear the broker down before
+   /// `observe()` reacquires and registers. Mutation testing measured this
+   /// test failing 5/5 against that shape while both deterministic guards
+   /// passed 3/3.
+   #[test]
+   fn test_concurrent_observe_and_unobserve_keep_broker_and_registrations_in_sync() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window A should build");
+         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
+            .build()
+            .expect("webview window B should build");
+
+         const ITERATIONS: usize = 2000;
+
+         for i in 0..ITERATIONS {
+            // Baseline for this iteration: only window A registered, broker
+            // live. Force both released first (no-ops if already released)
+            // so each iteration starts from a known state regardless of how
+            // the previous iteration's race resolved.
+            let _ = commands::unobserve(
+               app.state::<DbInstances>(),
+               app.state::<ActiveSubscriptions>(),
+               app.state::<ObserverRegistrations>(),
+               webview_a.as_ref().clone(),
+               "MAIN".to_string(),
+            )
+            .await;
+            let _ = commands::unobserve(
+               app.state::<DbInstances>(),
+               app.state::<ActiveSubscriptions>(),
+               app.state::<ObserverRegistrations>(),
+               webview_b.as_ref().clone(),
+               "MAIN".to_string(),
+            )
+            .await;
+            commands::observe(
+               app.state::<DbInstances>(),
+               app.state::<ObserverRegistrations>(),
+               webview_a.as_ref().clone(),
+               "MAIN".to_string(),
+               vec!["test".to_string()],
+               None,
+            )
+            .await
+            .expect("baseline observe for window A should succeed");
+
+            // Race: window B observes while window A unobserves, concurrently,
+            // on separate spawned tasks so the multi-thread runtime can
+            // actually run them in parallel rather than just interleaving at
+            // await points on one thread.
+            let app_for_observe = app.handle().clone();
+            let webview_b_for_task = webview_b.as_ref().clone();
+            let observe_task = tokio::spawn(async move {
+               commands::observe(
+                  app_for_observe.state::<DbInstances>(),
+                  app_for_observe.state::<ObserverRegistrations>(),
+                  webview_b_for_task,
+                  "MAIN".to_string(),
+                  vec!["test".to_string()],
+                  None,
+               )
+               .await
+            });
+
+            let app_for_unobserve = app.handle().clone();
+            let webview_a_for_task = webview_a.as_ref().clone();
+            let unobserve_task = tokio::spawn(async move {
+               commands::unobserve(
+                  app_for_unobserve.state::<DbInstances>(),
+                  app_for_unobserve.state::<ActiveSubscriptions>(),
+                  app_for_unobserve.state::<ObserverRegistrations>(),
+                  webview_a_for_task,
+                  "MAIN".to_string(),
+               )
+               .await
+            });
+
+            observe_task
+               .await
+               .expect("observe task should not panic")
+               .expect("observe should succeed");
+            unobserve_task
+               .await
+               .expect("unobserve task should not panic")
+               .expect("unobserve should succeed");
+
+            let has_registrations = app
+               .state::<ObserverRegistrations>()
+               .count_for_db("MAIN")
+               .await
+               > 0;
+            let observing = is_observing(&app, "MAIN").await;
+
+            assert_eq!(
+               observing, has_registrations,
+               "iteration {i}: is_observing() ({observing}) and has-registrations \
+                ({has_registrations}) must always agree"
+            );
+         }
+      });
+   }
+
+   /// Deterministic lock-order guard, observe side.
+   ///
+   /// Forces the exact contention the lock-order invariant depends on instead
+   /// of relying on scheduling luck: the test itself holds `observer_regs`'s
+   /// lock (via the test-only `lock_for_test()` accessor), so `observe()`'s
+   /// `register()` call is guaranteed to block. If `observe()` is correctly
+   /// holding the `db_instances` lock across that whole sequence, its lock
+   /// guard is still alive while blocked - so this test's own attempt to
+   /// acquire that same lock (with a short timeout) MUST fail. A regressed
+   /// `observe()` that drops the db lock before calling `register()` would let
+   /// this acquisition succeed instead.
+   #[test]
+   fn test_observe_holds_db_lock_across_register() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window should build");
+
+         // Hold observer_regs' lock ourselves so observe()'s register() call
+         // is guaranteed to block on it.
+         let observer_regs_state = app.state::<ObserverRegistrations>();
+         let regs_guard = observer_regs_state.lock_for_test().await;
+
+         let app_for_observe = app.handle().clone();
+         let webview_for_task = webview.as_ref().clone();
+         let observe_task = tokio::spawn(async move {
+            commands::observe(
+               app_for_observe.state::<DbInstances>(),
+               app_for_observe.state::<ObserverRegistrations>(),
+               webview_for_task,
+               "MAIN".to_string(),
+               vec!["test".to_string()],
+               None,
+            )
+            .await
+         });
+
+         // Wait for the spawned task to actually reach the point of
+         // contention (acquire the db lock, call enable_observation, reach
+         // register(), and block on the regs lock we're holding), rather than
+         // assuming a fixed sleep was long enough.
+         wait_until_db_instances_write_contended(&app, std::time::Duration::from_secs(2)).await;
+
+         let db_lock_attempt = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            app.state::<DbInstances>().inner().inner.write(),
+         )
+         .await;
+
+         assert!(
+            db_lock_attempt.is_err(),
+            "observe() must still be holding the db_instances lock while blocked on \
+             observer_regs.register() - if this acquisition succeeded, observe() had \
+             already dropped the db lock before registering (the exact regression this \
+             test guards against)"
+         );
+
+         // Release the regs lock so observe() can finish, then clean up.
+         drop(regs_guard);
+
+         observe_task
+            .await
+            .expect("observe task should not panic")
+            .expect("observe should succeed");
+      });
+   }
+
+   /// Deterministic lock-order guard, unobserve side.
+   ///
+   /// Same technique as `test_observe_holds_db_lock_across_register`, but for
+   /// `unobserve()`'s db-lock-then-release() ordering.
+   #[test]
+   fn test_unobserve_holds_db_lock_across_release() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("baseline observe should succeed");
+
+         // Hold observer_regs' lock ourselves so unobserve()'s release() call
+         // is guaranteed to block on it.
+         let observer_regs_state = app.state::<ObserverRegistrations>();
+         let regs_guard = observer_regs_state.lock_for_test().await;
+
+         let app_for_unobserve = app.handle().clone();
+         let webview_for_task = webview.as_ref().clone();
+         let unobserve_task = tokio::spawn(async move {
+            commands::unobserve(
+               app_for_unobserve.state::<DbInstances>(),
+               app_for_unobserve.state::<ActiveSubscriptions>(),
+               app_for_unobserve.state::<ObserverRegistrations>(),
+               webview_for_task,
+               "MAIN".to_string(),
+            )
+            .await
+         });
+
+         wait_until_db_instances_write_contended(&app, std::time::Duration::from_secs(2)).await;
+
+         let db_lock_attempt = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            app.state::<DbInstances>().inner().inner.write(),
+         )
+         .await;
+
+         assert!(
+            db_lock_attempt.is_err(),
+            "unobserve() must still be holding the db_instances lock while blocked on \
+             observer_regs.release() - if this acquisition succeeded, unobserve() had \
+             already released the db lock before calling release() (the exact \
+             regression this test guards against)"
+         );
+
+         drop(regs_guard);
+
+         unobserve_task
+            .await
+            .expect("unobserve task should not panic")
+            .expect("unobserve should succeed");
+      });
+   }
+
+   /// Closing a database fully clears its observer registrations (via
+   /// `ObserverRegistrations::clear_for_db`, wired through
+   /// `close_database_inner`), so a fresh `observe()` after a `close()`+reload
+   /// cycle restarts the refcount at 1 rather than inheriting stale entries
+   /// from before the close.
+   #[test]
+   fn test_observe_after_close_restarts_refcount() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("observe should succeed");
+
+         assert_eq!(
+            app.state::<ObserverRegistrations>()
+               .count_for_db("MAIN")
+               .await,
+            1
+         );
+
+         commands::close(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            app.state::<ActiveRegularTransactions>(),
+            "MAIN".to_string(),
+         )
+         .await
+         .expect("close should succeed");
+
+         assert_eq!(
+            app.state::<ObserverRegistrations>()
+               .count_for_db("MAIN")
+               .await,
+            0,
+            "close() should clear stale observer registrations, not just the crate-level broker"
+         );
+
+         // Reload and recreate the table (close() dropped the connection pool;
+         // the underlying file-backed table itself still exists on disk, but
+         // a fresh wrapper needs to be loaded before observe() will find it).
+         connect_to_database(app.handle(), "MAIN", None)
+            .await
+            .expect("reconnect after close should succeed");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("observe after reload should succeed");
+
+         assert_eq!(
+            app.state::<ObserverRegistrations>()
+               .count_for_db("MAIN")
+               .await,
+            1,
+            "refcount should restart at 1, not inherit anything from before the close"
+         );
+         assert!(is_observing(&app, "MAIN").await);
+      });
+   }
+
+   /// A window calling `observe()` twice (e.g. to add more tables) still only
+   /// holds ONE registration, so a single `unobserve()` call from that same
+   /// window fully tears the broker down - the refcount
+   /// tracks distinct webviews, not the number of `observe()` calls made.
+   #[test]
+   fn test_same_window_double_observe_then_single_unobserve_tears_down() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+         commands::execute(
+            app.state::<DbInstances>(),
+            "MAIN".to_string(),
+            "CREATE TABLE other (id INTEGER PRIMARY KEY, val TEXT)".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .expect("create other table should succeed");
+
+         let webview = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("first observe should succeed");
+
+         // Same window, second call, different tables - must not inflate the
+         // refcount for this window.
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["other".to_string()],
+            None,
+         )
+         .await
+         .expect("second observe should succeed");
+
+         assert_eq!(
+            app.state::<ObserverRegistrations>()
+               .count_for_db("MAIN")
+               .await,
+            1,
+            "same window calling observe() twice must still be a single registration"
+         );
+
+         commands::unobserve(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+         )
+         .await
+         .expect("unobserve should succeed");
+
+         assert!(
+            !is_observing(&app, "MAIN").await,
+            "a single unobserve() from the only registered window must fully tear down the broker"
+         );
+      });
+   }
+
+   /// Probabilistic regression guard for the close()-vs-observe() variant of
+   /// the lock-order invariant: `close_database_inner` must clear `observer_regs`
+   /// while still holding the `db_instances` write lock used to remove the
+   /// wrapper (not before acquiring it), or a concurrent `observe()` from
+   /// another window can register into - and enable observation on - a
+   /// wrapper that's about to be removed, leaving a phantom registration
+   /// behind after `close()` completes with no wrapper left for it to refer
+   /// to. `close()` always removes the wrapper by the time it returns, so the
+   /// database is deterministically unloaded after each iteration; what's
+   /// racy is only whether a registration is left behind.
+   #[test]
+   fn test_concurrent_observe_and_close_do_not_leak_registrations() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window A should build");
+         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
+            .build()
+            .expect("webview window B should build");
+
+         const ITERATIONS: usize = 200;
+
+         for i in 0..ITERATIONS {
+            // Baseline for this iteration: MAIN loaded, window A observing.
+            connect_to_database(app.handle(), "MAIN", None)
+               .await
+               .expect("reconnect should succeed");
+            commands::observe(
+               app.state::<DbInstances>(),
+               app.state::<ObserverRegistrations>(),
+               webview_a.as_ref().clone(),
+               "MAIN".to_string(),
+               vec!["test".to_string()],
+               None,
+            )
+            .await
+            .expect("baseline observe for window A should succeed");
+
+            // Race: window B observes while the database is closed, concurrently.
+            let app_for_observe = app.handle().clone();
+            let webview_b_for_task = webview_b.as_ref().clone();
+            let observe_task = tokio::spawn(async move {
+               commands::observe(
+                  app_for_observe.state::<DbInstances>(),
+                  app_for_observe.state::<ObserverRegistrations>(),
+                  webview_b_for_task,
+                  "MAIN".to_string(),
+                  vec!["test".to_string()],
+                  None,
+               )
+               .await
+            });
+
+            let app_for_close = app.handle().clone();
+            let close_task = tokio::spawn(async move {
+               commands::close(
+                  app_for_close.state::<DbInstances>(),
+                  app_for_close.state::<ActiveSubscriptions>(),
+                  app_for_close.state::<ObserverRegistrations>(),
+                  app_for_close.state::<ActiveInterruptibleTransactions>(),
+                  app_for_close.state::<ActiveRegularTransactions>(),
+                  "MAIN".to_string(),
+               )
+               .await
+            });
+
+            // observe() may legitimately fail with DATABASE_NOT_LOADED if
+            // close() won the race for the db lock first - that's fine, not
+            // what this test is guarding against.
+            let _ = observe_task.await.expect("observe task should not panic");
+            close_task
+               .await
+               .expect("close task should not panic")
+               .expect("close should succeed");
+
+            // close() always removes the wrapper by the time it returns, so
+            // the database is deterministically unloaded here - use is_some()
+            // directly rather than the is_observing() helper, which assumes a
+            // loaded database and would itself panic.
+            assert!(
+               app.state::<DbInstances>()
+                  .inner()
+                  .inner
+                  .read()
+                  .await
+                  .get("MAIN")
+                  .is_none(),
+               "iteration {i}: close() should always leave the database unloaded"
+            );
+            assert_eq!(
+               app.state::<ObserverRegistrations>()
+                  .count_for_db("MAIN")
+                  .await,
+               0,
+               "iteration {i}: no registration should survive close() with no wrapper left to refer to"
+            );
+         }
+      });
+   }
+
+   /// Pins the invariant that once a subscription's forwarding task ends (its
+   /// channel closed), it reaps its own entry from `ActiveSubscriptions` -
+   /// exercising the `oneshot` ready-gate + self-removal logic rather than
+   /// only reasoning about it. The channel below models the event loop being
+   /// gone entirely (every `send` fails), not a same-webview reload - see the
+   /// reap comment in `commands::subscribe` for why a reload can't actually
+   /// trigger this path. Without this reap, letting the event loop/broker tear
+   /// down would leave a dead entry behind forever, and eventually every *new*
+   /// subscribe() call would hit `TOO_MANY_SUBSCRIPTIONS` even though nothing
+   /// is actually subscribed anymore.
+   #[test]
+   fn test_subscribe_reaps_itself_after_channel_closes() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("observe should succeed");
+
+         // A channel whose "send" always fails, simulating the event loop
+         // being gone entirely (not a reload/navigation - a live webview's
+         // `Channel::send` still reports `Ok` even when nothing is listening
+         // on the JS side; see the reap comment in `commands::subscribe`). The
+         // forwarding task's `on_event.send(...).is_err()` check will be true
+         // on the first change event, causing it to break out of its loop and
+         // reap itself.
+         let channel = tauri::ipc::Channel::new(|_body| {
+            Err(std::io::Error::other("simulated closed channel").into())
+         });
+
+         commands::subscribe(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            channel,
+         )
+         .await
+         .expect("subscribe should succeed");
+
+         assert_eq!(
+            app.state::<ActiveSubscriptions>()
+               .count_for_db("MAIN")
+               .await,
+            1,
+            "subscription should be registered immediately after subscribe()"
+         );
+
+         commands::execute(
+            app.state::<DbInstances>(),
+            "MAIN".to_string(),
+            "INSERT INTO test (val) VALUES ('trigger')".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .expect("insert should succeed");
+
+         // Give the forwarding task a chance to receive the change, fail to
+         // send it through the closed channel, and reap itself.
+         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+         loop {
+            if app
+               .state::<ActiveSubscriptions>()
+               .count_for_db("MAIN")
+               .await
+               == 0
+            {
+               break;
+            }
+            assert!(
+               std::time::Instant::now() < deadline,
+               "forwarding task never reaped its own entry after its channel closed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+         }
       });
    }
 }

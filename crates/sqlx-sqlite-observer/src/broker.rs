@@ -55,6 +55,7 @@ pub struct ObservationBroker {
    observed_tables: RwLock<HashSet<String>>,
    table_info: RwLock<HashMap<String, TableInfo>>,
    capture_values: bool,
+   channel_capacity: usize,
 }
 
 impl ObservationBroker {
@@ -76,7 +77,26 @@ impl ObservationBroker {
          observed_tables: RwLock::new(HashSet::new()),
          table_info: RwLock::new(HashMap::new()),
          capture_values,
+         channel_capacity,
       })
+   }
+
+   /// Returns the broadcast channel capacity this broker was created with.
+   ///
+   /// This is fixed for the lifetime of the broker. A broker is a long-lived object
+   /// that may be shared by multiple independent observers of the same database, so
+   /// this value cannot be changed once the broker has subscribers without dropping
+   /// them.
+   pub fn channel_capacity(&self) -> usize {
+      self.channel_capacity
+   }
+
+   /// Returns whether this broker captures old/new column values in change notifications.
+   ///
+   /// Fixed for the lifetime of the broker; see [`channel_capacity`](Self::channel_capacity)
+   /// for why this can't be changed after creation.
+   pub fn capture_values(&self) -> bool {
+      self.capture_values
    }
 
    /// Checks if a table is being observed.
@@ -109,6 +129,24 @@ impl ObservationBroker {
    ///
    /// **Prefer [`observe_table`] when schema info is available**, as it atomically
    /// registers the table and sets schema info in one call.
+   ///
+   /// This is also the merge path used when re-enabling observation on a database
+   /// that already has a live broker (see
+   /// `sqlx_sqlite_toolkit::DatabaseWrapper::enable_observation`): rather than
+   /// recreating the broker, callers add tables to the existing one via this
+   /// method, relying on `TableInfo` being filled in lazily for the newly added
+   /// tables on the next connection acquisition.
+   ///
+   /// That lazy fill only converges for tables that actually exist. For a name
+   /// that is not in the schema, `query_table_info` yields `Ok(None)` and nothing
+   /// is recorded, so the name stays in the "needs querying" set and costs two
+   /// statements on *every* `acquire_writer()` for the lifetime of the broker.
+   /// Changes are still delivered if the table is created later - the hook gates
+   /// on the observed set, not on `TableInfo` - but until the info resolves those
+   /// events carry an empty `primary_key`, and a meaningless `rowid` for a
+   /// `WITHOUT ROWID` table. Nothing removes an individual name from the observed
+   /// set, so a typo or a table dropped by a later migration keeps paying that
+   /// cost indefinitely.
    ///
    /// [`set_table_info`]: Self::set_table_info
    /// [`observe_table`]: Self::observe_table
@@ -301,6 +339,41 @@ impl std::fmt::Debug for ObservationBroker {
       f.debug_struct("ObservationBroker")
          .field("buffer_len", &self.buffer.lock().len())
          .field("observed_tables", &self.observed_tables.read().len())
+         .field("channel_capacity", &self.channel_capacity)
+         .field("capture_values", &self.capture_values)
          .finish()
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn test_channel_capacity_and_capture_values_are_fixed_after_creation() {
+      let broker = ObservationBroker::new(64, false);
+
+      assert_eq!(broker.channel_capacity(), 64);
+      assert!(!broker.capture_values());
+   }
+
+   #[test]
+   fn test_observe_tables_is_additive_and_idempotent() {
+      let broker = ObservationBroker::new(16, true);
+
+      broker.observe_tables(["users"]);
+      assert_eq!(broker.get_observed_tables(), vec!["users".to_string()]);
+
+      // Adding more tables unions them with the existing set rather than replacing it.
+      broker.observe_tables(["posts"]);
+      let mut observed = broker.get_observed_tables();
+      observed.sort();
+      assert_eq!(observed, vec!["posts".to_string(), "users".to_string()]);
+
+      // Re-observing an already-tracked table is a no-op, not a duplicate.
+      broker.observe_tables(["users"]);
+      let mut observed = broker.get_observed_tables();
+      observed.sort();
+      assert_eq!(observed, vec!["posts".to_string(), "users".to_string()]);
    }
 }

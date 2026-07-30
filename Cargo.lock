@@ -3625,7 +3625,7 @@ dependencies = [
 
 [[package]]
 name = "sqlx-sqlite-observer"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "futures",
  "libsqlite3-sys",
@@ -3643,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "sqlx-sqlite-toolkit"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.13.0",

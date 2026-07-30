@@ -313,6 +313,11 @@ export interface KeysetPage<T = Record<string, SqlValue>> {
 
 /**
  * Configuration for the database observer.
+ *
+ * `channelCapacity` and `captureValues` are fixed by the first window to
+ * enable observation for a given database. Omitting this config on a later
+ * `observe()` call always succeeds, but an explicit request for different
+ * values for either field is rejected.
  */
 export interface ObserverConfig {
 
@@ -1192,13 +1197,31 @@ export default class Database {
     * Must be called before `subscribe()`. This configures the database to track
     * changes via SQLite hooks. Changes are only published after transactions commit.
     *
-    * If observation is already enabled, calling this again will abort all existing
-    * subscriptions for this database, tear down the previous observer, and create
-    * a new one with the provided configuration. You must re-subscribe after
-    * re-calling `observe()`.
+    * Observation is additive and reference-counted per window: calling this again
+    * (from this window or another one) merges the requested tables into the
+    * existing observer rather than replacing it, so subscriptions already active
+    * in any window - including this one - keep receiving notifications
+    * uninterrupted. `channelCapacity` and `captureValues` are fixed by the
+    * *first* window to enable observation for a given database; a later call
+    * omitting them always succeeds, but one requesting different values for
+    * either is rejected.
+    *
+    * Registration is keyed by webview label, not by caller: if two independent
+    * modules in the same window both call `observe()`, they share a single
+    * registration, and whichever one calls `unobserve()` first tears down
+    * observation - and aborts subscriptions - for both. Treat `observe()` /
+    * `unobserve()` as owned by a single module per window.
+    *
+    * Call `unobserve()` to release this window's registration. The underlying
+    * observer is only disabled once every window that called `observe()` for
+    * this database has released its registration.
     *
     * @param tables - Table names to observe for changes
     * @param config - Optional observer configuration
+    * @throws SqliteError with code `OBSERVATION_CONFIG_CONFLICT` if `config`
+    *         requests a `channelCapacity`/`captureValues` different from the
+    *         values a prior `observe()` call already established for this
+    *         database
     *
     * @example
     * ```ts
@@ -1229,11 +1252,24 @@ export default class Database {
     * Returns a `Subscription` that can be used to unsubscribe later. Change events
     * are streamed to the provided callback function.
     *
-    * Requires `observe()` to have been called first.
+    * The calling window must have called `observe()` itself - another window
+    * having called `observe()` does not satisfy this requirement.
+    *
+    * Because registration is keyed by webview label rather than by caller, a
+    * subscription can also be aborted if another module in the same window
+    * calls `unobserve()`, even if it wasn't the module that called `observe()`.
+    * See `observe()` for details.
+    *
+    * @remarks
+    * Webview labels persist across a page reload and registrations are not
+    * cleared on reload, so a window may pass the `observe()` check after a
+    * reload without having re-called `observe()` in the new page load.
     *
     * @param tables - Table names to receive notifications for
     * @param onEvent - Callback invoked for each change event
     * @returns A Subscription that can be used to stop receiving notifications
+    * @throws SqliteError with code `OBSERVATION_NOT_ENABLED` if this window
+    *         has not itself called `observe()` for this database
     *
     * @example
     * ```ts
@@ -1274,9 +1310,13 @@ export default class Database {
    /**
     * **unobserve**
     *
-    * Disable change observation for this database.
+    * Release this window's change observation registration for this database.
     *
-    * Stops tracking changes and aborts all active subscriptions for this database.
+    * Observation is reference-counted per window: if other windows are still
+    * observing this database, this only removes this window's own registration -
+    * tracking stays enabled and every other window's subscriptions are left
+    * untouched. Only once the *last* registered window calls `unobserve()` are
+    * changes actually stopped and all subscriptions for this database aborted.
     *
     * @example
     * ```ts
