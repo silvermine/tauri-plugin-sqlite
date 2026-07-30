@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::sqlite::SqliteConnection;
 use sqlx_sqlite_conn_mgr::{SqliteDatabase, SqliteDatabaseConfig, WriteGuard};
+#[cfg(feature = "observer")]
+use tracing::warn;
 
 #[cfg(feature = "observer")]
 use sqlx_sqlite_observer::{ObservableSqliteDatabase, ObservableWriteGuard, ObserverConfig};
@@ -387,14 +389,60 @@ impl DatabaseWrapper {
    /// After calling this, write operations will be tracked and subscribers
    /// can receive change notifications.
    ///
-   /// If observation is already enabled, the previous observer is disabled first.
-   /// This drops the old broadcast broker, causing existing subscriber streams to
-   /// terminate. Callers must re-subscribe after re-enabling observation.
+   /// **Additive, not destructive:** if observation is already enabled, the existing
+   /// broker is reused rather than replaced. The requested tables are unioned into
+   /// its observed-table set, and any subscribers created before this call keep
+   /// receiving notifications uninterrupted — this is what allows independent callers
+   /// (e.g. multiple windows observing the same database) to call `enable_observation`
+   /// without tearing down each other's subscriptions.
+   ///
+   /// `config.channel_capacity` and `config.capture_values` can only take effect on
+   /// the *first* call that enables observation for this database. Both are baked
+   /// into the broadcast channel/broker at creation time and cannot be changed
+   /// without recreating the broker — which would drop existing subscribers, the
+   /// exact problem this method now avoids. If a later call requests different
+   /// values, they are ignored (a warning is logged) and only the tables are merged
+   /// in — this method stays infallible on purpose. The Tauri plugin layer's
+   /// `observe()` command rejects a conflicting request outright before it ever
+   /// reaches here, so in practice this fallback only matters for direct Rust
+   /// callers of this crate. Those callers should not rely on the warning to
+   /// notice: all four crates in this workspace pin `tracing` with
+   /// `release_max_level_off`, which compiles the `warn!` below out entirely
+   /// whenever `debug_assertions` are disabled — not merely when the build
+   /// profile happens to be named `release`. The only reliable way to learn the values actually in effect
+   /// is to read them back afterward via `broker().channel_capacity()` /
+   /// `.capture_values()`. Call [`disable_observation`](Self::disable_observation)
+   /// first if you need to change these values, accepting that existing
+   /// subscribers will be dropped.
    ///
    /// Requires the `observer` feature.
    #[cfg(feature = "observer")]
    pub fn enable_observation(&mut self, config: ObserverConfig) {
-      self.disable_observation();
+      if let Some(existing) = &self.observer {
+         let broker = existing.broker();
+
+         if config.channel_capacity != broker.channel_capacity()
+            || config.capture_values != broker.capture_values()
+         {
+            warn!(
+               requested_channel_capacity = config.channel_capacity,
+               active_channel_capacity = broker.channel_capacity(),
+               requested_capture_values = config.capture_values,
+               active_capture_values = broker.capture_values(),
+               "enable_observation() called with different channel_capacity/capture_values \
+                while observation is already active; keeping the original values since \
+                recreating the broadcast channel would drop existing subscribers. Only the \
+                requested tables were merged in."
+            );
+         }
+
+         if !config.tables.is_empty() {
+            broker.observe_tables(config.tables.iter().map(String::as_str));
+         }
+
+         return;
+      }
+
       self.observer = Some(ObservableSqliteDatabase::new(
          Arc::clone(&self.inner),
          config,

@@ -614,7 +614,10 @@ await db.execute('INSERT INTO users (name) VALUES ($1)', ['Alice']);
 // 4. Unsubscribe when done
 await subscription.unsubscribe();
 
-// 5. Disable observation entirely (also aborts all active subscriptions)
+// 5. Release this window's observation registration. Observation is
+//    reference-counted per window: this only fully disables tracking and
+//    aborts subscriptions once every window that called observe() for this
+//    database has released via unobserve().
 await db.unobserve();
 ```
 
@@ -629,8 +632,25 @@ await db.observe(['users'], {
 
 **Important:**
 
-   * Call `observe()` before `subscribe()` — subscribing without observation returns
-     an error
+   * **Every window must call `observe()` itself before `subscribe()`** —
+     registration is per window and is not shared, even though the broker is.
+     `subscribe()` enforces this, returning `OBSERVATION_NOT_ENABLED` when _this_
+     window is not a registered observer
+   * `observe()` is additive and reference-counted: calling it again merges in the
+     requested tables rather than replacing anything, so existing subscriptions
+     keep working. `unobserve()` releases only this window's registration; tracking
+     stops and subscriptions abort once every registered window has released
+   * **Registration is keyed per _webview_, not per caller** — two modules in the
+     same window share one registration, so whichever calls `unobserve()` first
+     tears down the other's subscriptions. Treat `observe()`/`unobserve()` as owned
+     by a single module per window. Labels also survive a page reload without
+     clearing the registration, so a reloaded window can pass `subscribe()`'s check
+     without re-observing
+   * `channelCapacity`/`captureValues` are fixed by the _first_ window to observe a
+     database, since the broadcast channel behind them cannot be resized without
+     dropping subscribers. Omitting either field inherits the active value; an
+     explicit _different_ value fails with `OBSERVATION_CONFIG_CONFLICT`. To change
+     them, every window must `unobserve()` first
    * Multiple subscriptions can be active on the same database, each filtering by
      different tables
    * `lagged` events indicate the broadcast channel filled up before the
@@ -662,7 +682,10 @@ Common error codes:
    * `IO_ERROR` - File system error
    * `MIGRATION_ERROR` - Migration failed
    * `MULTIPLE_ROWS_RETURNED` - `fetchOne()` returned multiple rows
-   * `OBSERVATION_NOT_ENABLED` - Called `subscribe()` before `observe()`
+   * `OBSERVATION_NOT_ENABLED` - Called `subscribe()` before this window called
+     `observe()`
+   * `OBSERVATION_CONFIG_CONFLICT` - Called `observe()` with a
+     `channelCapacity`/`captureValues` differing from the active one
    * `OBSERVER_ERROR` - Error from the observer subsystem
 
 ### Closing and Removing
@@ -697,7 +720,7 @@ await db.remove();           // Close and DELETE database file(s) - irreversible
 | `remove()` | Close and delete database file(s), returns `true` if was loaded |
 | `observe(tables, config?)` | Enable change observation for tables |
 | `subscribe(tables, onEvent)` | Subscribe to change notifications, returns `Subscription` |
-| `unobserve()` | Disable observation and abort all subscriptions |
+| `unobserve()` | Release this window's observation registration; only fully disables observation and aborts subscriptions once every registered window has released |
 
 ### Builder Methods
 
@@ -1114,7 +1137,13 @@ untrusted or buggy frontend code:
      default (5 minutes) are automatically rolled back on the next access
      attempt (configurable via `Builder::transaction_timeout()`)
    * **Observer channel capacity**: Capped at 10,000 (default 256)
-   * **Observed tables**: Maximum 100 tables per `observe()` call
+   * **Observed tables**: Maximum 100 tables per single `observe()` call — **not**
+     a bound on the accumulated set for a database. `observe()` merges its tables
+     into the existing broker, `subscribe()` also adds tables with no per-call
+     limit, and nothing removes an individual table (the set is cleared only on a
+     full teardown), so the total is currently unbounded. An observed table that
+     does not exist also costs schema round trips on _every_ writer acquisition,
+     indefinitely, while that database's write connection is held (#56)
    * **Subscriptions**: Maximum 100 active subscriptions per database
 
 ### Unbounded Result Sets

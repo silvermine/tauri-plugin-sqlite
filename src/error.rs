@@ -55,6 +55,11 @@ pub enum Error {
    #[error("invalid configuration: {0}")]
    InvalidConfig(String),
 
+   /// A later `observe()` call requested a `channelCapacity`/`captureValues`
+   /// value that conflicts with the value already active for this database.
+   #[error("{0}")]
+   ObservationConfigConflict(String),
+
    /// Required plugin managed state was not found.
    #[error("required plugin state not found: {0}")]
    MissingState(String),
@@ -98,6 +103,7 @@ impl Error {
          Error::TooManyDatabases(_) => "TOO_MANY_DATABASES".to_string(),
          Error::TooManySubscriptions(_) => "TOO_MANY_SUBSCRIPTIONS".to_string(),
          Error::InvalidConfig(_) => "INVALID_CONFIG".to_string(),
+         Error::ObservationConfigConflict(_) => "OBSERVATION_CONFIG_CONFLICT".to_string(),
          Error::MissingState(_) => "MISSING_STATE".to_string(),
          Error::Other(_) => "ERROR".to_string(),
       }
