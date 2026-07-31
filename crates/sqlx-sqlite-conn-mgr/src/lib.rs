@@ -64,17 +64,19 @@ mod attached;
 mod config;
 mod database;
 mod error;
+mod observer_slot;
 mod registry;
 mod write_guard;
 
 // Re-export public types
 pub use attached::{
    AttachedMode, AttachedReadConnection, AttachedSpec, AttachedWriteGuard,
-   acquire_reader_with_attached, acquire_writer_with_attached,
+   acquire_reader_with_attached, acquire_writer_with_attached, validate_attached_specs,
 };
 pub use config::SqliteDatabaseConfig;
 pub use database::SqliteDatabase;
 pub use error::Error;
+pub use observer_slot::ObserverSlot;
 pub use write_guard::WriteGuard;
 
 // Re-export sqlx migrate types for convenience

@@ -84,8 +84,14 @@ impl ObservableConnection {
 
       let db: *mut sqlite3 = handle.as_raw_handle().as_ptr();
 
+      // This crate's plain (non-conn-mgr) connection path never attaches
+      // other databases, so there is only ever one schema to route: SQLite
+      // always reports "main" for the primary database.
+      let mut brokers = std::collections::HashMap::with_capacity(1);
+      brokers.insert("main".to_string(), Arc::clone(&self.broker));
+
       unsafe {
-         hooks::register_hooks(db, Arc::clone(&self.broker))?;
+         hooks::register_hooks(db, brokers)?;
       }
 
       // Cache the raw pointer so Drop can call unregister_hooks synchronously.

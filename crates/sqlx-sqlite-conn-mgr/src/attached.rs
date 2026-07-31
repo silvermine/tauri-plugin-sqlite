@@ -9,6 +9,7 @@ use sqlx::pool::PoolConnection;
 use sqlx::sqlite::SqliteConnection;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use tracing::error;
 
 /// Specification for attaching a database to a connection
 #[derive(Clone)]
@@ -174,12 +175,23 @@ impl Drop for AttachedWriteGuard {
    }
 }
 
+/// Longest accepted schema alias, in bytes.
+///
+/// SQLite imposes no limit of its own (a 100k-character alias attaches happily),
+/// but since observation started reporting the alias as `TableChange::schema` it
+/// is copied into every change notification and serialized to every subscriber,
+/// once per changed row. 64 is the conventional identifier ceiling and
+/// comfortably above every alias this workspace uses.
+const MAX_SCHEMA_NAME_LEN: usize = 64;
+
 /// Validates that a schema name is a valid SQLite identifier
 ///
 /// A valid schema name:
 /// - Must not be empty
 /// - Must contain only ASCII alphanumeric characters and underscores
 /// - Must not start with a digit
+/// - Must be at most [`MAX_SCHEMA_NAME_LEN`] bytes long
+/// - Must not be `main` or `temp`, compared case-insensitively
 ///
 /// This prevents SQL injection by ensuring the schema name can only be used
 /// as an identifier and cannot:
@@ -187,10 +199,76 @@ impl Drop for AttachedWriteGuard {
 /// - Start comments (--)
 /// - Break out of string context (')
 /// - Execute any SQL operations
+///
+/// The `main`/`temp` rule is separate from injection-safety: SQLite owns both names
+/// for its own schemas, so `ATTACH ... AS "main"` simply fails - and because SQLite's
+/// schema namespace is case-insensitive, so does `ATTACH ... AS "MAIN"` or `"Temp"`.
+/// Left unrejected here, that failure would happen inside the attach loop instead of
+/// before it, stranding whatever alias was already attached earlier in the same call.
 fn is_valid_schema_name(name: &str) -> bool {
    !name.is_empty()
+      && name.len() <= MAX_SCHEMA_NAME_LEN
       && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
       && !name.chars().next().unwrap().is_ascii_digit()
+      && !name.eq_ignore_ascii_case("main")
+      && !name.eq_ignore_ascii_case("temp")
+}
+
+/// Validates a batch of attached-database specs before any lock is acquired or any
+/// `ATTACH` is issued.
+///
+/// Exists so a caller that derives per-alias state ahead of acquisition - the observer
+/// crate builds a schema-alias-to-broker map before it attaches anything - can validate
+/// first and never build that state from input SQLite will later reject anyway.
+///
+/// Checks, for every spec:
+/// - the schema name itself, via [`is_valid_schema_name`] (shape, length, and the
+///   `main`/`temp` reservation)
+///
+/// and across the whole batch:
+/// - that no two specs share an alias, compared via [`str::to_ascii_lowercase`] rather
+///   than `==`, because SQLite's schema namespace is case-insensitive: `"x"` and `"X"`
+///   collide at `ATTACH` even though they compare unequal as plain strings.
+///
+/// Does not check for duplicate *database paths* - `acquire_reader_with_attached` and
+/// `acquire_writer_with_attached` each do that themselves, since attaching the same
+/// path is only a hard error for the writer (it would deadlock acquiring that
+/// database's writer twice) and both need the paths sorted first anyway.
+pub fn validate_attached_specs(specs: &[AttachedSpec]) -> Result<()> {
+   use std::collections::HashSet;
+   let mut seen_aliases = HashSet::new();
+   for spec in specs {
+      if !is_valid_schema_name(&spec.schema_name) {
+         return Err(Error::InvalidSchemaName(spec.schema_name.clone()));
+      }
+      if !seen_aliases.insert(spec.schema_name.to_ascii_lowercase()) {
+         return Err(Error::DuplicateSchemaName(spec.schema_name.clone()));
+      }
+   }
+   Ok(())
+}
+
+/// Detaches a single already-attached alias while unwinding a partial `ATTACH`
+/// failure - some earlier spec in the same call attached successfully before a later
+/// one failed, and that earlier alias is still live on the connection or writer this
+/// call is about to hand back with an error.
+///
+/// Mirrors the error-precedence idiom in
+/// `sqlx_sqlite_toolkit::builders::detach_after`: `original` is always what the caller
+/// gets back. A failure here would only replace "why the attach failed" with "why the
+/// cleanup of an attach you never got to use also failed", so it's logged instead of
+/// propagated.
+async fn detach_unwind(conn: &mut SqliteConnection, schema_name: &str, original: &Error) {
+   let detach_sql = format!("DETACH DATABASE \"{}\"", schema_name);
+   if let Err(detach_err) = sqlx::query(sqlx::AssertSqlSafe(detach_sql))
+      .execute(conn)
+      .await
+   {
+      error!(
+         "failed to detach '{}' while unwinding from an earlier error ({}): {}",
+         schema_name, original, detach_err
+      );
+   }
 }
 
 /// Acquire a read connection with attached database(s)
@@ -210,6 +288,8 @@ fn is_valid_schema_name(name: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error if:
+/// - A schema name is invalid, reserved (`main`/`temp`), or shared by two specs
+///   (case-insensitively) - see [`validate_attached_specs`]
 /// - The main database is closed
 /// - Cannot acquire a read connection
 /// - Attempting to attach read-write to a read connection
@@ -218,6 +298,11 @@ pub async fn acquire_reader_with_attached(
    main_db: &SqliteDatabase,
    mut specs: Vec<AttachedSpec>,
 ) -> Result<AttachedReadConnection> {
+   // Validate every alias up front, before acquiring or attaching anything. Doing it
+   // here rather than inline in the loop below is what stops a bad spec later in the
+   // list from stranding a good one attached earlier in the same call.
+   validate_attached_specs(&specs)?;
+
    // Acquire read connection from main database
    let mut conn = main_db.read_pool()?.acquire().await?;
 
@@ -239,17 +324,19 @@ pub async fn acquire_reader_with_attached(
       }
    }
 
-   let mut schema_names = Vec::new();
+   let mut schema_names: Vec<String> = Vec::new();
 
    for spec in specs {
-      // Validate schema name to prevent SQL injection
-      if !is_valid_schema_name(&spec.schema_name) {
-         return Err(Error::InvalidSchemaName(spec.schema_name.clone()));
-      }
-
-      // Read connections can only attach as read-only
+      // Read connections can only attach as read-only. Schema names are already
+      // validated above, but earlier specs in this loop may already be attached to
+      // `conn` - unwind those before returning, or they'd strand on the connection
+      // this call is about to hand back with an error.
       if spec.mode == AttachedMode::ReadWrite {
-         return Err(Error::CannotAttachReadWriteToReader);
+         let original = Error::CannotAttachReadWriteToReader;
+         for attached in &schema_names {
+            detach_unwind(&mut conn, attached, &original).await;
+         }
+         return Err(original);
       }
 
       // Execute ATTACH DATABASE
@@ -260,9 +347,16 @@ pub async fn acquire_reader_with_attached(
          "ATTACH DATABASE '{}' AS \"{}\"",
          escaped_path, spec.schema_name
       );
-      sqlx::query(sqlx::AssertSqlSafe(attach_sql))
+      if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(attach_sql))
          .execute(&mut *conn)
-         .await?;
+         .await
+      {
+         let original: Error = err.into();
+         for attached in &schema_names {
+            detach_unwind(&mut conn, attached, &original).await;
+         }
+         return Err(original);
+      }
 
       schema_names.push(spec.schema_name);
    }
@@ -290,6 +384,8 @@ pub async fn acquire_reader_with_attached(
 /// # Errors
 ///
 /// Returns an error if:
+/// - A schema name is invalid, reserved (`main`/`temp`), or shared by two specs
+///   (case-insensitively) - see [`validate_attached_specs`]
 /// - The main database is closed
 /// - Cannot acquire the main writer
 /// - Cannot acquire an attached database's writer (for read-write mode)
@@ -298,12 +394,8 @@ pub async fn acquire_writer_with_attached(
    main_db: &SqliteDatabase,
    specs: Vec<AttachedSpec>,
 ) -> Result<AttachedWriteGuard> {
-   // Validate schema names first
-   for spec in &specs {
-      if !is_valid_schema_name(&spec.schema_name) {
-         return Err(Error::InvalidSchemaName(spec.schema_name.clone()));
-      }
-   }
+   // Validate every alias first, before any lock is acquired or anything attached.
+   validate_attached_specs(&specs)?;
 
    // CRITICAL: To prevent deadlocks, we must acquire locks in a consistent global order.
    // Example deadlock without global ordering:
@@ -353,7 +445,7 @@ pub async fn acquire_writer_with_attached(
    let held_writers = all_writers;
 
    // Execute ATTACH commands
-   let mut schema_names = Vec::new();
+   let mut schema_names: Vec<String> = Vec::new();
 
    for spec in specs {
       let path = spec.database.path_str();
@@ -362,9 +454,19 @@ pub async fn acquire_writer_with_attached(
          "ATTACH DATABASE '{}' AS \"{}\"",
          escaped_path, spec.schema_name
       );
-      sqlx::query(sqlx::AssertSqlSafe(attach_sql))
+      if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(attach_sql))
          .execute(&mut *writer)
-         .await?;
+         .await
+      {
+         // Earlier specs in this loop may already be attached to `writer` - unwind
+         // those before returning the original error, or they'd strand on the write
+         // pool's single connection until it goes genuinely idle.
+         let original: Error = err.into();
+         for attached in &schema_names {
+            detach_unwind(&mut writer, attached, &original).await;
+         }
+         return Err(original);
+      }
 
       schema_names.push(spec.schema_name);
    }
@@ -502,6 +604,76 @@ mod tests {
          result.unwrap_err(),
          Error::CannotAttachReadWriteToReader
       ));
+   }
+
+   /// `test_attach_readwrite_to_reader_fails` above passes a single `ReadWrite` spec,
+   /// so `schema_names` is still empty when `CannotAttachReadWriteToReader` fires and
+   /// the unwind loop in `acquire_reader_with_attached` never runs its body. This test
+   /// reaches it: a `ReadOnly` spec attaches successfully first, then a `ReadWrite`
+   /// spec is rejected, and the unwind loop must detach the already-attached alias
+   /// before returning.
+   #[tokio::test]
+   async fn test_reader_unwinds_attached_alias_on_readwrite_rejection() {
+      let temp_dir = TempDir::new().unwrap();
+
+      // Pin to a single read connection so the connection this test's failed attempt
+      // touches is deterministically the one reused by the follow-up acquisition
+      // below - see test_reader_unwinds_partial_attach_on_limit_error for the same
+      // reasoning (otherwise which pooled connection gets reused, and therefore
+      // whether a stranded alias would even be visible, is a coin flip).
+      let main_db = SqliteDatabase::connect(
+         temp_dir.path().join("main.db"),
+         Some(crate::SqliteDatabaseConfig {
+            max_read_connections: 1,
+            ..Default::default()
+         }),
+      )
+      .await
+      .unwrap();
+
+      let ro_db = create_test_db("a_ro.db", &temp_dir).await;
+      let rw_db = create_test_db("z_rw.db", &temp_dir).await;
+
+      // Load-bearing filenames: `acquire_reader_with_attached` sorts specs by
+      // database *path* before the loop runs, regardless of the order given here.
+      // "a_ro.db" must sort before "z_rw.db" so the `ReadOnly` spec is attached
+      // first, making `schema_names` non-empty by the time the `ReadWrite` spec is
+      // rejected. Renaming these files without preserving that ordering would make
+      // this test pass vacuously, exercising the same empty-unwind-loop path as
+      // `test_attach_readwrite_to_reader_fails`.
+      let specs = vec![
+         AttachedSpec {
+            database: ro_db,
+            schema_name: "a_ro".to_string(),
+            mode: AttachedMode::ReadOnly,
+         },
+         AttachedSpec {
+            database: rw_db,
+            schema_name: "z_rw".to_string(),
+            mode: AttachedMode::ReadWrite,
+         },
+      ];
+
+      let result = acquire_reader_with_attached(&main_db, specs).await;
+      assert!(matches!(
+         result.unwrap_err(),
+         Error::CannotAttachReadWriteToReader
+      ));
+
+      // Load-bearing: without unwinding "a_ro" before returning, it would still be
+      // live on the pool's single reused connection, and a freshly acquired reader
+      // would see it alongside "main" instead of "main" alone.
+      let mut conn = main_db.read_pool().unwrap().acquire().await.unwrap();
+      let rows = sqlx::query("PRAGMA database_list")
+         .fetch_all(&mut *conn)
+         .await
+         .unwrap();
+      let names: Vec<String> = rows.iter().map(|row| row.get::<String, _>("name")).collect();
+      assert_eq!(
+         names,
+         vec!["main".to_string()],
+         "attached alias 'a_ro' should have been unwound, leaving only 'main'"
+      );
    }
 
    #[tokio::test]
@@ -754,6 +926,7 @@ mod tests {
       let other_db = create_test_db("other.db", &temp_dir).await;
 
       // Test various invalid schema names
+      let too_long = "a".repeat(MAX_SCHEMA_NAME_LEN + 1);
       let invalid_names = vec![
          "",                        // Empty
          "123invalid",              // Starts with digit
@@ -762,6 +935,7 @@ mod tests {
          "schema;DROP TABLE users", // SQL injection attempt
          "schema'--",               // SQL injection attempt
          "schema/*comment*/",       // Contains special chars
+         &too_long,                 // Longer than MAX_SCHEMA_NAME_LEN
       ];
 
       for invalid_name in invalid_names {
@@ -778,6 +952,28 @@ mod tests {
             invalid_name
          );
       }
+   }
+
+   /// Pins the accepting side of the length cap - the rejecting side is covered
+   /// above. An alias exactly at the limit must still attach, or the cap is
+   /// off-by-one.
+   #[tokio::test]
+   async fn test_schema_name_at_max_length_accepted() {
+      let temp_dir = TempDir::new().unwrap();
+      let main_db = create_test_db("main.db", &temp_dir).await;
+      let other_db = create_test_db("other.db", &temp_dir).await;
+
+      let at_limit = "a".repeat(MAX_SCHEMA_NAME_LEN);
+      let specs = vec![AttachedSpec {
+         database: other_db.clone(),
+         schema_name: at_limit.clone(),
+         mode: AttachedMode::ReadOnly,
+      }];
+
+      let conn = acquire_reader_with_attached(&main_db, specs)
+         .await
+         .expect("an alias exactly at the length limit should be accepted");
+      drop(conn);
    }
 
    #[tokio::test]
@@ -853,6 +1049,246 @@ mod tests {
       assert!(
          result.is_ok(),
          "Should attach database with single quote in path"
+      );
+   }
+
+   /// Asserts that nothing besides `main` is attached on a freshly acquired writer -
+   /// i.e. that no earlier failed attach left an alias stranded on the write pool's
+   /// single pooled connection.
+   async fn assert_only_main_attached(main_db: &SqliteDatabase) {
+      let mut writer = main_db.acquire_writer().await.unwrap();
+      let rows = sqlx::query("PRAGMA database_list")
+         .fetch_all(&mut *writer)
+         .await
+         .unwrap();
+      let names: Vec<String> = rows.iter().map(|row| row.get::<String, _>("name")).collect();
+      assert_eq!(
+         names,
+         vec!["main".to_string()],
+         "no alias should remain attached on a fresh writer"
+      );
+   }
+
+   #[tokio::test]
+   async fn test_reserved_schema_names_rejected() {
+      let temp_dir = TempDir::new().unwrap();
+      let main_db = create_test_db("main.db", &temp_dir).await;
+      let other_db = create_test_db("other.db", &temp_dir).await;
+
+      // SQLite's schema namespace is case-insensitive, so "main"/"temp" must be
+      // rejected regardless of case, and on both the reader and writer paths.
+      for reserved in ["main", "temp", "MAIN", "Temp"] {
+         let specs = vec![AttachedSpec {
+            database: other_db.clone(),
+            schema_name: reserved.to_string(),
+            mode: AttachedMode::ReadOnly,
+         }];
+         let result = acquire_reader_with_attached(&main_db, specs).await;
+         assert!(
+            matches!(result, Err(Error::InvalidSchemaName(_))),
+            "reader should reject reserved alias '{}', got {:?}",
+            reserved,
+            result.err()
+         );
+
+         let specs = vec![AttachedSpec {
+            database: other_db.clone(),
+            schema_name: reserved.to_string(),
+            mode: AttachedMode::ReadOnly,
+         }];
+         let result = acquire_writer_with_attached(&main_db, specs).await;
+         assert!(
+            matches!(result, Err(Error::InvalidSchemaName(_))),
+            "writer should reject reserved alias '{}', got {:?}",
+            reserved,
+            result.err()
+         );
+      }
+
+      // Load-bearing: every rejection above happens in `validate_attached_specs`,
+      // before any lock is acquired or any `ATTACH` is issued, so nothing should be
+      // left attached and a normal alias should still attach cleanly afterward.
+      assert_only_main_attached(&main_db).await;
+      let specs = vec![AttachedSpec {
+         database: other_db.clone(),
+         schema_name: "other".to_string(),
+         mode: AttachedMode::ReadOnly,
+      }];
+      assert!(
+         acquire_writer_with_attached(&main_db, specs).await.is_ok(),
+         "a normal alias should still attach after the reserved-name rejections above"
+      );
+   }
+
+   #[tokio::test]
+   async fn test_duplicate_schema_name_different_paths_rejected() {
+      let temp_dir = TempDir::new().unwrap();
+      let main_db = create_test_db("main.db", &temp_dir).await;
+      let db_b = create_test_db("b.db", &temp_dir).await;
+      let db_c = create_test_db("c.db", &temp_dir).await;
+
+      // Two different files sharing one alias pass the (path-keyed) duplicate-path
+      // check but must still be rejected before any `ATTACH` runs.
+      let specs = vec![
+         AttachedSpec {
+            database: db_b.clone(),
+            schema_name: "x".to_string(),
+            mode: AttachedMode::ReadOnly,
+         },
+         AttachedSpec {
+            database: db_c.clone(),
+            schema_name: "x".to_string(),
+            mode: AttachedMode::ReadOnly,
+         },
+      ];
+      let result = acquire_writer_with_attached(&main_db, specs).await;
+      assert!(
+         matches!(result, Err(Error::DuplicateSchemaName(_))),
+         "two different databases sharing alias 'x' should be rejected, got {:?}",
+         result.err()
+      );
+
+      // Load-bearing: the rejection above must not have attached either database, so
+      // the alias 'x' is still free to use afterward.
+      assert_only_main_attached(&main_db).await;
+      let specs = vec![AttachedSpec {
+         database: db_b.clone(),
+         schema_name: "x".to_string(),
+         mode: AttachedMode::ReadOnly,
+      }];
+      assert!(
+         acquire_writer_with_attached(&main_db, specs).await.is_ok(),
+         "alias 'x' should attach cleanly after the rejected duplicate-alias pair"
+      );
+   }
+
+   #[tokio::test]
+   async fn test_duplicate_schema_name_case_insensitive_rejected() {
+      let temp_dir = TempDir::new().unwrap();
+      let main_db = create_test_db("main.db", &temp_dir).await;
+      let db_x = create_test_db("x.db", &temp_dir).await;
+      let db_upper_x = create_test_db("upper_x.db", &temp_dir).await;
+
+      // "x" and "X" compare unequal as plain strings but collide in SQLite's
+      // case-insensitive schema namespace - a plain `HashSet<String>` would miss this.
+      let specs = vec![
+         AttachedSpec {
+            database: db_x.clone(),
+            schema_name: "x".to_string(),
+            mode: AttachedMode::ReadOnly,
+         },
+         AttachedSpec {
+            database: db_upper_x.clone(),
+            schema_name: "X".to_string(),
+            mode: AttachedMode::ReadOnly,
+         },
+      ];
+      let result = acquire_writer_with_attached(&main_db, specs).await;
+      assert!(
+         matches!(result, Err(Error::DuplicateSchemaName(_))),
+         "the 'x'/'X' pair should be rejected as a case-insensitive duplicate, got {:?}",
+         result.err()
+      );
+
+      assert_only_main_attached(&main_db).await;
+      let specs = vec![AttachedSpec {
+         database: db_x.clone(),
+         schema_name: "x".to_string(),
+         mode: AttachedMode::ReadOnly,
+      }];
+      assert!(
+         acquire_writer_with_attached(&main_db, specs).await.is_ok(),
+         "alias 'x' should attach cleanly after the rejected 'x'/'X' pair"
+      );
+   }
+
+   /// Builds `count` distinct single-table databases with distinct schema aliases,
+   /// suitable for pushing past SQLite's default `SQLITE_LIMIT_ATTACHED` (10).
+   async fn build_many_attach_specs(
+      count: usize,
+      temp_dir: &TempDir,
+   ) -> Vec<AttachedSpec> {
+      let mut specs = Vec::with_capacity(count);
+      for i in 0..count {
+         let db = create_test_db(&format!("many{i}.db"), temp_dir).await;
+         specs.push(AttachedSpec {
+            database: db,
+            schema_name: format!("many{i}"),
+            mode: AttachedMode::ReadOnly,
+         });
+      }
+      specs
+   }
+
+   #[tokio::test]
+   async fn test_writer_unwinds_partial_attach_on_limit_error() {
+      let temp_dir = TempDir::new().unwrap();
+      let main_db = create_test_db("main.db", &temp_dir).await;
+
+      // 11 distinct valid aliases exceeds SQLite's default attach limit of 10, so the
+      // 11th `ATTACH` fails after the first 10 already succeeded on this writer.
+      let specs = build_many_attach_specs(11, &temp_dir).await;
+      let result = acquire_writer_with_attached(&main_db, specs).await;
+      assert!(
+         result.is_err(),
+         "attaching 11 databases should exceed SQLite's default attach limit"
+      );
+
+      // Load-bearing: without unwinding the 10 aliases that attached before the 11th
+      // failed, they would still be live on the write pool's single connection, and
+      // this attach of a brand-new, previously-unused alias would fail too.
+      let unused_db = create_test_db("unused.db", &temp_dir).await;
+      let specs = vec![AttachedSpec {
+         database: unused_db,
+         schema_name: "unused".to_string(),
+         mode: AttachedMode::ReadOnly,
+      }];
+      let follow_up = acquire_writer_with_attached(&main_db, specs).await;
+      assert!(
+         follow_up.is_ok(),
+         "a later attach of an unused alias must succeed once the failed attempt has \
+          unwound: {:?}",
+         follow_up.err()
+      );
+   }
+
+   #[tokio::test]
+   async fn test_reader_unwinds_partial_attach_on_limit_error() {
+      let temp_dir = TempDir::new().unwrap();
+
+      // At the default of 6 read connections, whether the wedged connection is the one
+      // reused by the follow-up attach is a coin flip (measured 5/12 and 6/12 in
+      // practice). Pinning the pool to a single connection makes reuse - and therefore
+      // this test - deterministic.
+      let main_db = SqliteDatabase::connect(
+         temp_dir.path().join("main.db"),
+         Some(crate::SqliteDatabaseConfig {
+            max_read_connections: 1,
+            ..Default::default()
+         }),
+      )
+      .await
+      .unwrap();
+
+      let specs = build_many_attach_specs(11, &temp_dir).await;
+      let result = acquire_reader_with_attached(&main_db, specs).await;
+      assert!(
+         result.is_err(),
+         "attaching 11 databases should exceed SQLite's default attach limit"
+      );
+
+      let unused_db = create_test_db("unused.db", &temp_dir).await;
+      let specs = vec![AttachedSpec {
+         database: unused_db,
+         schema_name: "unused".to_string(),
+         mode: AttachedMode::ReadOnly,
+      }];
+      let follow_up = acquire_reader_with_attached(&main_db, specs).await;
+      assert!(
+         follow_up.is_ok(),
+         "a later attach of an unused alias must succeed once the failed attempt has \
+          unwound: {:?}",
+         follow_up.err()
       );
    }
 }

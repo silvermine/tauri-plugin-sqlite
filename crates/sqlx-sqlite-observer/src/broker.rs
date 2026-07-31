@@ -274,6 +274,7 @@ impl ObservationBroker {
       };
 
       Ok(TableChange {
+         schema: event.schema,
          table: event.table,
          operation: Some(event.operation),
          rowid,

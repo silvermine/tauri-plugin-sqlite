@@ -26,9 +26,11 @@ pub enum Error {
    #[error("Cannot attach database as read-write to a read-only connection")]
    CannotAttachReadWriteToReader,
 
-   /// Invalid schema name provided for attached database
+   /// Invalid schema name provided for attached database. See
+   /// `attached::is_valid_schema_name` for the authoritative rule set this message
+   /// must stay in sync with.
    #[error(
-      "Invalid schema name '{0}': must contain only alphanumeric characters and underscores, and cannot start with a digit"
+      "Invalid schema name '{0}': must be non-empty, contain only alphanumeric characters and underscores, not start with a digit, be at most 64 bytes long, and not be the reserved name 'main' or 'temp' (case-insensitive)"
    )]
    InvalidSchemaName(String),
 
@@ -37,4 +39,11 @@ pub enum Error {
       "Database '{0}' appears multiple times in attached database list (would cause deadlock)"
    )]
    DuplicateAttachedDatabase(String),
+
+   /// Two attached-database specs used the same schema alias. Compared
+   /// case-insensitively, matching SQLite's own schema namespace - a spec named `"x"`
+   /// and one named `"X"` collide at `ATTACH` even though they compare unequal as
+   /// plain strings.
+   #[error("Schema name '{0}' is used by more than one attached database")]
+   DuplicateSchemaName(String),
 }

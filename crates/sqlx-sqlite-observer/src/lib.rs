@@ -144,6 +144,9 @@ pub use observer::SqliteObserver;
 pub use stream::{TableChangeStream, TableChangeStreamExt};
 
 #[cfg(feature = "conn-mgr")]
-pub use conn_mgr::{ObservableSqliteDatabase, ObservableWriteGuard};
+pub use conn_mgr::{
+   ObservableSqliteDatabase, ObservableWriteGuard, UnobservedWriter,
+   acquire_writer_with_attached_brokers,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;

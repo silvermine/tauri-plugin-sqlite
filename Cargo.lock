@@ -3615,6 +3615,7 @@ dependencies = [
 name = "sqlx-sqlite-conn-mgr"
 version = "0.9.0"
 dependencies = [
+ "parking_lot",
  "serde",
  "sqlx",
  "tempfile",

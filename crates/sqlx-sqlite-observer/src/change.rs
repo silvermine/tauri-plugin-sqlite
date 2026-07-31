@@ -129,8 +129,29 @@ pub enum TableChangeEvent {
 /// Contains the table name, operation type, affected rowid, and the
 /// old/new column values (when available). Changes are only sent after
 /// the transaction commits successfully.
+// `#[non_exhaustive]` so future fields are additive rather than a major bump for
+// downstream struct literals and exhaustive destructuring - this struct already
+// grew `schema` once. `broker.rs` is the only place that builds one, and
+// construction stays legal inside this crate.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableChange {
+   /// The schema this change occurred under: `"main"` for the primary database,
+   /// or the caller-chosen `ATTACH ... AS <alias>` name otherwise.
+   ///
+   /// This is provenance metadata - "which schema name did the write use on
+   /// the connection that made it" - not a stable identifier. `schema_name` on
+   /// an attached-database spec is caller-supplied and validated only for
+   /// identifier shape, so the same physical database can legitimately be
+   /// attached under different aliases by different call sites. A subscriber
+   /// on the *owning* database (the one whose broker actually published this
+   /// change - see `ObservableSqliteDatabase::acquire_writer_with_attached`)
+   /// may see an alias chosen by some other, unrelated database's caller, and
+   /// that alias means nothing from the owning database's own perspective,
+   /// where the table is simply `main.<table>`. It is only guaranteed
+   /// consistent for the lifetime of the write guard that produced this
+   /// change - do not treat it as a lookup key or cache it across calls.
+   pub schema: String,
    pub table: String,
    pub operation: Option<ChangeOperation>,
    /// The SQLite internal rowid. This is `None` for WITHOUT ROWID tables

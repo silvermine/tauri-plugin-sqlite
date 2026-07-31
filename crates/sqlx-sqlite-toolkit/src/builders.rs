@@ -12,6 +12,46 @@ use crate::Error;
 use crate::pagination::{KeysetColumn, KeysetPage, build_paginated_query};
 use crate::wrapper::{DatabaseWrapper, WriteQueryResult, bind_value};
 
+/// Runs `detach` and returns `result`, whichever way `result` went.
+///
+/// Every attached-database query below has to detach on its error paths, not just
+/// on success, because nothing else will: the attached guards' `Drop` impls can't
+/// (an async `DETACH` from a synchronous `Drop`), and the pools' `after_release`
+/// hook runs `ROLLBACK` but never `DETACH`. So a bare `?` between acquiring the
+/// connection and detaching strands the alias on a *pooled* connection, and the
+/// next acquisition that reuses both fails at `ATTACH` with "database ... is
+/// already in use". For writes that is effectively permanent: the write pool is
+/// `max_connections(1)`, and only genuine idleness (default 30s) retires the
+/// connection.
+///
+/// A detach failure never masks an error the query already produced - it's logged
+/// instead, as in the transaction paths. On the success path there is no earlier
+/// error to preserve, so a detach failure becomes the returned error and the rows
+/// are dropped: the connection's alias state is then unknown, which is worse to
+/// hand back as success than to report.
+async fn detach_after<T, F, Fut, E>(result: Result<T, Error>, detach: F) -> Result<T, Error>
+where
+   F: FnOnce() -> Fut,
+   Fut: Future<Output = Result<(), E>>,
+   E: std::fmt::Display,
+   Error: From<E>,
+{
+   match result {
+      Ok(value) => {
+         detach().await?;
+         Ok(value)
+      }
+      Err(original) => {
+         if let Err(detach_err) = detach().await {
+            tracing::error!(
+               "detach_all failed while unwinding from an earlier error ({original}): {detach_err}"
+            );
+         }
+         Err(original)
+      }
+   }
+}
+
 /// Builder for SELECT queries returning multiple rows
 pub struct FetchAllBuilder {
    db: Arc<sqlx_sqlite_conn_mgr::SqliteDatabase>,
@@ -56,16 +96,18 @@ impl FetchAllBuilder {
          let mut conn =
             sqlx_sqlite_conn_mgr::acquire_reader_with_attached(&self.db, self.attached).await?;
 
-         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
-         for value in self.values {
-            q = bind_value(q, value);
+         let (query, values) = (self.query, self.values);
+         let result = async {
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
+            for value in values {
+               q = bind_value(q, value);
+            }
+            let rows = sqlx::Executor::fetch_all(&mut *conn, q).await?;
+            decode_rows(rows)
          }
-         let rows = sqlx::Executor::fetch_all(&mut *conn, q).await?;
-         let result = decode_rows(rows)?;
+         .await;
 
-         // Explicit cleanup
-         conn.detach_all().await?;
-         Ok(result)
+         detach_after(result, || conn.detach_all()).await
       }
    }
 }
@@ -122,15 +164,19 @@ impl FetchOneBuilder {
          let mut conn =
             sqlx_sqlite_conn_mgr::acquire_reader_with_attached(&self.db, self.attached).await?;
 
-         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
-         for value in self.values {
-            q = bind_value(q, value);
+         let (query, values) = (self.query, self.values);
+         let result = async {
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
+            for value in values {
+               q = bind_value(q, value);
+            }
+            sqlx::Executor::fetch_all(&mut *conn, q)
+               .await
+               .map_err(Error::from)
          }
-         let rows = sqlx::Executor::fetch_all(&mut *conn, q).await?;
+         .await;
 
-         // Explicit cleanup
-         conn.detach_all().await?;
-         rows
+         detach_after(result, || conn.detach_all()).await?
       };
 
       // Validate row count
@@ -268,15 +314,18 @@ impl FetchPageBuilder {
          let mut conn =
             sqlx_sqlite_conn_mgr::acquire_reader_with_attached(&self.db, self.attached).await?;
 
-         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
-         for value in all_values {
-            q = bind_value(q, value);
+         let result = async {
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for value in all_values {
+               q = bind_value(q, value);
+            }
+            sqlx::Executor::fetch_all(&mut *conn, q)
+               .await
+               .map_err(Error::from)
          }
-         let rows = sqlx::Executor::fetch_all(&mut *conn, q).await?;
+         .await;
 
-         // Explicit cleanup
-         conn.detach_all().await?;
-         rows
+         detach_after(result, || conn.detach_all()).await?
       };
 
       // Decode rows
@@ -376,23 +425,27 @@ impl ExecuteBuilder {
          })
       } else {
          // With attached database(s) - acquire writer with attached database(s)
-         let mut conn =
-            sqlx_sqlite_conn_mgr::acquire_writer_with_attached(self.db.inner(), self.attached)
-               .await?;
+         // (routes through the observer when in use, same as the non-attached
+         // branch above - this is also the main database's own writer, so
+         // observation applies even if nothing ends up attached in ReadWrite
+         // mode)
+         let mut conn = self.db.acquire_writer_with_attached(self.attached).await?;
 
-         let mut q = sqlx::query(sqlx::AssertSqlSafe(self.query));
-         for value in self.values {
-            q = bind_value(q, value);
+         let (query, values) = (self.query, self.values);
+         let result = async {
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
+            for value in values {
+               q = bind_value(q, value);
+            }
+            let result = sqlx::Executor::execute(&mut *conn, q).await?;
+            Ok(WriteQueryResult {
+               rows_affected: result.rows_affected(),
+               last_insert_id: result.last_insert_rowid(),
+            })
          }
-         let result = sqlx::Executor::execute(&mut *conn, q).await?;
-         let write_result = WriteQueryResult {
-            rows_affected: result.rows_affected(),
-            last_insert_id: result.last_insert_rowid(),
-         };
+         .await;
 
-         // Explicit cleanup
-         conn.detach_all().await?;
-         Ok(write_result)
+         detach_after(result, || conn.detach_all()).await
       }
    }
 }

@@ -9,7 +9,9 @@ use sqlx_sqlite_conn_mgr::{SqliteDatabase, SqliteDatabaseConfig, WriteGuard};
 use tracing::warn;
 
 #[cfg(feature = "observer")]
-use sqlx_sqlite_observer::{ObservableSqliteDatabase, ObservableWriteGuard, ObserverConfig};
+use sqlx_sqlite_observer::{
+   ObservableSqliteDatabase, ObservableWriteGuard, ObservationBroker, ObserverConfig,
+};
 
 use crate::Error;
 
@@ -58,6 +60,68 @@ impl DerefMut for WriterGuard {
    }
 }
 
+/// Unified attached-writer guard that routes through the observer when enabled.
+///
+/// Mirrors [`WriterGuard`]'s Regular/Observable split, but for the
+/// attached-database acquisition path (see
+/// [`DatabaseWrapper::acquire_writer_with_attached`]).
+///
+/// Derefs to `SqliteConnection` so it can be used with `sqlx::query().execute()`.
+///
+/// **Important**: call [`detach_all`](Self::detach_all) before dropping. Neither
+/// inner guard detaches in `Drop`, so a dropped guard leaves the alias on the
+/// pooled write connection until that connection is eventually closed - and the
+/// write pool holds a single connection, so every later attach of that alias
+/// fails until then. `#[must_use]` catches the discarded-guard case but cannot
+/// carry this hazard in its message, which is why it's stated here.
+#[must_use = "if unused, the write guard and locks are immediately dropped"]
+pub enum AttachedWriterGuard {
+   /// Plain attached writer from the connection manager - unobserved.
+   Regular(sqlx_sqlite_conn_mgr::AttachedWriteGuard),
+   /// Attached writer that tracks changes via SQLite hooks, routed per-schema
+   /// to whichever database owns each affected table.
+   #[cfg(feature = "observer")]
+   Observable(ObservableWriteGuard),
+}
+
+impl Deref for AttachedWriterGuard {
+   type Target = SqliteConnection;
+
+   fn deref(&self) -> &Self::Target {
+      match self {
+         AttachedWriterGuard::Regular(w) => w,
+         #[cfg(feature = "observer")]
+         AttachedWriterGuard::Observable(w) => w,
+      }
+   }
+}
+
+impl DerefMut for AttachedWriterGuard {
+   fn deref_mut(&mut self) -> &mut Self::Target {
+      match self {
+         AttachedWriterGuard::Regular(w) => &mut *w,
+         #[cfg(feature = "observer")]
+         AttachedWriterGuard::Observable(w) => &mut *w,
+      }
+   }
+}
+
+impl AttachedWriterGuard {
+   /// Detach all attached databases from this writer.
+   ///
+   /// See `sqlx_sqlite_conn_mgr::AttachedWriteGuard::detach_all` /
+   /// `ObservableWriteGuard::detach_all` for what this does on each side;
+   /// both are safe to call only after an explicit commit or rollback has
+   /// already run.
+   pub async fn detach_all(self) -> Result<(), Error> {
+      match self {
+         AttachedWriterGuard::Regular(w) => Ok(w.detach_all().await?),
+         #[cfg(feature = "observer")]
+         AttachedWriterGuard::Observable(w) => Ok(w.detach_all().await?),
+      }
+   }
+}
+
 /// Wrapper around SqliteDatabase that provides a high-level API for database operations.
 ///
 /// This struct is the main entry point for interacting with SQLite databases through
@@ -65,12 +129,15 @@ impl DerefMut for WriterGuard {
 /// builder-pattern APIs for queries, transactions, and write operations.
 ///
 /// When the `observer` feature is enabled, the wrapper can also manage an
-/// `ObservableSqliteDatabase` for change notification support.
+/// `ObservableSqliteDatabase` for change notification support. Observation state
+/// itself lives on the shared `SqliteDatabase` (see [`enable_observation`'s
+/// doc](Self::enable_observation)), not on this struct, so `#[derive(Clone)]`
+/// cloning only `inner` is exactly what makes every clone of a `DatabaseWrapper`,
+/// and every independent `connect()` call to the same path, observe through the
+/// same broker.
 #[derive(Clone)]
 pub struct DatabaseWrapper {
    inner: Arc<SqliteDatabase>,
-   #[cfg(feature = "observer")]
-   observer: Option<ObservableSqliteDatabase>,
 }
 
 impl DatabaseWrapper {
@@ -91,11 +158,32 @@ impl DatabaseWrapper {
    ///
    /// When observation is enabled, returns an observable writer that tracks
    /// changes via SQLite hooks. Otherwise, returns a regular writer.
+   ///
+   /// **Known limitation:** the broker read from the slot here is snapshotted
+   /// into the returned guard for its whole lifetime, so a
+   /// [`disable_observation`] + [`enable_observation`] cycle during an open
+   /// transaction leaves it publishing to the previous broker - silently, as
+   /// far as any status check is concerned. See
+   /// `sqlx_sqlite_observer::ObservableSqliteDatabase::acquire_writer`'s doc
+   /// for the mechanics and [`disable_observation`] for the reachable trigger.
+   ///
+   /// [`disable_observation`]: Self::disable_observation
+   /// [`enable_observation`]: Self::enable_observation
    pub async fn acquire_writer(&self) -> Result<WriterGuard, Error> {
       #[cfg(feature = "observer")]
-      if let Some(ref observable) = self.observer {
-         let writer = observable.acquire_writer().await.map_err(Error::Observer)?;
-         return Ok(WriterGuard::Observable(writer));
+      {
+         // Read the broker out of the slot and drop the guard immediately -
+         // `get()` already does this internally - before doing anything async,
+         // so no lock guard is ever held across an `.await` here. The slot
+         // holds `Arc<ObservationBroker>`, not `Arc<ObservableSqliteDatabase>`
+         // (see `ObservableSqliteDatabase::from_broker`'s doc), so the handle
+         // is rebuilt here rather than read out directly.
+         let broker = self.inner.observer_slot().get::<ObservationBroker>();
+         if let Some(broker) = broker {
+            let observable = ObservableSqliteDatabase::from_broker(Arc::clone(&self.inner), broker);
+            let writer = observable.acquire_writer().await.map_err(Error::Observer)?;
+            return Ok(WriterGuard::Observable(writer));
+         }
       }
 
       Ok(WriterGuard::Regular(self.inner.acquire_writer().await?))
@@ -106,8 +194,108 @@ impl DatabaseWrapper {
    /// This always bypasses the observer, even when observation is enabled.
    /// Useful when you need a writer for operations that should not trigger
    /// change notifications (e.g., internal bookkeeping).
+   ///
+   /// **This is an intentional, documented bypass, not a hole to close.**
+   /// Callers who reach for this method are opting out of observation for this
+   /// one writer; every other writer obtained via [`acquire_writer`] on this
+   /// same (now database-wide) observation state still gets tracked normally.
+   /// When observation is enabled, calling this logs a `tracing::warn!` as a
+   /// development-time aid - it compiles out entirely in release builds, since
+   /// this workspace pins `tracing` with `release_max_level_off`, so don't rely
+   /// on it surfacing in a shipped app. Reads never need an equivalent bypass or
+   /// warning: [`fetch_all`](Self::fetch_all), [`fetch_one`](Self::fetch_one),
+   /// and [`fetch_page`](Self::fetch_page) all go through the read pool, which
+   /// is opened `read_only(true)` and therefore can never write, observed or not.
+   ///
+   /// [`acquire_writer`]: Self::acquire_writer
    pub async fn acquire_regular_writer(&self) -> Result<WriteGuard, Error> {
+      // Checked via the slot directly rather than `is_observing()`, which goes
+      // through `observable()` and builds a whole handle only to drop it - the
+      // `warn!` compiles out in release but the condition does not.
+      #[cfg(feature = "observer")]
+      if self
+         .inner
+         .observer_slot()
+         .get::<ObservationBroker>()
+         .is_some()
+      {
+         warn!(
+            "acquire_regular_writer() called while observation is enabled on this \
+             database; writes through this guard will not be tracked or published \
+             to subscribers. This is intentional if you meant to bypass \
+             observation - otherwise use acquire_writer() instead."
+         );
+      }
+
       Ok(self.inner.acquire_writer().await?)
+   }
+
+   /// Acquire a writer guard with one or more databases attached.
+   ///
+   /// When observation is enabled, routes through the observer so that writes
+   /// into attached databases are tracked too - each change publishes to the
+   /// broker of whichever database *owns* the affected table, not necessarily
+   /// this one. See
+   /// `sqlx_sqlite_observer::acquire_writer_with_attached_brokers`
+   /// for the exact routing rule. When observation is not enabled, this falls
+   /// back to the plain conn-mgr attached-writer acquisition, identical to
+   /// calling `sqlx_sqlite_conn_mgr::acquire_writer_with_attached` directly.
+   ///
+   /// **Observation is checked on both sides, not just this database.** The
+   /// observable path is taken when this database is observed *or* any
+   /// `ReadWrite` spec's database is, since an attachment observed on its own
+   /// still needs hooks registered for its subscribers to hear writes made
+   /// through this call. Only when neither side is observed does this fall back
+   /// to the plain conn-mgr call, which keeps an entirely unobserved caller
+   /// from paying `lock_handle()` and FFI hook registration for nothing, and
+   /// from newly requiring `SQLITE_ENABLE_PREUPDATE_HOOK` on a build that never
+   /// asked for observation. [`acquire_writer_with_attached_brokers`] takes a
+   /// free function's `Option` broker rather than being a method because this
+   /// call has no `Self` to invoke when its own observation is off.
+   ///
+   /// This gate and that function's own map build are not atomic: it re-reads
+   /// every slot. If observation is disabled on all sides in between, the
+   /// observable path is taken with an empty map, which it handles by skipping
+   /// hook registration - so the race is inert rather than contradicting the
+   /// rationale above.
+   ///
+   /// [`acquire_writer_with_attached_brokers`]: sqlx_sqlite_observer::acquire_writer_with_attached_brokers
+   pub async fn acquire_writer_with_attached(
+      &self,
+      specs: Vec<sqlx_sqlite_conn_mgr::AttachedSpec>,
+   ) -> Result<AttachedWriterGuard, Error> {
+      #[cfg(feature = "observer")]
+      {
+         // Same immediate clone-and-drop, and same slot-holds-a-broker
+         // rebuild, as acquire_writer() - see its comments.
+         let main_broker = self.inner.observer_slot().get::<ObservationBroker>();
+
+         // Whether any ReadWrite spec's own database is observed, independent of
+         // this database's `main_broker` above - see this method's doc for why
+         // either side alone is enough to take the observable path.
+         let any_readwrite_attachment_observed = specs.iter().any(|spec| {
+            spec.mode == sqlx_sqlite_conn_mgr::AttachedMode::ReadWrite
+               && spec
+                  .database
+                  .observer_slot()
+                  .get::<ObservationBroker>()
+                  .is_some()
+         });
+
+         if main_broker.is_some() || any_readwrite_attachment_observed {
+            let guard = sqlx_sqlite_observer::acquire_writer_with_attached_brokers(
+               &self.inner,
+               main_broker,
+               specs,
+            )
+            .await?;
+            return Ok(AttachedWriterGuard::Observable(guard));
+         }
+      }
+
+      Ok(AttachedWriterGuard::Regular(
+         sqlx_sqlite_conn_mgr::acquire_writer_with_attached(&self.inner, specs).await?,
+      ))
    }
 
    /// Begin an interruptible transaction that can be paused and resumed.
@@ -163,11 +351,7 @@ impl DatabaseWrapper {
    ) -> Result<Self, Error> {
       let db = SqliteDatabase::connect(abs_path, custom_config).await?;
 
-      Ok(Self {
-         inner: db,
-         #[cfg(feature = "observer")]
-         observer: None,
-      })
+      Ok(Self { inner: db })
    }
 
    /// Create a builder for write queries (INSERT/UPDATE/DELETE).
@@ -350,6 +534,11 @@ impl DatabaseWrapper {
    ///
    /// Runs all pending migrations from the provided migrator.
    /// SQLx tracks applied migrations, so this is safe to call multiple times.
+   ///
+   /// Migrations run through `self.inner` directly, never through the observer,
+   /// even when observation is enabled - schema changes are not row changes and
+   /// have no `TableChange` representation, so there's nothing for a subscriber
+   /// to receive here regardless.
    pub async fn run_migrations(
       &self,
       migrator: &sqlx_sqlite_conn_mgr::Migrator,
@@ -362,8 +551,10 @@ impl DatabaseWrapper {
    ///
    /// Checkpoints the WAL and closes all connection pools.
    /// If observation is enabled, it is disabled first to unregister SQLite hooks
-   /// and allow the write connection to close cleanly.
-   pub async fn close(mut self) -> Result<(), Error> {
+   /// and allow the write connection to close cleanly - which, per
+   /// [`disable_observation`](Self::disable_observation), affects every handle
+   /// to this database.
+   pub async fn close(self) -> Result<(), Error> {
       #[cfg(feature = "observer")]
       self.disable_observation();
 
@@ -375,8 +566,9 @@ impl DatabaseWrapper {
    ///
    /// Removes the main database file, WAL, and SHM files.
    /// If observation is enabled, it is disabled first to unregister SQLite hooks
-   /// and allow the write connection to close cleanly.
-   pub async fn remove(mut self) -> Result<(), Error> {
+   /// and allow the write connection to close cleanly. Same database-wide caveat
+   /// as [`close`](Self::close).
+   pub async fn remove(self) -> Result<(), Error> {
       #[cfg(feature = "observer")]
       self.disable_observation();
 
@@ -389,12 +581,35 @@ impl DatabaseWrapper {
    /// After calling this, write operations will be tracked and subscribers
    /// can receive change notifications.
    ///
-   /// **Additive, not destructive:** if observation is already enabled, the existing
-   /// broker is reused rather than replaced. The requested tables are unioned into
-   /// its observed-table set, and any subscribers created before this call keep
-   /// receiving notifications uninterrupted — this is what allows independent callers
-   /// (e.g. multiple windows observing the same database) to call `enable_observation`
-   /// without tearing down each other's subscriptions.
+   /// **Database-wide, not per-handle (issue #53):** observation state lives on
+   /// the shared `SqliteDatabase` behind `self.inner`, not on this
+   /// `DatabaseWrapper` value. Every clone of this wrapper and every independent
+   /// `DatabaseWrapper::connect()` call that resolves to the same underlying file
+   /// observes through the same broker - there is no such thing as "my own"
+   /// observation separate from anyone else's handle to this database. `:memory:`
+   /// databases are the one exception: each `connect()` call gets its own
+   /// `SqliteDatabase` (they're excluded from the path registry), so they're
+   /// independently observed by construction, not because of anything special
+   /// here.
+   ///
+   /// **Additive, not destructive (issue #54):** if observation is already
+   /// enabled - by this handle, a clone of it, or a completely independent
+   /// connection to the same database - the existing broker is reused rather
+   /// than replaced. The requested tables are unioned into its observed-table
+   /// set, and any subscribers created before this call keep receiving
+   /// notifications uninterrupted. This is what allows independent callers (e.g.
+   /// multiple windows observing the same database) to call `enable_observation`
+   /// without tearing down each other's subscriptions. The check for an existing
+   /// broker, the creation of a new one, and - on the reuse path - the merge of
+   /// the requested tables into the existing broker's observed set all happen
+   /// under the database's observer slot's single write lock, so two callers
+   /// racing to be first can't each build their own broker and have one
+   /// silently overwrite (and orphan the subscribers of) the other, and a
+   /// concurrent [`disable_observation`](Self::disable_observation) can't land
+   /// in the middle of the merge and have this call's tables register against
+   /// a broker the slot no longer points to. The lock is released before this
+   /// returns, though, so a `disable_observation()` immediately afterward still
+   /// tears down what this call just set up.
    ///
    /// `config.channel_capacity` and `config.capture_values` can only take effect on
    /// the *first* call that enables observation for this database. Both are baked
@@ -413,69 +628,158 @@ impl DatabaseWrapper {
    /// is to read them back afterward via `broker().channel_capacity()` /
    /// `.capture_values()`. Call [`disable_observation`](Self::disable_observation)
    /// first if you need to change these values, accepting that existing
-   /// subscribers will be dropped.
+   /// subscribers will be dropped - and, per the database-wide note above, dropped
+   /// for every handle to this database, not just this one.
    ///
    /// Requires the `observer` feature.
    #[cfg(feature = "observer")]
-   pub fn enable_observation(&mut self, config: ObserverConfig) {
-      if let Some(existing) = &self.observer {
-         let broker = existing.broker();
+   pub fn enable_observation(&self, config: ObserverConfig) {
+      let requested_channel_capacity = config.channel_capacity;
+      let requested_capture_values = config.capture_values;
+      let requested_tables = config.tables.clone();
+      let inner = Arc::clone(&self.inner);
 
-         if config.channel_capacity != broker.channel_capacity()
-            || config.capture_values != broker.capture_values()
-         {
-            warn!(
-               requested_channel_capacity = config.channel_capacity,
-               active_channel_capacity = broker.channel_capacity(),
-               requested_capture_values = config.capture_values,
-               active_capture_values = broker.capture_values(),
-               "enable_observation() called with different channel_capacity/capture_values \
-                while observation is already active; keeping the original values since \
-                recreating the broadcast channel would drop existing subscribers. Only the \
-                requested tables were merged in."
-            );
-         }
+      // `get_or_init_with` rather than `get_or_init` so the merge below runs under
+      // the same write lock that decided "reuse, don't create" - see its doc.
+      // Doing the merge after that lock released would leave a window for a
+      // concurrent `disable_observation()` to clear the slot, orphaning this
+      // call's `observe_tables()` on a broker nothing points to.
+      let result = self.inner.observer_slot().get_or_init_with(
+         || {
+            // `ObservableSqliteDatabase::new` stays the single place an
+            // `ObserverConfig` becomes a broker, but only the broker goes in the
+            // slot - see `ObservableSqliteDatabase::from_broker`'s doc for why
+            // storing the whole handle would form a reference cycle.
+            let observable = ObservableSqliteDatabase::new(inner, config);
+            Arc::clone(observable.broker())
+         },
+         |broker| {
+            // Merge path: a broker already existed (this handle's own prior
+            // call, a clone's, or an entirely independent connection's) and
+            // get_or_init_with left it in place rather than replacing it.
+            if requested_channel_capacity != broker.channel_capacity()
+               || requested_capture_values != broker.capture_values()
+            {
+               warn!(
+                  requested_channel_capacity = requested_channel_capacity,
+                  active_channel_capacity = broker.channel_capacity(),
+                  requested_capture_values = requested_capture_values,
+                  active_capture_values = broker.capture_values(),
+                  "enable_observation() called with different channel_capacity/capture_values \
+                   while observation is already active; keeping the original values since \
+                   recreating the broadcast channel would drop existing subscribers. Only the \
+                   requested tables were merged in."
+               );
+            }
 
-         if !config.tables.is_empty() {
-            broker.observe_tables(config.tables.iter().map(String::as_str));
-         }
+            if !requested_tables.is_empty() {
+               broker.observe_tables(requested_tables.iter().map(String::as_str));
+            }
+         },
+      );
 
-         return;
+      if result.is_none() {
+         // The slot holds a value of some other type - a programming error
+         // elsewhere in this process, since this method is the slot's only
+         // writer. Nothing safe to do here but warn and leave observation
+         // exactly as it was; see `ObserverSlot::get_or_init`'s doc for why
+         // this can't happen from repeated calls to this method alone.
+         warn!(
+            "enable_observation: observer slot for this database holds a value \
+             of an unexpected type; leaving observation state untouched"
+         );
       }
-
-      self.observer = Some(ObservableSqliteDatabase::new(
-         Arc::clone(&self.inner),
-         config,
-      ));
    }
 
    /// Disable observation on this database.
    ///
-   /// Drops the observable wrapper and stops tracking changes.
+   /// Clears the database's observer slot and stops tracking changes.
    /// Existing subscribers will stop receiving notifications.
+   ///
+   /// **Affects every handle to this database (issue #53).** Observation is
+   /// database-wide (see [`enable_observation`](Self::enable_observation)), so
+   /// this tears it down for clones and independent `connect()` callers alike,
+   /// including ones this call has no way to know about. Nothing here counts
+   /// how many callers still want observation; a caller that needs that must
+   /// coordinate above this crate.
+   ///
+   /// **The coordination that exists above this crate does not cover you.** The
+   /// `tauri-plugin-sqlite` layer reference-counts observation per *webview
+   /// label* (issue #54), and a Rust caller holding a `DatabaseWrapper` registers
+   /// nothing there. So the plugin's `unobserve()` (or a window being destroyed)
+   /// can drive that count to zero and call this method on the database you are
+   /// observing, ending your subscription without you having called anything.
+   /// Symmetrically, calling this yourself leaves those registrations non-zero
+   /// while the slot is empty: the plugin's `subscribe()` then fails with
+   /// `OBSERVATION_NOT_ENABLED`, and the next `observe()` builds a fresh broker
+   /// that other windows' existing subscriptions are not bound to. A Rust
+   /// consumer that must not be torn down needs its own database file - the
+   /// broker is keyed by canonical path, so registering the same file under a
+   /// different plugin key still shares it.
+   ///
+   /// **Known limitation: this clears the slot, but never reaches a writer
+   /// that already has a broker bound.** Calling this and then
+   /// [`enable_observation`](Self::enable_observation) while such a writer's
+   /// transaction is open leaves it publishing to the broker it bound at
+   /// acquisition, so a subscriber created after the cycle misses that commit
+   /// while pre-existing ones still receive it - with `is_observing()`, the new
+   /// `subscribe()`, and the commit all reporting success. The reachable
+   /// trigger: the last window's `unobserve()` runs, then a new caller's
+   /// `observe()`, while another caller's interruptible transaction is still
+   /// open. See
+   /// `sqlx_sqlite_observer::ObservableSqliteDatabase::acquire_writer`'s doc
+   /// for the mechanics and the deferred fix.
    ///
    /// Requires the `observer` feature.
    #[cfg(feature = "observer")]
-   pub fn disable_observation(&mut self) {
-      self.observer = None;
+   pub fn disable_observation(&self) {
+      self.inner.observer_slot().clear();
    }
 
-   /// Get a reference to the observable database, if observation is enabled.
+   /// Get an owned handle to the observable database, if observation is enabled.
    ///
    /// Returns `None` if observation has not been enabled via `enable_observation()`.
    ///
+   /// Returns an owned `ObservableSqliteDatabase` rather than a reference, since a
+   /// reference into the observer slot can't escape the slot's internal lock
+   /// guard. The slot itself only holds the broker (see
+   /// `ObservableSqliteDatabase::from_broker`'s doc for why), so the handle is
+   /// rebuilt from `self.inner` plus that broker - two refcount bumps, not a deep
+   /// copy - semantically identical to holding a reference for as long as you need
+   /// one.
+   ///
    /// Requires the `observer` feature.
    #[cfg(feature = "observer")]
-   pub fn observable(&self) -> Option<&ObservableSqliteDatabase> {
-      self.observer.as_ref()
+   pub fn observable(&self) -> Option<ObservableSqliteDatabase> {
+      self
+         .inner
+         .observer_slot()
+         .get::<ObservationBroker>()
+         .map(|broker| ObservableSqliteDatabase::from_broker(Arc::clone(&self.inner), broker))
    }
 
    /// Returns true if observation is currently enabled on this database.
    ///
+   /// Deliberately defined in terms of [`observable`](Self::observable) rather
+   /// than the slot's own `is_set()` (which only checks that *something* is
+   /// there, not that it downcasts to the `ObservationBroker` this layer
+   /// stores). On the slot type-mismatch case documented on
+   /// `ObserverSlot::get`, `is_set()` would report `true` while `observable()`
+   /// returns `None` - a predicate built on `is_set()` would then claim
+   /// observation is on while every acquisition path silently took its
+   /// unobserved branch. Defining it this way keeps "is observing" and
+   /// "`observable()` returns `Some`" in agreement, which is what makes this
+   /// usable as an external invariant: the `tauri-plugin-sqlite` layer's
+   /// lock-order tests assert it against its own observer registrations. The
+   /// acquisition paths in this file - [`acquire_writer`](Self::acquire_writer)
+   /// and [`acquire_regular_writer`](Self::acquire_regular_writer) - read the
+   /// slot directly instead, since they need the broker itself (or just a
+   /// boolean) without building a handle only to drop it.
+   ///
    /// Requires the `observer` feature.
    #[cfg(feature = "observer")]
    pub fn is_observing(&self) -> bool {
-      self.observer.is_some()
+      self.observable().is_some()
    }
 }
 
@@ -513,14 +817,23 @@ impl InterruptibleTransactionBuilder {
          let guard = self.db.acquire_writer().await?;
          TransactionWriter::from(guard)
       } else {
-         let guard =
-            sqlx_sqlite_conn_mgr::acquire_writer_with_attached(self.db.inner(), self.attached)
-               .await?;
-         TransactionWriter::Attached(guard)
+         let guard = self.db.acquire_writer_with_attached(self.attached).await?;
+         TransactionWriter::from(guard)
       };
 
-      // Begin transaction
-      writer.begin_immediate().await?;
+      // Begin transaction. A failure here (a busy database, say) is the one early
+      // return not covered by `ActiveInterruptibleTransaction`'s Drop, since the
+      // writer hasn't been handed over yet - so detach explicitly, or the alias
+      // strands on the pooled write connection (see `builders::detach_after`).
+      if let Err(err) = writer.begin_immediate().await {
+         if let Err(detach_err) = writer.detach_if_attached().await {
+            tracing::error!(
+               "detach_all failed after BEGIN IMMEDIATE failed: {}",
+               detach_err
+            );
+         }
+         return Err(err);
+      }
 
       // Create active transaction and execute initial statements
       let mut active_tx = ActiveInterruptibleTransaction::new(
@@ -618,14 +931,22 @@ impl TransactionExecutionBuilder {
          let guard = self.db.acquire_writer().await?;
          TransactionWriter::from(guard)
       } else {
-         let guard =
-            sqlx_sqlite_conn_mgr::acquire_writer_with_attached(self.db.inner(), self.attached)
-               .await?;
-         TransactionWriter::Attached(guard)
+         let guard = self.db.acquire_writer_with_attached(self.attached).await?;
+         TransactionWriter::from(guard)
       };
 
-      // Begin transaction
-      writer.begin_immediate().await?;
+      // Begin transaction. Same reasoning as the commit/rollback arms below: this
+      // early return has to detach too, or the alias strands on the single write
+      // connection.
+      if let Err(err) = writer.begin_immediate().await {
+         if let Err(detach_err) = writer.detach_if_attached().await {
+            tracing::error!(
+               "detach_all failed after BEGIN IMMEDIATE failed: {}",
+               detach_err
+            );
+         }
+         return Err(err);
+      }
 
       // Execute all statements
       let exec_result = async {

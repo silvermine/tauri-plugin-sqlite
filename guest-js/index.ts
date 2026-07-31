@@ -34,6 +34,11 @@ export interface AttachedDatabaseSpec {
    /**
     * Schema name to use for the attached database in queries
     * (e.g., "orders" to query as "SELECT * FROM orders.table_name")
+    *
+    * Must be a plain identifier - letters, digits and underscores only, not
+    * starting with a digit - and at most 64 characters. Anything else fails with
+    * `CONNECTION_ERROR`. The name is also reported as `schema` on change
+    * notifications for this database.
     */
    schemaName: string;
 
@@ -360,6 +365,16 @@ export type ColumnValue =
  * Notification of a change to a database table.
  */
 export interface TableChange {
+
+   /**
+    * The schema this change occurred under: `"main"` for the primary
+    * database, or an attached database's alias otherwise.
+    *
+    * This is provenance metadata, not a stable identifier - the alias is
+    * chosen by whoever attached the database and isn't guaranteed to be
+    * consistent across calls. Don't use it as a lookup key.
+    */
+   schema: string;
 
    /** Name of the table that was changed */
    table: string;

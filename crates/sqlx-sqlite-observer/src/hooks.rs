@@ -9,8 +9,10 @@
 //! Use [`is_preupdate_hook_enabled()`] to check at runtime whether the linked
 //! SQLite library supports this feature.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::panic::catch_unwind;
+use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::Arc;
 
@@ -82,8 +84,17 @@ impl SqliteValue {
 }
 
 /// Raw change event captured by the preupdate hook before commit decision.
+///
+/// `#[non_exhaustive]` for the same reason as
+/// [`TableChange`](crate::change::TableChange); only `preupdate_callback` builds
+/// one.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PreUpdateEvent {
+   /// The schema this change occurred under (`"main"` or an `ATTACH` alias).
+   /// See [`TableChange::schema`](crate::change::TableChange::schema) for what
+   /// this is - and is not - safe to rely on.
+   pub schema: String,
    pub table: String,
    pub operation: ChangeOperation,
    pub old_rowid: i64,
@@ -94,10 +105,14 @@ pub struct PreUpdateEvent {
 
 /// Context data passed to SQLite hook callbacks.
 ///
-/// Stored as user_data pointer in SQLite hooks. The Arc ensures the broker
-/// stays alive as long as hooks are registered.
+/// Stored as user_data pointer in SQLite hooks. Keyed by schema alias
+/// (`"main"` for the primary database, the `ATTACH` alias otherwise) rather
+/// than holding a single broker, so that one connection with attached
+/// databases can route each change to the broker of whichever database
+/// actually owns the affected table. The `Arc`s ensure each broker stays
+/// alive as long as hooks are registered.
 struct HookContext {
-   broker: Arc<ObservationBroker>,
+   brokers: HashMap<String, Arc<ObservationBroker>>,
 }
 
 /// Checks if the linked SQLite library was compiled with `SQLITE_ENABLE_PREUPDATE_HOOK`.
@@ -131,13 +146,22 @@ pub fn is_preupdate_hook_enabled() -> bool {
 /// - Must be called from the same thread that owns the connection, or
 ///   the connection must be in serialized threading mode
 ///
+/// # Arguments
+///
+/// * `db` - the connection to register hooks on
+/// * `brokers` - schema alias -> broker map. `"main"` covers the primary
+///   database; any other key routes changes made under that `ATTACH` alias to
+///   the corresponding broker. A schema with no entry here has its changes
+///   silently dropped by the preupdate callback rather than misrouted to some
+///   other schema's broker - see [`preupdate_callback`].
+///
 /// # Errors
 ///
 /// Returns an error if preupdate hooks are not supported by the linked SQLite
 /// library, or if the hooks cannot be registered.
 pub unsafe fn register_hooks(
    db: *mut sqlite3,
-   broker: Arc<ObservationBroker>,
+   brokers: HashMap<String, Arc<ObservationBroker>>,
 ) -> crate::Result<()> {
    // Check at runtime if preupdate hook is supported
    if !is_preupdate_hook_enabled() {
@@ -153,7 +177,7 @@ pub unsafe fn register_hooks(
 
    // Heap-allocate the context so it outlives this function. SQLite's C API
    // requires a raw pointer to pass user data to callbacks.
-   let context = Box::new(HookContext { broker });
+   let context = Box::new(HookContext { brokers });
    // Transfer ownership out of Rust's memory management.
    //
    // NOTE: This pointer is shared across all three hooks and is intentionally
@@ -206,7 +230,9 @@ pub unsafe fn unregister_hooks(db: *mut sqlite3) {
 /// Preupdate hook callback - captures changes before they're committed.
 ///
 /// Called by SQLite for INSERT, UPDATE, and DELETE operations. Captures old/new
-/// row values and buffers them in the broker until commit or rollback.
+/// row values and buffers them in the broker of whichever database owns the
+/// affected table (selected by schema - see [`register_hooks`]) until commit
+/// or rollback.
 ///
 /// Note: `user_data` is SQLite's C API term for callback context (our HookContext),
 /// unrelated to our app's user data.
@@ -214,29 +240,59 @@ unsafe extern "C" fn preupdate_callback(
    user_data: *mut c_void,
    db: *mut sqlite3,
    op: c_int,
-   _database: *const c_char,
+   database: *const c_char,
    table: *const c_char,
    old_rowid: i64,
    new_rowid: i64,
 ) {
-   if user_data.is_null() || table.is_null() {
+   if user_data.is_null() || database.is_null() || table.is_null() {
       return;
    }
 
-   // Catch any panics to prevent unwinding across the FFI boundary (which is UB).
+   // Catch any panics to prevent unwinding across the FFI boundary, which aborts
+   // the process (a guarantee since Rust 1.81, UB before it; MSRV here is 1.94).
    let result = catch_unwind(|| {
       // SAFETY: user_data is a valid HookContext pointer created in register_hooks
       // and remains valid until unregister_hooks is called.
       let context = unsafe { &*(user_data as *const HookContext) };
 
-      // SAFETY: table is a non-null C string provided by SQLite, valid for this callback.
-      let table_name = match unsafe { CStr::from_ptr(table) }.to_str() {
-         Ok(s) => s.to_string(),
+      // SAFETY: database is a non-null C string provided by SQLite, valid for
+      // this callback. SQLite reports "main" for the primary schema and the
+      // caller-chosen ATTACH alias otherwise. Kept as `&str` through both
+      // gates below (broker lookup, then observed-table check) rather than
+      // allocated right away - `HashMap::get`/`HashSet::contains` both take
+      // `&str`, so an unobserved schema or table costs no allocation on this
+      // per-row FFI hot path. Only a change that clears both gates has its
+      // strings turned into owned `String`s, for the `PreUpdateEvent` below.
+      let schema_name = match unsafe { CStr::from_ptr(database) }.to_str() {
+         Ok(s) => s,
          Err(_) => return,
       };
 
+      // SAFETY: table is a non-null C string provided by SQLite, valid for this callback.
+      let table_name = match unsafe { CStr::from_ptr(table) }.to_str() {
+         Ok(s) => s,
+         Err(_) => return,
+      };
+
+      // No broker is registered for this schema - a `temp` table, an attached
+      // database with no observation enabled, or a `ReadOnly` attachment whose
+      // broker was deliberately left out of the map (see
+      // `ObservableSqliteDatabase::acquire_writer_with_attached`'s doc). Either
+      // way, drop the change rather than publish it under some other schema's
+      // broker. `trace!` rather than `warn!` because the `temp` case is routine
+      // and a warning would cry wolf.
+      let Some(broker) = context.brokers.get(schema_name) else {
+         trace!(
+            schema = %schema_name,
+            table = %table_name,
+            "Dropping change for a schema with no broker in the hook map"
+         );
+         return;
+      };
+
       // Check if this table is being observed
-      if !context.broker.is_table_observed(&table_name) {
+      if !broker.is_table_observed(table_name) {
          return;
       }
 
@@ -247,7 +303,7 @@ unsafe extern "C" fn preupdate_callback(
          _ => return,
       };
 
-      trace!(table = %table_name, ?operation, old_rowid, new_rowid, "Preupdate hook fired");
+      trace!(schema = %schema_name, table = %table_name, ?operation, old_rowid, new_rowid, "Preupdate hook fired");
 
       // SAFETY: db is a valid sqlite3 pointer provided by SQLite for this callback.
       let column_count = unsafe { sqlite3_preupdate_count(db) };
@@ -294,7 +350,8 @@ unsafe extern "C" fn preupdate_callback(
       };
 
       let event = PreUpdateEvent {
-         table: table_name,
+         schema: schema_name.to_string(),
+         table: table_name.to_string(),
          operation,
          old_rowid,
          new_rowid,
@@ -302,13 +359,18 @@ unsafe extern "C" fn preupdate_callback(
          new_values,
       };
 
-      context.broker.on_preupdate(event);
+      broker.on_preupdate(event);
    });
 
    if result.is_err() {
-      // Cannot use tracing here since it may have been the source of the panic.
-      // The best we can do is silently absorb it to prevent UB.
-      eprintln!("sqlx-sqlite-observer: panic in preupdate_callback (absorbed to prevent UB)");
+      // Cannot use tracing here since it may have been the source of the panic,
+      // nor eprintln!, which panics on a write failure - and that unwind would
+      // abort the process. Absorbing it is the best available outcome. The other
+      // two callbacks below report their own panics the same way.
+      let _ = writeln!(
+         std::io::stderr(),
+         "sqlx-sqlite-observer: panic in preupdate_callback (absorbed to keep the process alive)"
+      );
    }
 }
 
@@ -317,6 +379,12 @@ unsafe extern "C" fn preupdate_callback(
 /// Called by SQLite when a transaction is about to commit. Returning 0 allows
 /// the commit to proceed; returning non-zero would cause a rollback.
 ///
+/// `sqlite3_commit_hook`'s callback takes no schema argument and fires exactly
+/// once per transaction regardless of how many schemas (main plus any attached
+/// databases) were touched, so every broker in the map must be flushed here -
+/// a single-broker flush would strand an attached database's buffered changes
+/// with no commit of its own to release them on.
+///
 /// Note: `user_data` is SQLite's C API term for callback context (our HookContext),
 /// unrelated to application-level user data.
 unsafe extern "C" fn commit_callback(user_data: *mut c_void) -> c_int {
@@ -324,16 +392,28 @@ unsafe extern "C" fn commit_callback(user_data: *mut c_void) -> c_int {
       return 0;
    }
 
-   // Catch any panics to prevent unwinding across the FFI boundary (which is UB).
-   let result = catch_unwind(|| {
-      // SAFETY: user_data is a valid HookContext pointer created in register_hooks.
-      let context = unsafe { &*(user_data as *const HookContext) };
-      trace!("Commit hook fired - flushing changes");
-      context.broker.on_commit();
-   });
+   // SAFETY: user_data is a valid HookContext pointer created in register_hooks.
+   let context = unsafe { &*(user_data as *const HookContext) };
+   // Wrapped because it's the one other thing in this fn that can panic, and an
+   // unwind out of an extern "C" fn aborts the process. Nothing to report if it
+   // does fail - the panic would be coming from the logger itself.
+   let _ = catch_unwind(|| trace!("Commit hook fired - flushing changes"));
 
-   if result.is_err() {
-      eprintln!("sqlx-sqlite-observer: panic in commit_callback (absorbed to prevent UB)");
+   // catch_unwind wraps each broker's flush individually rather than the
+   // whole loop: a panic partway through must not skip flushing the brokers
+   // that come after it. With a single broker this distinction was moot: the
+   // fan-out is what makes it matter, since brokers left unflushed here have
+   // their buffered events resurface as phantom changes on the connection's
+   // *next* commit rather than this one.
+   for broker in context.brokers.values() {
+      if catch_unwind(AssertUnwindSafe(|| broker.on_commit())).is_err() {
+         // Reported via writeln! to stderr rather than tracing - see
+         // preupdate_callback's equivalent for why.
+         let _ = writeln!(
+            std::io::stderr(),
+            "sqlx-sqlite-observer: panic in commit_callback (absorbed to keep the process alive)"
+         );
+      }
    }
 
    0 // Allow commit to proceed
@@ -341,7 +421,9 @@ unsafe extern "C" fn commit_callback(user_data: *mut c_void) -> c_int {
 
 /// Rollback hook callback - discards buffered changes.
 ///
-/// Called by SQLite when a transaction is rolled back.
+/// Called by SQLite when a transaction is rolled back. Fans out to every
+/// broker in the map for the same reason [`commit_callback`] does - one
+/// rollback hook fires for the whole transaction, not per schema.
 ///
 /// Note: `user_data` is SQLite's C API term for callback context (our HookContext),
 /// unrelated to application-level user data.
@@ -350,16 +432,24 @@ unsafe extern "C" fn rollback_callback(user_data: *mut c_void) {
       return;
    }
 
-   // Catch any panics to prevent unwinding across the FFI boundary (which is UB).
-   let result = catch_unwind(|| {
-      // SAFETY: user_data is a valid HookContext pointer created in register_hooks.
-      let context = unsafe { &*(user_data as *const HookContext) };
-      trace!("Rollback hook fired - discarding changes");
-      context.broker.on_rollback();
-   });
+   // SAFETY: user_data is a valid HookContext pointer created in register_hooks.
+   let context = unsafe { &*(user_data as *const HookContext) };
+   // Wrapped for the same reason as commit_callback's - see its comment.
+   let _ = catch_unwind(|| trace!("Rollback hook fired - discarding changes"));
 
-   if result.is_err() {
-      eprintln!("sqlx-sqlite-observer: panic in rollback_callback (absorbed to prevent UB)");
+   // catch_unwind wraps each broker's discard individually - see
+   // commit_callback's comment for why the fan-out makes this matter: a
+   // panic partway through must not leave the remaining brokers' buffers
+   // undiscarded.
+   for broker in context.brokers.values() {
+      if catch_unwind(AssertUnwindSafe(|| broker.on_rollback())).is_err() {
+         // Reported via writeln! to stderr rather than tracing - see
+         // preupdate_callback's equivalent for why.
+         let _ = writeln!(
+            std::io::stderr(),
+            "sqlx-sqlite-observer: panic in rollback_callback (absorbed to keep the process alive)"
+         );
+      }
    }
 }
 

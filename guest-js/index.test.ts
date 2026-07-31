@@ -785,6 +785,7 @@ describe('Observer types', () => {
 
    it('TableChange structure', () => {
       const change: TableChange = {
+         schema: 'main',
          table: 'users',
          operation: 'insert',
          rowid: 1,
@@ -805,6 +806,7 @@ describe('Observer types', () => {
 
    it('TableChange without rowid', () => {
       const change: TableChange = {
+         schema: 'main',
          table: 'kv_store',
          operation: 'update',
          primaryKey: [ { type: 'text', value: 'my-key' } ],
@@ -818,6 +820,11 @@ describe('Observer types', () => {
       const event: TableChangeEvent = {
          event: 'change',
          data: {
+            // Not 'main' here on purpose - schema is whatever alias the
+            // write happened under, not always the primary database, so a
+            // fixture that only ever uses 'main' would document the field as
+            // if it were a constant.
+            schema: 'archive',
             table: 'users',
             operation: 'delete',
             primaryKey: [ { type: 'integer', value: 5 } ],
