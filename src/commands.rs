@@ -102,6 +102,19 @@ use crate::{
 };
 use crate::{close_all_loaded_databases, close_database, connect_to_database};
 
+/// Upper bound on the number of table names accepted by a *single* `observe()`
+/// or `subscribe()` call. Both commands ultimately call
+/// `broker.observe_tables()` on the database's shared observation broker (one
+/// instance per file, shared across every window's handle to it - see #53), so
+/// an unbounded request from either command grows the same observed set and pays
+/// the same unresolvable-name cost documented on `observe()` below and in the
+/// Resource Limits section of the README.
+///
+/// This bounds a single call's request only, not the accumulated set of
+/// tables observed on a database overall across many calls - that remains
+/// unbounded for now and is tracked as issue #56.
+const MAX_OBSERVED_TABLES: usize = 100;
+
 /// Token representing an active interruptible transaction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -595,13 +608,14 @@ pub async fn begin_interruptible_transaction(
    // Generate unique transaction ID
    let transaction_id = Uuid::new_v4().to_string();
 
-   // Acquire appropriate writer based on whether databases are attached
+   // Acquire appropriate writer based on whether databases are attached.
+   // `acquire_writer_with_attached` routes through the observer when it's
+   // enabled, so writes into attached databases are tracked here too - not
+   // just direct writes to this database.
    let mut writer = if let Some(specs) = attached {
       let resolved_specs = resolve_attached_specs(specs, &instances)?;
-      let guard =
-         sqlx_sqlite_conn_mgr::acquire_writer_with_attached(wrapper.inner(), resolved_specs)
-            .await?;
-      TransactionWriter::Attached(guard)
+      let guard = wrapper.acquire_writer_with_attached(resolved_specs).await?;
+      TransactionWriter::from(guard)
    } else {
       TransactionWriter::from(wrapper.acquire_writer().await?)
    };
@@ -754,7 +768,6 @@ pub async fn observe<R: Runtime>(
    tables: Vec<String>,
    config: Option<ObserverConfigParams>,
 ) -> Result<()> {
-   const MAX_OBSERVED_TABLES: usize = 100;
    const MAX_CHANNEL_CAPACITY: usize = 10_000;
 
    if tables.is_empty() || tables.len() > MAX_OBSERVED_TABLES {
@@ -876,6 +889,15 @@ pub async fn observe<R: Runtime>(
 /// labels persist across a reload and registrations aren't cleared on one, so
 /// this proves "this webview label called `observe()` at some point", not
 /// "this specific page load did".
+///
+/// `tables` is optional filtering, not a fresh observation request, but it is
+/// still forwarded to the shared broker's `observe_tables()` (see `observe()`
+/// above), so it is bounded by the same `MAX_OBSERVED_TABLES` for the same
+/// reason: an unresolvable name added here costs a schema round trip on every
+/// writer's `acquire_writer()` for this database, indefinitely, just as it
+/// would if added via `observe()`. As with `observe()`, this bounds a single
+/// `subscribe()` call's request only, not the accumulated set of tables
+/// observed on a database overall - see issue #56.
 #[tauri::command]
 pub async fn subscribe<R: Runtime>(
    db_instances: State<'_, DbInstances>,
@@ -891,6 +913,17 @@ pub async fn subscribe<R: Runtime>(
    let sub_count = active_subs.count_for_db(&db_key).await;
    if sub_count >= MAX_SUBSCRIPTIONS_PER_DATABASE {
       return Err(Error::TooManySubscriptions(MAX_SUBSCRIPTIONS_PER_DATABASE));
+   }
+
+   // Unlike observe(), an empty `tables` is valid here - it means "no filter,
+   // receive every change already being observed" (see
+   // `ObservableSqliteDatabase::subscribe_stream`), so only the upper bound
+   // applies.
+   if tables.len() > MAX_OBSERVED_TABLES {
+      return Err(Error::InvalidConfig(format!(
+         "tables count must be at most {MAX_OBSERVED_TABLES}, got {}",
+         tables.len()
+      )));
    }
 
    let instances = db_instances.inner.read().await;
@@ -1003,6 +1036,13 @@ pub async fn unsubscribe(
 /// Calling this from a window that never called `observe()` for `db_key` is a
 /// no-op (beyond validating that `db_key` itself is loaded) - it does not tear
 /// down observation that other windows are legitimately still using.
+///
+/// **The teardown is database-wide, and the reference count only covers
+/// webviews.** Since observation became a property of the database rather than of
+/// a handle (#53), the `disable_observation()` this performs on the last release
+/// also silences any Rust consumer observing the same file directly - such a
+/// caller registers nothing here. See `DatabaseWrapper::disable_observation`'s
+/// doc, and the README's Change Notifications caveats.
 #[tauri::command]
 pub async fn unobserve<R: Runtime>(
    db_instances: State<'_, DbInstances>,

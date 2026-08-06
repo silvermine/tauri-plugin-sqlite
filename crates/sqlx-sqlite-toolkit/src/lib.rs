@@ -49,7 +49,7 @@ pub use transactions::{
    Statement, TransactionWriter, cleanup_all_transactions, cleanup_transactions_for_db,
 };
 pub use wrapper::{
-   DatabaseWrapper, InterruptibleTransaction, InterruptibleTransactionBuilder,
+   AttachedWriterGuard, DatabaseWrapper, InterruptibleTransaction, InterruptibleTransactionBuilder,
    TransactionExecutionBuilder, WriteQueryResult, WriterGuard, bind_value,
 };
 

@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 #[cfg(feature = "observer")]
 use sqlx_sqlite_observer::ObservableWriteGuard;
 
-use crate::wrapper::WriterGuard;
+use crate::wrapper::{AttachedWriterGuard, WriterGuard};
 use crate::{Error, Result, WriteQueryResult};
 
 /// Wrapper around WriteGuard, ObservableWriteGuard, or AttachedWriteGuard
@@ -24,6 +24,11 @@ use crate::{Error, Result, WriteQueryResult};
 pub enum TransactionWriter {
    Regular(WriteGuard),
    Attached(AttachedWriteGuard),
+   /// An observable writer, attached or not. One variant rather than two
+   /// because `ObservableWriteGuard` already knows which kind of writer it wraps
+   /// and handles both in `detach_all()`. Two variants of the same type would
+   /// duplicate that distinction with nothing but the `From` impl below keeping
+   /// them aligned - and a mis-map there strands the `ATTACH` alias.
    #[cfg(feature = "observer")]
    Observable(ObservableWriteGuard),
 }
@@ -75,8 +80,17 @@ impl TransactionWriter {
 
    /// Detach all attached databases if this is an attached writer
    pub async fn detach_if_attached(self) -> Result<()> {
-      if let Self::Attached(w) = self {
-         w.detach_all().await?;
+      match self {
+         Self::Attached(w) => w.detach_all().await?,
+         // Called unconditionally, deliberately. For a non-attached inner writer
+         // `detach_all()` skips the DETACH but still unregisters the hooks and
+         // discards the guard's buffered events - work `Drop` would otherwise do
+         // at an unspecified point. Do not "optimize" this into a no-op arm for a
+         // writer that looks unattached; only the guard knows, and getting it
+         // wrong strands the alias on the single write connection permanently.
+         #[cfg(feature = "observer")]
+         Self::Observable(w) => w.detach_all().await?,
+         Self::Regular(_) => {}
       }
       Ok(())
    }
@@ -88,6 +102,16 @@ impl From<WriterGuard> for TransactionWriter {
          WriterGuard::Regular(w) => TransactionWriter::Regular(w),
          #[cfg(feature = "observer")]
          WriterGuard::Observable(w) => TransactionWriter::Observable(w),
+      }
+   }
+}
+
+impl From<AttachedWriterGuard> for TransactionWriter {
+   fn from(guard: AttachedWriterGuard) -> Self {
+      match guard {
+         AttachedWriterGuard::Regular(w) => TransactionWriter::Attached(w),
+         #[cfg(feature = "observer")]
+         AttachedWriterGuard::Observable(w) => TransactionWriter::Observable(w),
       }
    }
 }

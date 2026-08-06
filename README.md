@@ -577,12 +577,16 @@ await db.executeTransaction([
    * Read-write attachments acquire write locks on all involved databases
    * Attachments are connection-scoped and don't persist across queries
    * Main database is always accessible without a schema prefix
+   * A `readWrite` write into an attached database is observed too, and is
+     delivered to _that database's own_ subscribers, not the database the
+     write was issued through — see [Change Notifications](#change-notifications)
 
 ### Change Notifications
 
 Subscribe to real-time change notifications when rows are inserted, updated, or
 deleted. Changes are only published after transactions commit — you never see
-partial or rolled-back data.
+partial data, or data undone by a `ROLLBACK` of the transaction that wrote it.
+(Savepoints you write yourself are the one exception — see the caveats below.)
 
 ```typescript
 // 1. Enable observation for specific tables
@@ -651,12 +655,90 @@ await db.observe(['users'], {
      dropping subscribers. Omitting either field inherits the active value; an
      explicit _different_ value fails with `OBSERVATION_CONFIG_CONFLICT`. To change
      them, every window must `unobserve()` first
+   * **Observation is database-wide, not per-connection.** The broker belongs to
+     the underlying database file, keyed by its canonical path — not to any one
+     way of opening it. Every window that loads the same database key shares it,
+     and so does Rust code that opens the same file directly through
+     `sqlx-sqlite-toolkit`, outside this plugin entirely (a different
+     registration key for the same path is still the same broker). `:memory:`
+     databases are the one exception — each one is its own private database that
+     nothing else can open, so it's always independently observed
+   * **The reference count only covers webview windows.** Rust code that calls
+     `DatabaseWrapper::enable_observation()` directly is not registered
+     anywhere, so it sits outside the count: when the last window that called
+     `observe()` releases (explicitly, or by being destroyed), observation is
+     torn down for the whole file and the Rust consumer's subscription silently
+     ends without it having called anything. The reverse also holds — a Rust
+     `disable_observation()` breaks every window's live subscription while
+     leaving their registrations non-zero, so a later `observe()` builds a fresh
+     broker the old subscriptions are not bound to. Until there's a
+     plugin-level API for Rust observers, a Rust consumer that must not be torn
+     down needs its own database file (per the bullet above, a distinct key
+     alone won't do it) or must re-enable observation after a teardown
    * Multiple subscriptions can be active on the same database, each filtering by
      different tables
    * `lagged` events indicate the broadcast channel filled up before the
      subscriber could read — increase `channelCapacity`
+   * Each `TableChange`'s `schema` field reports where the change occurred —
+     `"main"` for the primary database, or the alias used in `.attach()`
+     otherwise (see [Cross-Database Queries](#cross-database-queries)). Treat
+     it as provenance metadata, not a stable identifier: an alias is chosen by
+     whoever attached the database, so the same physical database can appear
+     under different aliases depending on who's asking — it's only guaranteed
+     consistent for the change that reported it
+   * **`primaryKey`/`rowid` can arrive unresolved.** Both are looked up from a
+     per-table schema cache that's warmed lazily — on a writer's _next_
+     acquisition after a table joins the observed set, not synchronously when
+     `observe()`/`subscribe()` returns. Until that next acquisition warms it,
+     a change notification for that table carries an empty `primaryKey`, and
+     a meaningless `rowid` if the table is `WITHOUT ROWID`. This is a general
+     property, not a narrow race, and it happens two ways: observing a table
+     before it exists in the schema at all (the likelier case in practice —
+     e.g. observing ahead of the migration that creates it), or adding a table
+     to the observed set while a write against it is already in flight, whose
+     acquisition already committed to whichever tables were warmed when it
+     started. Either way, it converges by the following writer acquisition.
+     Note also that the observed set is checked live when a change fires
+     rather than snapshotted at transaction start, so a `subscribe()` that
+     lands mid-transaction can still receive that same transaction's changes
+     — with unresolved schema info if it lands in one of the two cases above
+   * A write into an attached database only produces a notification if that
+     database is attached in `readWrite` mode **and** has its own observation
+     enabled — a `readOnly` attachment, or a `readWrite` one with no observer
+     of its own, has its changes silently dropped rather than misrouted to the
+     wrong subscribers. `readOnly` describes which locks are taken, not an
+     enforced restriction: SQLite is never asked to reject writes through such
+     an attachment, so one lands _and_ goes unobserved
+   * Writes to `CREATE TEMP TABLE` objects never notify — `temp` has no owning
+     database to route to and cannot be an attachment alias. This includes an
+     unqualified write that resolves to a temp table shadowing an observed one
+   * `SAVEPOINT`/`ROLLBACK TO` is not tracked. SQLite fires no rollback hook for
+     `ROLLBACK TO`, and the change buffer has no savepoint awareness, so rows
+     undone by a `ROLLBACK TO` are still published when the outer transaction
+     commits. The library never issues savepoint SQL itself, so this only
+     applies if you write it — and only inside a statement list passed to
+     `executeTransaction()` or `beginInterruptibleTransaction()`, since
+     consecutive `execute()` calls do not share a transaction (the write
+     connection is released and rolled back between them, taking any savepoint
+     with it)
    * Column values (`oldValues`, `newValues`) are typed as `ColumnValue` — a tagged
      union of `null`, `integer`, `real`, `text`, or `blob` (base64-encoded)
+   * Migrations never produce change notifications — schema changes aren't row
+     changes and have no `TableChange` representation. (Rust code using
+     `sqlx-sqlite-toolkit::DatabaseWrapper` directly has an additional,
+     JavaScript-unreachable bypass: `acquire_regular_writer()` opts a specific
+     writer out of observation entirely.)
+   * Observation only sees writes made through connections this library
+     manages, in this process. SQLite's preupdate hook is registered per
+     connection, so writes from another process — or any other tool touching
+     the same file — are invisible. This is a limit of how SQLite's hooks
+     work, not a bug, and there's no file-wide guarantee to fall back on
+   * Rust code using `sqlx-sqlite-observer` directly, without going through
+     `sqlx-sqlite-toolkit::DatabaseWrapper`, isn't automatically discoverable
+     as an attached-database's broker — registering a database so others can
+     find it that way is `DatabaseWrapper::enable_observation()`'s job.
+     Attached-database routing therefore requires the toolkit on the attached
+     side too, not just the side issuing the write
 
 ### Error Handling
 
@@ -765,7 +847,8 @@ interface CustomConfig {
 
 interface AttachedDatabaseSpec {
    databaseKey: string;  // Registration key of a database already loaded via load()
-   schemaName: string;    // Schema name for accessing tables (e.g., 'orders')
+   schemaName: string;    // Schema name for accessing tables (e.g., 'orders').
+                          // [A-Za-z0-9_] only, no leading digit, max 64 chars
    mode: 'readOnly' | 'readWrite';
 }
 
@@ -802,6 +885,7 @@ type ColumnValue =
    | { type: 'blob'; value: string };  // base64-encoded
 
 interface TableChange {
+   schema: string;              // "main" or an attached alias - provenance only, not a stable id
    table: string;
    operation?: ChangeOperation;
    rowid?: number;
@@ -1137,13 +1221,20 @@ untrusted or buggy frontend code:
      default (5 minutes) are automatically rolled back on the next access
      attempt (configurable via `Builder::transaction_timeout()`)
    * **Observer channel capacity**: Capped at 10,000 (default 256)
-   * **Observed tables**: Maximum 100 tables per single `observe()` call — **not**
-     a bound on the accumulated set for a database. `observe()` merges its tables
-     into the existing broker, `subscribe()` also adds tables with no per-call
-     limit, and nothing removes an individual table (the set is cleared only on a
-     full teardown), so the total is currently unbounded. An observed table that
-     does not exist also costs schema round trips on _every_ writer acquisition,
-     indefinitely, while that database's write connection is held (#56)
+   * **Observed tables**: Maximum 100 tables per single `observe()` or
+     `subscribe()` call — **not** a bound on the accumulated set for a
+     database. Both commands merge their tables into the same underlying
+     broker, and nothing ever removes an individual table from it (the set is
+     cleared only on a full teardown), so the accumulated total is currently
+     unbounded (#56). An observed table that does not exist also costs a
+     schema round trip on _every_ writer acquisition, indefinitely — that
+     round trip is paid before the write permit is acquired, not while it's
+     held, so an unresolvable name delays a write rather than extending how
+     long the connection is held once acquired. (Earlier versions of this
+     plugin warmed the schema cache after acquiring the write permit, which
+     paid this cost while the connection was held; that ordering was inverted
+     to avoid a deadlock between a saturated read pool and a pending writer -
+     see `ObservableSqliteDatabase::acquire_writer` in `sqlx-sqlite-observer`.)
    * **Subscriptions**: Maximum 100 active subscriptions per database
 
 ### Unbounded Result Sets

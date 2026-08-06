@@ -103,6 +103,13 @@ impl From<&ColumnValue> for ColumnValuePayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableChangeData {
+   /// The schema this change occurred under: `"main"` for the primary
+   /// database, or the caller-chosen `ATTACH ... AS <alias>` name otherwise.
+   /// Provenance metadata, not a stable identifier - see
+   /// `sqlx_sqlite_observer::TableChange::schema` for the full explanation of
+   /// why the same physical database can report different aliases depending
+   /// on who attached it.
+   pub schema: String,
    pub table: String,
    pub operation: Option<String>,
    pub rowid: Option<i64>,
@@ -133,6 +140,7 @@ pub fn event_to_payload(event: TableChangeEvent) -> TableChangePayload {
 /// Convert an observer `TableChange` to serializable data.
 fn change_to_data(change: &TableChange) -> TableChangeData {
    TableChangeData {
+      schema: change.schema.clone(),
       table: change.table.clone(),
       operation: change.operation.map(|op| match op {
          ChangeOperation::Insert => "insert".to_string(),

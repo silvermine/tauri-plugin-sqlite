@@ -2390,6 +2390,62 @@ mod tests {
       });
    }
 
+   /// `subscribe()` forwards `tables` into the same shared broker's
+   /// `observe_tables()` that `observe()` does (see `MAX_OBSERVED_TABLES`'s doc
+   /// comment in `src/commands.rs`), so it must be bounded the same way -
+   /// otherwise a single `subscribe()` call could grow the observed set past
+   /// the limit `observe()` enforces. Unlike `observe()`, an empty `tables` is
+   /// valid on `subscribe()` (it means "no filter"), so only the upper bound
+   /// is exercised here.
+   #[test]
+   fn test_subscribe_rejects_too_many_tables() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let key = "MAIN".to_string();
+
+      tauri::async_runtime::block_on(async {
+         let (app, _) =
+            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
+               .await
+               .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+
+         let webview = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
+            .build()
+            .expect("webview window should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("observe should succeed");
+
+         // One past MAX_OBSERVED_TABLES (100).
+         let too_many_tables: Vec<String> = (0..101).map(|i| format!("table_{i}")).collect();
+         let channel = tauri::ipc::Channel::new(|_body| Ok(()));
+
+         let err = commands::subscribe(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            webview.as_ref().clone(),
+            "MAIN".to_string(),
+            too_many_tables,
+            channel,
+         )
+         .await
+         .expect_err("subscribe should reject a request over MAX_OBSERVED_TABLES");
+
+         assert!(matches!(err, Error::InvalidConfig(_)));
+      });
+   }
+
    /// Refcount teardown boundary: the broker stays live while at least one
    /// window is registered as an observer, and is only torn down once the last
    /// registered window releases via `unobserve()`. A non-final `unobserve()`

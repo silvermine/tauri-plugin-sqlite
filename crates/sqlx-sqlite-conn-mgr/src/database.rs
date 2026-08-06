@@ -3,6 +3,7 @@
 use crate::Result;
 use crate::config::SqliteDatabaseConfig;
 use crate::error::Error;
+use crate::observer_slot::ObserverSlot;
 use crate::registry::{get_or_open_database, is_memory_database, uncache_database};
 use crate::write_guard::WriteGuard;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -64,6 +65,15 @@ pub struct SqliteDatabase {
 
    /// Path to database file (used for cleanup and registry lookups)
    path: PathBuf,
+
+   /// Type-erased slot for a higher layer's observation state.
+   ///
+   /// Living here - rather than in a side registry or on the wrapper that calls
+   /// `connect()` - means every handle that resolves to this same `SqliteDatabase`
+   /// (clones of a wrapper, or independent `connect()` calls to the same path)
+   /// shares one observation state. See [`ObserverSlot`] for the type-erasure
+   /// mechanics.
+   observer_slot: ObserverSlot,
 }
 
 impl SqliteDatabase {
@@ -72,6 +82,14 @@ impl SqliteDatabase {
    /// Used internally (crate-private) for ATTACH DATABASE statements
    pub(crate) fn path_str(&self) -> String {
       self.path.to_string_lossy().to_string()
+   }
+
+   /// Get this database's observation slot.
+   ///
+   /// Opaque to this crate - see [`ObserverSlot`] for what it's for and how a
+   /// higher layer is expected to use it.
+   pub fn observer_slot(&self) -> &ObserverSlot {
+      &self.observer_slot
    }
 
    /// Connect to a SQLite database
@@ -220,6 +238,7 @@ impl SqliteDatabase {
             wal_initialized: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             path: path.clone(),
+            observer_slot: ObserverSlot::default(),
          })
       })
       .await
@@ -369,6 +388,13 @@ impl SqliteDatabase {
    pub async fn close(self: Arc<Self>) -> Result<()> {
       // Mark as closed
       self.closed.store(true, Ordering::SeqCst);
+
+      // Hygiene only: the slot holds a leaf value with no reference back to this
+      // database, so the field would drop on its own once this `Arc<Self>` does.
+      // Clearing here just releases it - and, transitively, any subscribers -
+      // promptly rather than whenever the last strong reference happens to go
+      // away.
+      self.observer_slot.clear();
 
       // Remove from registry
       if let Err(e) = uncache_database(&self.path).await {
