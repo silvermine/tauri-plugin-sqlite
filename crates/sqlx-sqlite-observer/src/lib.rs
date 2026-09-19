@@ -1,7 +1,8 @@
 //! Reactive change notifications for SQLite databases using sqlx.
 //!
 //! This crate provides **transaction-safe** change notifications for SQLite databases
-//! using SQLite's native hooks (`preupdate_hook`, `commit_hook`, `rollback_hook`).
+//! using SQLite's native hooks (`preupdate_hook`, `commit_hook`, `rollback_hook`, and a
+//! `SQLITE_TRACE_PROFILE` trace hook).
 //!
 //! # SQLite Requirements
 //!
@@ -24,7 +25,8 @@
 //!
 //! # Features
 //!
-//! - **Transaction-safe notifications** - changes only notify after successful commit
+//! - **Transaction-safe notifications** - changes notify only once committed and
+//!   readable through any connection, with nothing required of the writer
 //! - **Typed column values** - access old/new values with native SQLite types
 //! - **Stream support** - use `tokio_stream::Stream` for async iteration
 //! - **Multiple subscribers** - broadcast channel supports multiple listeners
@@ -69,7 +71,7 @@
 //!         .execute(&mut **conn)
 //!         .await?;
 //!
-//!     // Changes are published automatically when the transaction commits
+//!     // Changes are published once the committing statement finishes
 //!     drop(conn);
 //!
 //!     Ok(())

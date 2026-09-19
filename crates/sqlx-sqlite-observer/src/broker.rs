@@ -1,14 +1,20 @@
-//! Transaction-aware observation broker for buffering and publishing changes.
+//! Transaction-aware observation broker for converting and publishing changes.
 //!
 //! This module provides transaction-safe change notifications. Changes are buffered
 //! during transactions (explicit and implicit) and only published after successful
-//! commit. Rolled-back transactions produce no notifications.
+//! commit, once the committing statement finishes. Rolled-back transactions produce
+//! no notifications.
+//!
+//! The buffer lives in each connection's hook context (see [`crate::hooks`]), not
+//! on the broker, so two connections observing the same database never publish or
+//! discard each other's changes. The broker holds what every connection shares:
+//! observed tables, schema info, event conversion, and the broadcast channel.
 //!
 //! # Data Flow
 //!
 //! ```text
 //! ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-//! │ preupdate_hook  │────►│  broker.buffer  │     │   subscribers   │
+//! │ preupdate_hook  │────►│ context.buffer  │     │   subscribers   │
 //! │ (captures data) │     │  (Vec<Event>)   │     │                 │
 //! └─────────────────┘     └────────┬────────┘     └─────────────────┘
 //!                                  │                       ▲
@@ -19,10 +25,12 @@
 //!               └─────┬────┘  └────┬─────┘      │          │
 //!                     │            │            │          │
 //!                     ▼            ▼            │          │
-//!               on_commit()   on_rollback()     │          │
-//!                     │            │            │          │
+//!              commit_hook    rollback_hook     │          │
+//!            (convert, hold)       │            │          │
 //!                     │       buffer.clear()    │          │
-//!                     │       (discard)         │          │
+//!                     ▼       (discard)         │          │
+//!               trace_hook                      │          │
+//!          (statement finished)                 │          │
 //!                     │                         │          │
 //!                     └─────────────────────────┴──────────┘
 //!                             change_tx.send()
@@ -30,27 +38,31 @@
 //! ```
 //!
 //! Changes captured by the preupdate hook are buffered until the transaction
-//! (explicit or implicit) completes. On commit, buffered changes are published
-//! to subscribers. On rollback, they are discarded without notification.
+//! (explicit or implicit) completes. On commit, the commit hook converts the
+//! buffered changes and holds them, and the trace hook publishes them to
+//! subscribers when the committing statement finishes. On rollback, they are
+//! discarded without notification.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use tokio::sync::broadcast;
-use tracing::{debug, error, trace};
+use tracing::trace;
 
 use crate::change::{ChangeOperation, ColumnValue, TableChange, TableInfo};
 use crate::hooks::{PreUpdateEvent, SqliteValue};
 
-/// Transaction-aware observation broker.
+/// Shared observation broker for one database.
 ///
-/// Buffers preupdate events during transactions and publishes them to
-/// subscribers only after successful commit. Rolled-back transactions
-/// have their buffered changes discarded.
+/// Knows which tables are observed and their schema, converts a connection's
+/// captured events into [`TableChange`]s, and publishes them to subscribers.
+/// A broker is shared by every connection that observes its database; the
+/// per-transaction buffering lives in each connection's hook context (see the
+/// module doc), so a rolled-back or abandoned transaction on one connection
+/// never touches another's changes.
 pub struct ObservationBroker {
-   buffer: Mutex<Vec<PreUpdateEvent>>,
    change_tx: broadcast::Sender<TableChange>,
    observed_tables: RwLock<HashSet<String>>,
    table_info: RwLock<HashMap<String, TableInfo>>,
@@ -72,7 +84,6 @@ impl ObservationBroker {
       assert!(channel_capacity > 0, "channel_capacity must be at least 1");
       let (change_tx, _) = broadcast::channel(channel_capacity);
       Arc::new(Self {
-         buffer: Mutex::new(Vec::new()),
          change_tx,
          observed_tables: RwLock::new(HashSet::new()),
          table_info: RwLock::new(HashMap::new()),
@@ -182,73 +193,29 @@ impl ObservationBroker {
       self.observed_tables.read().iter().cloned().collect()
    }
 
-   /// Called by preupdate_hook - buffers the event for later processing.
+   /// Publishes one converted change to every subscriber.
    ///
-   /// Events are held in the buffer until either `on_commit()` (publish)
-   /// or `on_rollback()` (discard) is called.
-   pub fn on_preupdate(&self, event: PreUpdateEvent) {
-      trace!(
-          table = %event.table,
-          operation = ?event.operation,
-          "Buffering preupdate event"
-      );
-      self.buffer.lock().push(event);
-   }
-
-   /// Called by commit_hook - flushes buffered events to subscribers.
-   ///
-   /// Converts all buffered `PreUpdateEvent`s to `TableChange`s and sends
-   /// them through the broadcast channel. The buffer is cleared afterward.
-   pub fn on_commit(&self) {
-      let events: Vec<PreUpdateEvent> = {
-         let mut buffer = self.buffer.lock();
-         std::mem::take(&mut *buffer)
-      };
-
-      if events.is_empty() {
-         return;
-      }
-
-      debug!(count = events.len(), "Flushing buffered changes on commit");
-
-      for event in events {
-         match self.event_to_change(event) {
-            Ok(table_change) => {
-               let _ = self.change_tx.send(table_change);
-            }
-            Err(e) => {
-               error!(error = %e, "Failed to convert event to change");
-            }
-         }
-      }
-   }
-
-   /// Called by rollback_hook - discards all buffered events.
-   ///
-   /// Clears the buffer without publishing any changes to subscribers.
-   pub fn on_rollback(&self) {
-      let count = {
-         let mut buffer = self.buffer.lock();
-         let count = buffer.len();
-         buffer.clear();
-         count
-      };
-
-      if count > 0 {
-         debug!(count, "Discarding buffered changes on rollback");
-      }
+   /// Called by a connection's trace hook once the statement that committed the
+   /// change has finished, so a subscriber that reads on notification reads the
+   /// committed state. A send error means there are no subscribers, which is not
+   /// an error for the writer.
+   pub(crate) fn publish(&self, change: TableChange) {
+      let _ = self.change_tx.send(change);
    }
 
    /// Subscribes to change notifications.
    ///
    /// Returns a broadcast receiver that will receive `TableChange` events
-   /// after transactions commit.
+   /// once a committed transaction's changes are readable.
    pub fn subscribe(&self) -> broadcast::Receiver<TableChange> {
       self.change_tx.subscribe()
    }
 
    /// Converts a PreUpdateEvent to a TableChange for broadcast.
-   fn event_to_change(&self, event: PreUpdateEvent) -> crate::Result<TableChange> {
+   ///
+   /// Called by a connection's commit hook, which needs this broker's schema
+   /// information for the table the event touched.
+   pub(crate) fn event_to_change(&self, event: PreUpdateEvent) -> crate::Result<TableChange> {
       let table_info = self.table_info.read().get(&event.table).cloned();
 
       // For WITHOUT ROWID tables, the rowid from preupdate hook is not meaningful
@@ -338,7 +305,6 @@ impl ObservationBroker {
 impl std::fmt::Debug for ObservationBroker {
    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
       f.debug_struct("ObservationBroker")
-         .field("buffer_len", &self.buffer.lock().len())
          .field("observed_tables", &self.observed_tables.read().len())
          .field("channel_capacity", &self.channel_capacity)
          .field("capture_values", &self.capture_values)

@@ -20,7 +20,7 @@ use crate::schema::query_table_info;
 ///
 /// Uses SQLite's native preupdate_hook, commit_hook, and rollback_hook for
 /// change detection. Changes are buffered during transactions and only
-/// published to subscribers after successful commit. Rolled-back transactions
+/// published to subscribers once committed and readable. Rolled-back transactions
 /// produce no notifications.
 ///
 /// # SQLite Version Requirements
@@ -54,7 +54,7 @@ impl SqliteObserver {
    ///
    /// If additional tables are provided, they will be added to the observed set.
    /// Returns a broadcast receiver that will receive `TableChange` events
-   /// after transactions commit.
+   /// once a committed transaction's changes are readable.
    pub fn subscribe<I, S>(&self, tables: I) -> broadcast::Receiver<TableChange>
    where
       I: IntoIterator<Item = S>,
@@ -97,8 +97,7 @@ impl SqliteObserver {
 
    /// Acquires a connection from the pool with observation hooks registered.
    ///
-   /// The returned connection will track changes to observed tables. Changes
-   /// are buffered during transactions and published to subscribers after commit.
+   /// The returned connection will track changes to observed tables.
    ///
    /// On first acquisition for each table, queries the schema to determine
    /// primary key columns and WITHOUT ROWID status.

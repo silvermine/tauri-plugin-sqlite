@@ -1,8 +1,8 @@
 //! Observable connection wrapper with SQLite hook integration.
 //!
 //! Provides change tracking via SQLite's native preupdate/commit/rollback hooks
-//! instead of triggers. Changes are buffered during transactions and only
-//! published to subscribers after successful commit.
+//! instead of triggers. Changes are buffered during transactions and published
+//! once the statement that committed them finishes, when they are readable.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -18,10 +18,6 @@ use crate::hooks;
 
 /// A wrapper around a SQLite pool connection allowing observers to subscribe to
 /// change notifications.
-///
-/// Uses SQLite's native hooks (preupdate_hook, commit_hook, rollback_hook)
-/// for transaction-safe change tracking. Changes are buffered during transactions
-/// and published to subscribers only after successful commit.
 ///
 /// Implements `Deref`/`DerefMut` to allow transparent use as the underlying
 /// `PoolConnection<Sqlite>`.

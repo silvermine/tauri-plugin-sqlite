@@ -4,7 +4,8 @@
 //! `sqlx-sqlite-conn-mgr`. Enable with the `conn-mgr` feature.
 //!
 //! Uses SQLite's native hooks for transaction-safe change tracking. Changes
-//! are buffered during transactions and only published after commit.
+//! are buffered during transactions and published once the statement that
+//! committed them finishes, when they are readable.
 //!
 //! # Example
 //!
@@ -226,7 +227,6 @@ impl ObservableSqliteDatabase {
          writer: Some(InnerWriter::Regular(writer)),
          hooks_registered: false,
          raw_db: None,
-         brokers: HashMap::new(),
       };
 
       let mut brokers = HashMap::with_capacity(1);
@@ -469,7 +469,6 @@ pub async fn acquire_writer_with_attached_brokers(
       writer: Some(InnerWriter::Attached(writer)),
       hooks_registered: false,
       raw_db: None,
-      brokers: HashMap::new(),
    };
 
    // `brokers` can be empty here even though a caller's own gate found at least
@@ -576,13 +575,6 @@ pub struct ObservableWriteGuard {
    /// call unregister_hooks synchronously in Drop without needing
    /// the async lock_handle.
    raw_db: Option<*mut sqlite3>,
-   /// Brokers hooks were registered with, keyed by schema alias. Retained
-   /// (rather than discarded once `hooks::register_hooks` has its own copy)
-   /// so `Drop` can discard each one's buffered-but-uncommitted events if
-   /// this guard is dropped without an explicit commit or rollback - see
-   /// `Drop`'s impl for why that's safe to do unconditionally. Empty until
-   /// `register_hooks` populates it.
-   brokers: HashMap<String, Arc<ObservationBroker>>,
 }
 
 // SAFETY: The raw_db pointer is only used for hook registration/unregistration
@@ -613,7 +605,7 @@ impl ObservableWriteGuard {
       let db: *mut sqlite3 = handle.as_raw_handle().as_ptr();
 
       unsafe {
-         hooks::register_hooks(db, brokers.clone())?;
+         hooks::register_hooks(db, brokers)?;
       }
 
       // Cache the raw pointer so Drop can call unregister_hooks synchronously.
@@ -621,37 +613,17 @@ impl ObservableWriteGuard {
       // which we own via self.writer.
       self.raw_db = Some(db);
       self.hooks_registered = true;
-      self.brokers = brokers;
       Ok(())
-   }
-
-   /// Discards every broker's buffered-but-uncommitted events.
-   ///
-   /// Safe to call unconditionally, regardless of whether a commit or
-   /// rollback already ran: `on_commit` drains the buffer via `mem::take`
-   /// before publishing, and an explicit `ROLLBACK`'s own rollback_hook
-   /// already clears it too, so calling this afterward always finds nothing
-   /// left to discard. The only case where it does something is the one it
-   /// exists for: hooks torn down - by [`Drop`](Self), [`into_inner`], or
-   /// [`detach_all`] - with no commit or rollback ever having run, which
-   /// would otherwise let this transaction's buffered events resurface as
-   /// phantom changes on the *next* transaction's commit.
-   ///
-   /// [`into_inner`]: Self::into_inner
-   /// [`detach_all`]: Self::detach_all
-   fn flush_all_brokers(&self) {
-      for broker in self.brokers.values() {
-         broker.on_rollback();
-      }
    }
 
    /// Consumes this wrapper and returns the underlying write guard.
    ///
    /// Hooks are unregistered before returning the guard, so it can be
-   /// safely used without observation. Also flushes every broker's buffer
-   /// (see [`flush_all_brokers`](Self::flush_all_brokers)) - safe to call
-   /// whether or not a commit/rollback already ran, and necessary if this is
-   /// called mid-transaction, with no commit or rollback yet sent.
+   /// safely used without observation. Unregistering also drops this writer's
+   /// buffered-but-uncommitted events (see [`hooks::unregister_hooks`]), which
+   /// matters if this is called mid-transaction, with no commit or rollback yet
+   /// sent: those events would otherwise resurface as phantom changes on the
+   /// connection's next commit.
    pub fn into_inner(mut self) -> UnobservedWriter {
       // Unregister hooks before returning the writer to prevent
       // use-after-free if the broker is dropped before the connection is reused.
@@ -662,7 +634,6 @@ impl ObservableWriteGuard {
             crate::hooks::unregister_hooks(db);
          }
          trace!("Hooks unregistered before returning inner writer");
-         self.flush_all_brokers();
       }
       self.hooks_registered = false;
       self.raw_db = None;
@@ -676,9 +647,8 @@ impl ObservableWriteGuard {
    ///
    /// If this guard wraps a plain (non-attached) writer, there is nothing to
    /// detach - this reduces to hook unregistration, safe to call regardless
-   /// of which kind of writer this guard wraps. Also flushes every broker's
-   /// buffer (see [`flush_all_brokers`](Self::flush_all_brokers)) - safe to
-   /// call whether or not a commit/rollback already ran.
+   /// of which kind of writer this guard wraps. Unregistering also drops this
+   /// writer's buffered-but-uncommitted events (see [`hooks::unregister_hooks`]).
    pub async fn detach_all(mut self) -> Result<()> {
       if self.hooks_registered
          && let Some(db) = self.raw_db
@@ -687,7 +657,6 @@ impl ObservableWriteGuard {
             crate::hooks::unregister_hooks(db);
          }
          trace!("Hooks unregistered before detach_all");
-         self.flush_all_brokers();
       }
       self.hooks_registered = false;
       self.raw_db = None;
@@ -712,7 +681,6 @@ impl Drop for ObservableWriteGuard {
             hooks::unregister_hooks(db);
          }
          trace!("ObservableWriteGuard dropped, hooks unregistered");
-         self.flush_all_brokers();
       }
    }
 }

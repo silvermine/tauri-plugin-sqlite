@@ -3,11 +3,12 @@
 Reactive change notifications for SQLite databases using sqlx.
 
 This crate provides **transaction-safe** change notifications for SQLite databases
-using SQLite's native hooks (`preupdate_hook`, `commit_hook`, `rollback_hook`).
+using SQLite's native hooks (`preupdate_hook`, `commit_hook`, `rollback_hook`, and a
+`SQLITE_TRACE_PROFILE` trace hook).
 
 ## Features
 
-   * **Transaction-safe notifications**: Changes only notify after successful commit
+   * **Transaction-safe notifications**: Changes notify only once committed and readable
    * **Typed column values**: Access old/new values with native SQLite types
    * **Stream support**: Use `tokio_stream::Stream` for async iteration
    * **Multiple subscribers**: Broadcast channel supports multiple listeners
@@ -57,38 +58,43 @@ sqlx-sqlite-observer = { version = "0.8", features = ["conn-mgr"] }
 The library uses SQLite's native hooks for transaction-safe change tracking:
 
 ```text
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ preupdate_hook  │────►│  broker.buffer  │     │   subscribers   │
-│ (captures data) │     │  (Vec<Event>)   │     │                 │
-└─────────────────┘     └────────┬────────┘     └─────────────────┘
-                                 │                       ▲
-                    ┌────────────|                       │
-                    │            │                       │
-              ┌─────▼────┐  ┌────▼─────┐                 │
-              │  COMMIT  │  │ ROLLBACK │                 │
-              └─────┬────┘  └────┬─────┘                 │
-                    │            │                       │
-                    ▼            ▼                       │
-              on_commit()   on_rollback()                │
-                    │            │                       │
-                    │       buffer.clear()               │
-                    │       (discard)                    │
-                    │                                    │
-                    └────────────────────────────────────┘
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ preupdate_hook  │────►│ context.buffer   │     │   subscribers   │
+│ (captures data) │     │ (per connection) │     │                 │
+└─────────────────┘     └────────┬─────────┘     └─────────────────┘
+                                 │                        ▲
+                    ┌────────────┼────────────┐           │
+                    │            │            │           │
+              ┌─────▼────┐  ┌────▼─────┐      │           │
+              │  COMMIT  │  │ ROLLBACK │      │           │
+              └─────┬────┘  └────┬─────┘      │           │
+                    │            │            │           │
+                    ▼            ▼            │           │
+           commit_hook      rollback_hook     │           │
+           convert + hold   buffer.clear()    │           │
+                    │       (discard)         │           │
+                    ▼                         │           │
+           trace_hook (statement finished)    │           │
+           broker.publish() ──────────────────┴───────────┘
                             change_tx.send()
-                            (publish)
 ```
 
 1. When you acquire a connection, observation hooks are registered on the raw
-   SQLite handle
+   SQLite handle. Each connection gets its own buffer, so two connections that
+   observe the same database never publish or discard each other's changes.
 2. `preupdate_hook` captures changes (table, operation, old/new values) and
-   buffers them
-3. `commit_hook` fires when a transaction commits, publishing buffered changes
-   to subscribers
-4. `rollback_hook` fires when a transaction rolls back, discarding buffered
-   changes
+   buffers them.
+3. `commit_hook` fires when a transaction is about to commit. It converts the
+   buffered changes and holds them. It does not publish, because it runs before
+   the commit is final.
+4. The trace hook fires when the statement that committed finishes. The commit
+   is durable by then, so the held changes are published.
+5. `rollback_hook` fires when a transaction rolls back, discarding buffered
+   changes.
 
-This ensures subscribers **only receive notifications for committed changes**.
+This ensures subscribers **only receive notifications for committed changes**,
+and that a subscriber who reads as soon as it is notified reads the committed
+state.
 
 ## API Reference
 
@@ -320,13 +326,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     sqlx::query("COMMIT").execute(&mut *writer).await?;
 
-    // Notification arrives after commit
+    // The notification arrives once the COMMIT has finished, so the change is
+    // readable through any connection.
     let change = rx.recv().await?;
     println!("Changed: {}", change.table);
 
     Ok(())
 }
 ```
+
+## When Notifications Arrive
+
+A notification means the change is committed and readable through any
+connection. Nothing is required of the writer for that to hold. It takes two
+hooks, because SQLite's commit hook runs *before* the commit is final. It is
+the hook whose non-zero return converts a `COMMIT` into a `ROLLBACK`.
+
+1. The commit hook converts the buffered changes and holds them.
+2. A trace hook, registered with `SQLITE_TRACE_PROFILE` and
+   `SQLITE_TRACE_STMT`, fires when the statement that committed finishes
+   running, and again when the next statement starts. The commit is durable by
+   then, and the held changes are published.
+
+If publication happened in the commit hook instead, a subscriber that reads as
+soon as it is notified would read pre-commit state.
+
+Two consequences follow from publishing after the commit:
+
+   * **Order is per connection.** Publication happens after SQLite released the
+     write lock, so two connections that commit in one order can notify in the
+     other. Writes through one connection, including every write through
+     `sqlx-sqlite-conn-mgr`'s single writer, notify in commit order.
+   * **A commit made during a statement reset notifies late.** `fetch_one` stops
+     at the first row and resets the statement. For an autocommit
+     `INSERT ... RETURNING`, the commit happens inside that reset, after the
+     profile event. The trace hook is also registered for `SQLITE_TRACE_STMT`,
+     so the change is published when the next statement on that connection
+     starts, or when the connection is released, whichever comes first.
+
+The trace hook occupies the connection's single `sqlite3_trace_v2` slot. sqlx
+does not use that slot. If you install your own trace hook on an observed
+connection, notifications from that connection stop.
 
 ## Usage Notes
 

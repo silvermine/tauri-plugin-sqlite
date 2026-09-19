@@ -425,10 +425,12 @@ async fn concurrent_enable_observation_converges_on_one_broker() {
 
 /// A writer dropped mid-transaction - BEGIN plus a write, then dropped with no
 /// COMMIT or ROLLBACK ever sent - must not have its buffered change resurface
-/// on the *next* transaction's commit. Without `ObservableWriteGuard::drop`
-/// discarding the buffer, the abandoned INSERT below would still be sitting in
-/// the broker's buffer when the real transaction commits, and `on_commit`'s
-/// `mem::take` would publish it right alongside (or instead of) the real change.
+/// on the *next* transaction's commit. The buffer lives in the hook context
+/// that `ObservableWriteGuard::drop` unregisters, so it dies with the guard.
+/// Were it to outlive the guard on the pooled connection, the abandoned INSERT
+/// below would still be sitting there when the real transaction commits, and
+/// the commit hook would publish it right alongside (or instead of) the real
+/// change.
 ///
 /// Uses `acquire_writer()` directly (not `execute_transaction()` or
 /// `begin_interruptible_transaction()`) because both of those already have

@@ -9,7 +9,11 @@
 
 use futures::StreamExt;
 use sqlx::SqlitePool;
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx_sqlite_observer::{ChangeOperation, ColumnValue, ObserverConfig, SqliteObserver};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -763,5 +767,310 @@ async fn test_delete_returns_old_primary_key() {
       change.primary_key[0],
       ColumnValue::Integer(1),
       "DELETE should return old PK value"
+   );
+}
+
+// ============================================================================
+// Commit Visibility
+// ============================================================================
+
+/// A notification must mean the change is readable by another connection.
+///
+/// SQLite's commit hook runs before the commit is final, so publishing from it
+/// announces a change that another connection cannot read yet. This subscriber
+/// reacts concurrently, reading as soon as it is notified.
+///
+/// Both journal modes are covered. They make a commit visible differently: WAL
+/// appends frames and publishes a new WAL index snapshot, while a rollback
+/// journal writes the database file, deletes the journal, and drops the
+/// EXCLUSIVE lock. Both happen inside the committing statement, before the
+/// trace hook, but the branch this guards exists because a visibility
+/// assumption went untested. In WAL mode an early notification shows as a
+/// stale count. In rollback-journal mode it shows as a locked read, which is
+/// why the reader below does not wait on the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_means_the_change_is_readable_in_wal_mode() {
+   a_notification_means_the_change_is_readable("WAL").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_means_the_change_is_readable_in_rollback_journal_mode() {
+   a_notification_means_the_change_is_readable("DELETE").await;
+}
+
+async fn a_notification_means_the_change_is_readable(journal_mode: &str) {
+   const WRITES: i64 = 50;
+
+   let dir = tempfile::tempdir().unwrap();
+   let path = dir.path().join("visibility.db");
+   let url = format!("sqlite:{}?mode=rwc", path.display());
+
+   let writer_pool = SqlitePool::connect(&url).await.unwrap();
+   // A test constant, not caller input; PRAGMA takes no bind parameter.
+   let mode: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+      "PRAGMA journal_mode={journal_mode}"
+   )))
+   .fetch_one(&writer_pool)
+   .await
+   .unwrap();
+   assert_eq!(
+      mode.to_uppercase(),
+      journal_mode,
+      "SQLite must accept the journal mode"
+   );
+   sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+      .execute(&writer_pool)
+      .await
+      .unwrap();
+
+   // A wholly separate reader, as a consumer reacting to a change has. Its busy
+   // handler is off: in rollback-journal mode a reader that arrives before the
+   // commit released the EXCLUSIVE lock would otherwise wait for it and then
+   // read the committed row, which hides an early notification behind a late
+   // read. With no waiting, an early notification surfaces as a locked read.
+   let reader_options = SqliteConnectOptions::from_str(&url)
+      .unwrap()
+      .busy_timeout(Duration::ZERO);
+   let reader_pool = SqlitePool::connect_with(reader_options).await.unwrap();
+
+   let config = ObserverConfig::new().with_tables(["users"]);
+   let observer = SqliteObserver::new(writer_pool, config);
+   let mut rx = observer.subscribe(["users"]);
+
+   let unreadable = Arc::new(AtomicI64::new(0));
+   let notified = Arc::new(AtomicI64::new(0));
+
+   // The writer waits for the consumer to finish reading notification N before
+   // it starts write N+1. The race under test - commit N against read N - is
+   // untouched, but write N+1 can no longer hold the lock that read N runs
+   // into, which would count as an early notification that never happened.
+   let (read_done_tx, mut read_done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+   let consumer = tokio::spawn({
+      let unreadable = Arc::clone(&unreadable);
+      let notified = Arc::clone(&notified);
+
+      async move {
+         while rx.recv().await.is_ok() {
+            let count = notified.fetch_add(1, Ordering::SeqCst) + 1;
+            let read: Result<i64, sqlx::Error> = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+               .fetch_one(&reader_pool)
+               .await;
+
+            // A locked database means the commit had not released its lock
+            // when the notification arrived: unreadable, the same as a stale
+            // count. Any other error is a broken test, and the panic surfaces
+            // through the join below.
+            let readable = match read {
+               Ok(rows) => rows,
+               Err(sqlx::Error::Database(e)) if e.code().is_some_and(|c| c == "5") => -1,
+               Err(e) => panic!("reader failed: {e}"),
+            };
+
+            if readable < count {
+               unreadable.fetch_add(1, Ordering::SeqCst);
+            }
+
+            if read_done_tx.send(()).await.is_err() {
+               return;
+            }
+         }
+      }
+   });
+
+   for i in 1..=WRITES {
+      let mut conn = observer.acquire().await.unwrap();
+
+      sqlx::query("INSERT INTO users (name) VALUES (?)")
+         .bind(format!("user{i}"))
+         .execute(&mut **conn)
+         .await
+         .unwrap();
+
+      // A consumer that died or never got notified stops the writes here; the
+      // join and the notification count below say which.
+      if timeout(Duration::from_secs(2), read_done_rx.recv())
+         .await
+         .is_err()
+      {
+         break;
+      }
+   }
+   consumer.abort();
+
+   // A consumer that died on its read must fail the test with that panic, not
+   // with a misleading notification count.
+   if let Err(join_error) = consumer.await
+      && !join_error.is_cancelled()
+   {
+      std::panic::resume_unwind(join_error.into_panic());
+   }
+
+   assert_eq!(
+      notified.load(Ordering::SeqCst),
+      WRITES,
+      "every committed write must notify",
+   );
+   assert_eq!(
+      unreadable.load(Ordering::SeqCst),
+      0,
+      "a notification must not arrive before its change is readable",
+   );
+}
+
+// ============================================================================
+// Per-Connection Isolation
+// ============================================================================
+
+/// A transaction abandoned on one connection must not leak into another
+/// connection's commit.
+///
+/// Each connection's hook context owns its buffer. Connection A opens a
+/// transaction, writes, and is then released mid-transaction through
+/// `into_inner`, which unregisters its hooks and drops its buffer. Were the
+/// buffer shared per database, A's row would still be waiting when B commits,
+/// and B's commit would publish it as a phantom change.
+#[tokio::test]
+async fn abandoned_transaction_on_one_connection_does_not_leak_into_another() {
+   let dir = tempfile::tempdir().unwrap();
+   let path = dir.path().join("isolation.db");
+   let url = format!("sqlite:{}?mode=rwc", path.display());
+
+   let pool = SqlitePool::connect(&url).await.unwrap();
+   sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+      .execute(&pool)
+      .await
+      .unwrap();
+
+   let config = ObserverConfig::new().with_tables(["users"]);
+   let observer = SqliteObserver::new(pool, config);
+   let mut rx = observer.subscribe(["users"]);
+
+   let mut conn_a = observer.acquire().await.unwrap();
+   let mut conn_b = observer.acquire().await.unwrap();
+
+   sqlx::query("BEGIN").execute(&mut **conn_a).await.unwrap();
+   sqlx::query("INSERT INTO users (name) VALUES ('Pending')")
+      .execute(&mut **conn_a)
+      .await
+      .unwrap();
+
+   // Abandon A's transaction: hooks come off first, so the ROLLBACK that frees
+   // the write lock fires no rollback hook that could tidy up after it.
+   let mut raw_a = conn_a.into_inner();
+   sqlx::query("ROLLBACK").execute(&mut *raw_a).await.unwrap();
+   drop(raw_a);
+
+   sqlx::query("INSERT INTO users (name) VALUES ('Real')")
+      .execute(&mut **conn_b)
+      .await
+      .unwrap();
+
+   let change = timeout(Duration::from_millis(100), rx.recv())
+      .await
+      .expect("B's commit must notify")
+      .unwrap();
+   assert!(
+      has_text_value(change.new_values.as_deref().unwrap_or_default(), "Real"),
+      "the one notification must be B's row, got {change:?}",
+   );
+
+   let phantom = timeout(Duration::from_millis(50), rx.recv()).await;
+   assert!(
+      phantom.is_err(),
+      "A's abandoned row must not surface on B's commit, got {phantom:?}",
+   );
+}
+
+// ============================================================================
+// Commits Made During a Statement Reset
+// ============================================================================
+
+/// A write that commits while its statement is reset must still notify, even
+/// if the next statement on the connection fails.
+///
+/// `fetch_one` stops at the first row and resets the statement. For an
+/// autocommit `INSERT ... RETURNING`, the commit happens inside that reset.
+/// SQLite fires the profile event before it halts the statement, and the halt
+/// is the commit. So the trace hook sees nothing held. The change waits for
+/// the next statement. If that statement fails, its rollback hook must not
+/// discard the earlier, committed change.
+#[tokio::test]
+async fn a_commit_made_during_a_statement_reset_survives_a_later_failed_write() {
+   let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+   sqlx::query(
+      "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE)",
+   )
+   .execute(&pool)
+   .await
+   .unwrap();
+
+   let config = ObserverConfig::new().with_tables(["users"]);
+   let observer = SqliteObserver::new(pool, config);
+   let mut rx = observer.subscribe(["users"]);
+   let mut conn = observer.acquire().await.unwrap();
+
+   let id: i64 = sqlx::query_scalar("INSERT INTO users (name) VALUES ('Alice') RETURNING id")
+      .fetch_one(&mut **conn)
+      .await
+      .unwrap();
+   assert_eq!(id, 1);
+
+   let duplicate = sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
+      .execute(&mut **conn)
+      .await;
+   assert!(duplicate.is_err(), "the duplicate insert must fail");
+
+   let change = timeout(Duration::from_millis(100), rx.recv())
+      .await
+      .expect("the committed insert must notify")
+      .unwrap();
+   assert!(
+      has_text_value(change.new_values.as_deref().unwrap_or_default(), "Alice"),
+      "the notification must be the committed row, got {change:?}",
+   );
+}
+
+/// Releasing a connection publishes a commit that its statement reset made.
+///
+/// Same setup as the test above, but no further statement runs. The held
+/// change is published when the hooks are unregistered on drop.
+#[tokio::test]
+async fn dropping_a_connection_publishes_a_commit_made_during_a_statement_reset() {
+   let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+   sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+      .execute(&pool)
+      .await
+      .unwrap();
+
+   let config = ObserverConfig::new().with_tables(["users"]);
+   let observer = SqliteObserver::new(pool, config);
+   let mut rx = observer.subscribe(["users"]);
+   let mut conn = observer.acquire().await.unwrap();
+
+   let id: i64 = sqlx::query_scalar("INSERT INTO users (name) VALUES ('Alice') RETURNING id")
+      .fetch_one(&mut **conn)
+      .await
+      .unwrap();
+   assert_eq!(id, 1);
+
+   let before_drop = timeout(Duration::from_millis(50), rx.recv()).await;
+   // This assertion pins the current delivery latency. It is not a
+   // guarantee. If a future change publishes a reset commit earlier, update
+   // this assertion instead of treating the change as a regression.
+   assert!(
+      before_drop.is_err(),
+      "a reset commit is held until the next statement or the drop, got {before_drop:?}",
+   );
+
+   drop(conn);
+
+   let change = timeout(Duration::from_millis(100), rx.recv())
+      .await
+      .expect("dropping the connection must publish the held commit")
+      .unwrap();
+   assert!(
+      has_text_value(change.new_values.as_deref().unwrap_or_default(), "Alice"),
+      "the notification must be the committed row, got {change:?}",
    );
 }

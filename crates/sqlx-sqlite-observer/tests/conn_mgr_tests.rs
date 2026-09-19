@@ -949,8 +949,9 @@ async fn detach_all_discards_buffered_events_for_every_broker() {
       .await
       .unwrap();
 
-   // detach_all() calls flush_all_brokers() *before* it attempts the DETACH -
-   // and that flush is the only cleanup that happens here. The transaction is
+   // detach_all() unregisters the hooks - dropping this writer's buffer with
+   // them - *before* it attempts the DETACH, and that drop is the only cleanup
+   // that happens here. The transaction is
    // still open (no COMMIT/ROLLBACK was ever sent), so SQLite refuses to
    // detach "other" out from under it and this deterministically returns
    // Err(ConnMgr(Sqlx("database other is locked"))). That failure is exactly

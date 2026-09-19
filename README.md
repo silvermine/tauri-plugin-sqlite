@@ -50,7 +50,8 @@ without Tauri:
    * **[`sqlx-sqlite-conn-mgr`](crates/sqlx-sqlite-conn-mgr/)** — Low-level connection
      management: read pool, exclusive writer, WAL mode, attached databases
    * **[`sqlx-sqlite-observer`](crates/sqlx-sqlite-observer/)** — Reactive change
-     notifications using SQLite's native preupdate/commit/rollback hooks
+     notifications using SQLite's native `preupdate_hook`, `commit_hook`,
+     `rollback_hook`, and a `SQLITE_TRACE_PROFILE` trace hook
    * **[`sqlx-sqlite-toolkit`](crates/sqlx-sqlite-toolkit/)** — High-level API:
      `DatabaseWrapper`, builder-pattern queries, interruptible transactions, JSON
      type decoding. Optionally integrates the observer behind a feature flag.
