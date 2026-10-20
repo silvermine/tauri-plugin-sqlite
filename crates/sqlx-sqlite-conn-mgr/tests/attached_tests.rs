@@ -1,5 +1,6 @@
 //! Integration tests for attached database functionality
 
+use rstest::rstest;
 use sqlx_sqlite_conn_mgr::{
    AttachedMode, AttachedSpec, Error, SqliteDatabase, acquire_reader_with_attached,
    acquire_writer_with_attached,
@@ -236,8 +237,14 @@ async fn test_attach_multiple_databases() {
    conn.detach_all().await.unwrap();
 }
 
+#[rstest]
+#[case::starts_with_digit("123invalid")]
+#[case::contains_hyphen("invalid-name")]
+#[case::contains_space("invalid name")]
+#[case::contains_semicolon("invalid;drop")]
+#[case::empty_string("")]
 #[tokio::test]
-async fn test_attach_invalid_schema_name() {
+async fn test_attach_rejects_invalid_schema_name(#[case] invalid_name: &str) {
    let temp_dir = TempDir::new().unwrap();
    let main_path = temp_dir.path().join("test_attach_invalid_schema.db");
    let other_path = temp_dir.path().join("test_attach_invalid_other.db");
@@ -245,30 +252,18 @@ async fn test_attach_invalid_schema_name() {
    let main_db = SqliteDatabase::connect(&main_path, None).await.unwrap();
    let other_db = SqliteDatabase::connect(&other_path, None).await.unwrap();
 
-   // Try invalid schema names
-   let invalid_names = vec![
-      "123invalid",   // starts with digit
-      "invalid-name", // contains hyphen
-      "invalid name", // contains space
-      "invalid;drop", // contains semicolon
-      "",             // empty string
-   ];
+   let specs = vec![AttachedSpec {
+      database: Arc::clone(&other_db),
+      schema_name: invalid_name.to_string(),
+      mode: AttachedMode::ReadOnly,
+   }];
 
-   for invalid_name in invalid_names {
-      let specs = vec![AttachedSpec {
-         database: Arc::clone(&other_db),
-         schema_name: invalid_name.to_string(),
-         mode: AttachedMode::ReadOnly,
-      }];
-
-      let result = acquire_reader_with_attached(&main_db, specs).await;
-      assert!(
-         result.is_err(),
-         "Schema name '{}' should be rejected",
-         invalid_name
-      );
-      assert!(matches!(result.unwrap_err(), Error::InvalidSchemaName(_)));
-   }
+   let result = acquire_reader_with_attached(&main_db, specs).await;
+   assert!(
+      matches!(result, Err(Error::InvalidSchemaName(_))),
+      "Schema name '{invalid_name}' should be rejected with InvalidSchemaName, got {:?}",
+      result.err()
+   );
 }
 
 #[tokio::test]

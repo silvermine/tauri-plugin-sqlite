@@ -1,5 +1,6 @@
 //! Tests for transaction state management types.
 
+use rstest::rstest;
 use serde_json::json;
 use sqlx_sqlite_toolkit::{
    ActiveInterruptibleTransactions, ActiveRegularTransactions, DatabaseWrapper, Error,
@@ -353,11 +354,18 @@ async fn test_regular_abort_all_clears_state() {
    state.insert("main".into(), "a".into(), h3).await;
 }
 
+#[rstest]
+#[case::only_matching_db_key("main", "other")]
+// Closing `a` must not abort the transaction belonging to database `a:b`.
+#[case::colon_prefix_alias("a", "a:b")]
 #[tokio::test]
-async fn test_regular_abort_for_db_only_matching_db_key() {
+async fn test_regular_abort_for_db_aborts_only_matching_db(
+   #[case] target_db: &str,
+   #[case] other_db: &str,
+) {
    let state = ActiveRegularTransactions::default();
 
-   let main_handle = tokio::spawn(async {
+   let target_handle = tokio::spawn(async {
       tokio::time::sleep(std::time::Duration::from_secs(60)).await;
    });
    let other_handle = tokio::spawn(async {
@@ -366,73 +374,33 @@ async fn test_regular_abort_for_db_only_matching_db_key() {
 
    // Keep abort handles to observe the tasks once the tracker owns them.
    // abort_for_db awaits every task it aborts, so is_finished() is settled.
-   let main_task = main_handle.abort_handle();
+   let target_task = target_handle.abort_handle();
    let other_task = other_handle.abort_handle();
 
    state
-      .insert("main".into(), "main-one".into(), main_handle)
+      .insert(target_db.into(), "target-tx".into(), target_handle)
       .await;
    state
-      .insert("other".into(), "other-two".into(), other_handle)
+      .insert(other_db.into(), "other-tx".into(), other_handle)
       .await;
 
-   state.abort_for_db("main").await.unwrap();
+   state.abort_for_db(target_db).await.unwrap();
 
    assert!(
-      main_task.is_finished(),
-      "abort_for_db(\"main\") should abort and await the `main` transaction task"
+      target_task.is_finished(),
+      "abort_for_db({target_db:?}) should abort and await the {target_db:?} transaction task"
    );
    assert!(
       !other_task.is_finished(),
-      "abort_for_db(\"main\") must not abort the `other` transaction task"
+      "abort_for_db({target_db:?}) must not abort the {other_db:?} transaction task"
    );
 
-   // Other database transaction should still be tracked and abortable.
-   state.abort_for_db("other").await.unwrap();
+   // The other database's transaction should still be tracked and abortable.
+   state.abort_for_db(other_db).await.unwrap();
 
    assert!(
       other_task.is_finished(),
-      "`other` transaction should still be tracked so abort_for_db(\"other\") aborts it"
-   );
-}
-
-#[tokio::test]
-async fn test_regular_abort_for_db_does_not_match_colon_prefix_alias() {
-   let state = ActiveRegularTransactions::default();
-
-   let a_handle = tokio::spawn(async {
-      tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-   });
-   let ab_handle = tokio::spawn(async {
-      tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-   });
-
-   // Keep abort handles to observe the tasks once the tracker owns them.
-   // abort_for_db awaits every task it aborts, so is_finished() is settled.
-   let a_task = a_handle.abort_handle();
-   let ab_task = ab_handle.abort_handle();
-
-   state.insert("a".into(), "a-tx".into(), a_handle).await;
-   state.insert("a:b".into(), "ab-tx".into(), ab_handle).await;
-
-   state.abort_for_db("a").await.unwrap();
-
-   assert!(
-      a_task.is_finished(),
-      "abort_for_db(\"a\") should abort and await the `a` transaction task"
-   );
-
-   // Closing `a` must not abort the transaction belonging to database `a:b`.
-   assert!(
-      !ab_task.is_finished(),
-      "abort_for_db(\"a\") must not abort the `a:b` transaction task"
-   );
-
-   state.abort_for_db("a:b").await.unwrap();
-
-   assert!(
-      ab_task.is_finished(),
-      "`a:b` transaction should still be tracked so abort_for_db(\"a:b\") aborts it"
+      "{other_db:?} transaction should still be tracked so abort_for_db({other_db:?}) aborts it"
    );
 }
 

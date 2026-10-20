@@ -8,6 +8,7 @@
 //! - Multi-subscriber: all subscribers receive notifications
 
 use futures::StreamExt;
+use rstest::rstest;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx_sqlite_observer::{ChangeOperation, ColumnValue, ObserverConfig, SqliteObserver};
@@ -557,179 +558,71 @@ async fn test_capture_values_disabled() {
 // Primary Key Extraction
 // ============================================================================
 
+#[rstest]
+// The PK is the auto-incremented id (1).
+#[case::single_column(
+   "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
+   "INSERT INTO users (name) VALUES ('Alice')",
+   "users",
+   vec![ColumnValue::Integer(1)],
+   Some(1)
+)]
+// PK columns are in declaration order: (user_id, role_id).
+#[case::composite(
+   "CREATE TABLE user_roles (user_id INTEGER NOT NULL, role_id INTEGER NOT NULL, \
+    granted_at TEXT, PRIMARY KEY (user_id, role_id))",
+   "INSERT INTO user_roles (user_id, role_id, granted_at) VALUES (42, 7, '2024-01-01')",
+   "user_roles",
+   vec![ColumnValue::Integer(42), ColumnValue::Integer(7)],
+   Some(1)
+)]
+#[case::text(
+   "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)",
+   "INSERT INTO settings (key, value) VALUES ('theme', 'dark')",
+   "settings",
+   vec![ColumnValue::Text("theme".to_string())],
+   Some(1)
+)]
+// A WITHOUT ROWID table has rowid=None, but its primary_key is still populated.
+#[case::without_rowid_table(
+   "CREATE TABLE kv_store (key TEXT PRIMARY KEY, value BLOB) WITHOUT ROWID",
+   "INSERT INTO kv_store (key, value) VALUES ('mykey', X'DEADBEEF')",
+   "kv_store",
+   vec![ColumnValue::Text("mykey".to_string())],
+   None
+)]
 #[tokio::test]
-async fn test_single_column_primary_key() {
-   let pool = setup_test_db().await;
-   let config = ObserverConfig::new().with_tables(["users"]);
-   let observer = SqliteObserver::new(pool, config);
-
-   let mut rx = observer.subscribe(["users"]);
-   let mut conn = observer.acquire().await.unwrap();
-
-   sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
-      .execute(&mut **conn)
-      .await
-      .unwrap();
-
-   let change = timeout(Duration::from_millis(100), rx.recv())
-      .await
-      .unwrap()
-      .unwrap();
-
-   assert_eq!(change.table, "users");
-   assert!(!change.primary_key.is_empty(), "Should have primary key");
-   assert_eq!(change.primary_key.len(), 1, "Single-column PK");
-
-   // The PK should be the auto-incremented id (1)
-   assert_eq!(
-      change.primary_key[0],
-      ColumnValue::Integer(1),
-      "PK should be id=1"
-   );
-}
-
-#[tokio::test]
-async fn test_composite_primary_key() {
+async fn test_insert_reports_primary_key(
+   #[case] create_table_sql: &'static str,
+   #[case] insert_sql: &'static str,
+   #[case] table: &str,
+   #[case] expected_primary_key: Vec<ColumnValue>,
+   #[case] expected_rowid: Option<i64>,
+) {
    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+   sqlx::query(create_table_sql).execute(&pool).await.unwrap();
 
-   // Create a table with a composite primary key
-   sqlx::query(
-      r#"
-        CREATE TABLE user_roles (
-            user_id INTEGER NOT NULL,
-            role_id INTEGER NOT NULL,
-            granted_at TEXT,
-            PRIMARY KEY (user_id, role_id)
-        )
-        "#,
-   )
-   .execute(&pool)
-   .await
-   .unwrap();
-
-   let config = ObserverConfig::new().with_tables(["user_roles"]);
+   let config = ObserverConfig::new().with_tables([table]);
    let observer = SqliteObserver::new(pool, config);
 
-   let mut rx = observer.subscribe(["user_roles"]);
+   let mut rx = observer.subscribe([table]);
    let mut conn = observer.acquire().await.unwrap();
 
-   sqlx::query(
-      "INSERT INTO user_roles (user_id, role_id, granted_at) VALUES (42, 7, '2024-01-01')",
-   )
-   .execute(&mut **conn)
-   .await
-   .unwrap();
+   sqlx::query(insert_sql).execute(&mut **conn).await.unwrap();
 
    let change = timeout(Duration::from_millis(100), rx.recv())
       .await
       .unwrap()
       .unwrap();
 
-   assert_eq!(change.table, "user_roles");
-   assert_eq!(change.primary_key.len(), 2, "Composite PK has 2 columns");
-
-   // PK columns should be in declaration order: (user_id, role_id)
+   assert_eq!(change.table, table);
    assert_eq!(
-      change.primary_key[0],
-      ColumnValue::Integer(42),
-      "First PK column is user_id=42"
+      change.rowid, expected_rowid,
+      "rowid should be the inserted row's rowid, or None for a WITHOUT ROWID table"
    );
    assert_eq!(
-      change.primary_key[1],
-      ColumnValue::Integer(7),
-      "Second PK column is role_id=7"
-   );
-}
-
-#[tokio::test]
-async fn test_text_primary_key() {
-   let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-
-   // Create a table with a TEXT primary key
-   sqlx::query(
-      r#"
-        CREATE TABLE settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        "#,
-   )
-   .execute(&pool)
-   .await
-   .unwrap();
-
-   let config = ObserverConfig::new().with_tables(["settings"]);
-   let observer = SqliteObserver::new(pool, config);
-
-   let mut rx = observer.subscribe(["settings"]);
-   let mut conn = observer.acquire().await.unwrap();
-
-   sqlx::query("INSERT INTO settings (key, value) VALUES ('theme', 'dark')")
-      .execute(&mut **conn)
-      .await
-      .unwrap();
-
-   let change = timeout(Duration::from_millis(100), rx.recv())
-      .await
-      .unwrap()
-      .unwrap();
-
-   assert_eq!(change.table, "settings");
-   assert_eq!(change.primary_key.len(), 1, "Single TEXT PK");
-   assert_eq!(
-      change.primary_key[0],
-      ColumnValue::Text("theme".to_string()),
-      "PK should be key='theme'"
-   );
-}
-
-#[tokio::test]
-async fn test_without_rowid_table() {
-   let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-
-   // Create a WITHOUT ROWID table
-   sqlx::query(
-      r#"
-        CREATE TABLE kv_store (
-            key TEXT PRIMARY KEY,
-            value BLOB
-        ) WITHOUT ROWID
-        "#,
-   )
-   .execute(&pool)
-   .await
-   .unwrap();
-
-   let config = ObserverConfig::new().with_tables(["kv_store"]);
-   let observer = SqliteObserver::new(pool, config);
-
-   let mut rx = observer.subscribe(["kv_store"]);
-   let mut conn = observer.acquire().await.unwrap();
-
-   sqlx::query("INSERT INTO kv_store (key, value) VALUES ('mykey', X'DEADBEEF')")
-      .execute(&mut **conn)
-      .await
-      .unwrap();
-
-   let change = timeout(Duration::from_millis(100), rx.recv())
-      .await
-      .unwrap()
-      .unwrap();
-
-   assert_eq!(change.table, "kv_store");
-
-   // For WITHOUT ROWID tables, rowid should be None
-   assert!(
-      change.rowid.is_none(),
-      "WITHOUT ROWID table should have rowid=None"
-   );
-
-   // But primary_key should still be populated
-   assert_eq!(change.primary_key.len(), 1);
-   assert_eq!(
-      change.primary_key[0],
-      ColumnValue::Text("mykey".to_string()),
-      "PK should be key='mykey'"
+      change.primary_key, expected_primary_key,
+      "PK should hold the inserted key columns in declaration order"
    );
 }
 
@@ -788,17 +681,11 @@ async fn test_delete_returns_old_primary_key() {
 /// assumption went untested. In WAL mode an early notification shows as a
 /// stale count. In rollback-journal mode it shows as a locked read, which is
 /// why the reader below does not wait on the lock.
+#[rstest]
+#[case::wal_mode("WAL")]
+#[case::rollback_journal_mode("DELETE")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_notification_means_the_change_is_readable_in_wal_mode() {
-   a_notification_means_the_change_is_readable("WAL").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_notification_means_the_change_is_readable_in_rollback_journal_mode() {
-   a_notification_means_the_change_is_readable("DELETE").await;
-}
-
-async fn a_notification_means_the_change_is_readable(journal_mode: &str) {
+async fn a_notification_means_the_change_is_readable(#[case] journal_mode: &str) {
    const WRITES: i64 = 50;
 
    let dir = tempfile::tempdir().unwrap();

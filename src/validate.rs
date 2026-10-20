@@ -66,6 +66,7 @@ pub fn validate_database_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use rstest::rstest;
    use std::fs;
    use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,34 +79,21 @@ mod tests {
       dir
    }
 
-   #[test]
-   fn test_memory_passthrough() {
-      assert_eq!(
-         validate_database_path(":memory:").unwrap(),
-         PathBuf::from(":memory:"),
-      );
-   }
-
-   #[test]
-   fn test_file_memory_uri_passthrough() {
-      assert_eq!(
-         validate_database_path("file::memory:?cache=shared").unwrap(),
-         PathBuf::from("file::memory:?cache=shared"),
-      );
-   }
-
-   #[test]
-   fn test_mode_memory_passthrough() {
-      assert_eq!(
-         validate_database_path("file:test?mode=memory").unwrap(),
-         PathBuf::from("file:test?mode=memory"),
-      );
+   #[rstest]
+   #[case::memory(":memory:")]
+   #[case::file_memory_uri("file::memory:?cache=shared")]
+   #[case::mode_memory("file:test?mode=memory")]
+   fn test_memory_path_passes_through(#[case] path: &str) {
+      assert_eq!(validate_database_path(path).unwrap(), PathBuf::from(path));
    }
 
    #[test]
    fn test_mode_memory_substring_in_value_is_not_treated_as_memory() {
       let err = validate_database_path("file:/home/user/real.db?x=mode=memory").unwrap_err();
-      assert!(matches!(err, Error::InvalidPath(_)));
+      assert!(
+         matches!(err, Error::InvalidPath(_)),
+         "expected InvalidPath, got {err:?}"
+      );
    }
 
    #[test]
@@ -142,30 +130,27 @@ mod tests {
    #[test]
    fn test_rejects_relative_path() {
       let err = validate_database_path("relative.db").unwrap_err();
-      assert!(matches!(err, Error::InvalidPath(_)));
+      assert!(
+         matches!(err, Error::InvalidPath(_)),
+         "expected InvalidPath, got {err:?}"
+      );
    }
 
-   #[test]
-   fn test_rejects_absolute_path_with_parent_traversal() {
-      let dir = make_temp_dir();
-      let abs_str = format!("{}/../escape.db", dir.to_str().unwrap());
-
-      let err = validate_database_path(&abs_str).unwrap_err();
-      assert!(matches!(err, Error::PathTraversal(_)));
-   }
-
-   #[test]
-   fn test_rejects_absolute_path_with_embedded_traversal() {
-      let dir = make_temp_dir();
-      let abs_str = format!("{}/sub/../../escape.db", dir.to_str().unwrap());
-
-      let err = validate_database_path(&abs_str).unwrap_err();
-      assert!(matches!(err, Error::PathTraversal(_)));
-   }
-
-   #[test]
-   fn test_rejects_null_byte() {
-      let err = validate_database_path("path\0evil").unwrap_err();
-      assert!(matches!(err, Error::PathTraversal(_)));
+   #[rstest]
+   #[case::absolute_path_with_parent_traversal(format!(
+      "{}/../escape.db",
+      make_temp_dir().to_str().unwrap()
+   ))]
+   #[case::absolute_path_with_embedded_traversal(format!(
+      "{}/sub/../../escape.db",
+      make_temp_dir().to_str().unwrap()
+   ))]
+   #[case::null_byte("path\0evil".to_string())]
+   fn test_rejects_path_traversal(#[case] path: String) {
+      let err = validate_database_path(&path).unwrap_err();
+      assert!(
+         matches!(err, Error::PathTraversal(_)),
+         "expected PathTraversal, got {err:?}"
+      );
    }
 }

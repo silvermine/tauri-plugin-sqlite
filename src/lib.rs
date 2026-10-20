@@ -1408,6 +1408,7 @@ mod tests {
    use super::*;
    use crate::commands;
    use crate::subscriptions::ObserverConfigParams;
+   use rstest::rstest;
    use std::collections::HashMap;
    use tauri::plugin::Plugin;
    use tauri::test::{MockRuntime, mock_app, mock_builder, mock_context, noop_assets};
@@ -2768,13 +2769,19 @@ mod tests {
       });
    }
 
-   /// A second window's explicit `captureValues` request that conflicts with
-   /// the value already active for a database must be rejected with
-   /// `OBSERVATION_CONFIG_CONFLICT`, without mutating the live broker or
-   /// recording that window's registration - the check must return before
-   /// `register()` runs.
-   #[test]
-   fn test_observe_conflicting_capture_values_rejected() {
+   /// A second window's explicit `captureValues` or `channelCapacity` request
+   /// that conflicts with the value already active for a database must be
+   /// rejected with `OBSERVATION_CONFIG_CONFLICT`, without mutating the live
+   /// broker or recording that window's registration - the check must return
+   /// before `register()` runs.
+   #[rstest]
+   #[case::capture_values(
+      ObserverConfigParams { channel_capacity: None, capture_values: Some(false) }
+   )]
+   #[case::channel_capacity(
+      ObserverConfigParams { channel_capacity: Some(512), capture_values: None }
+   )]
+   fn test_observe_conflicting_config_rejected(#[case] config_b: ObserverConfigParams) {
       let temp_dir = tempfile::tempdir().unwrap();
       let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
       let key = "MAIN".to_string();
@@ -2811,13 +2818,10 @@ mod tests {
             webview_b.as_ref().clone(),
             "MAIN".to_string(),
             vec!["test".to_string()],
-            Some(ObserverConfigParams {
-               channel_capacity: None,
-               capture_values: Some(false),
-            }),
+            Some(config_b),
          )
          .await
-         .expect_err("conflicting captureValues should be rejected");
+         .expect_err("window B's conflicting config should be rejected");
 
          assert!(matches!(err, Error::ObservationConfigConflict(_)));
 
@@ -2852,10 +2856,29 @@ mod tests {
       });
    }
 
-   /// Same as `test_observe_conflicting_capture_values_rejected`, but for a
-   /// conflicting `channelCapacity` request.
-   #[test]
-   fn test_observe_conflicting_channel_capacity_rejected() {
+   /// A second window's `observe()` whose config does not conflict with the
+   /// live broker's active values must succeed and record that window's
+   /// registration.
+   #[rstest]
+   // An explicit config that matches the live broker's already-active values
+   // exactly is not a conflict and must succeed.
+   #[case::identical_explicit_config(
+      None,
+      Some(ObserverConfigParams { channel_capacity: Some(256), capture_values: Some(true) })
+   )]
+   // Guards the `seeded` block in `observe()`: once window A has enabled
+   // observation with a non-default explicit config, a second window calling
+   // `observe()` with `config: None` must succeed - its defaults must never be
+   // compared against the live broker's (already non-default) values as if
+   // they were an explicit, conflicting request.
+   #[case::omitted_config_after_explicit_config(
+      Some(ObserverConfigParams { channel_capacity: Some(512), capture_values: Some(false) }),
+      None
+   )]
+   fn test_observe_compatible_config_succeeds(
+      #[case] config_a: Option<ObserverConfigParams>,
+      #[case] config_b: Option<ObserverConfigParams>,
+   ) {
       let temp_dir = tempfile::tempdir().unwrap();
       let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
       let key = "MAIN".to_string();
@@ -2881,91 +2904,10 @@ mod tests {
             webview_a.as_ref().clone(),
             "MAIN".to_string(),
             vec!["test".to_string()],
-            None,
+            config_a,
          )
          .await
-         .expect("window A observe with default config should succeed");
-
-         let err = commands::observe(
-            app.state::<DbInstances>(),
-            app.state::<ObserverRegistrations>(),
-            webview_b.as_ref().clone(),
-            "MAIN".to_string(),
-            vec!["test".to_string()],
-            Some(ObserverConfigParams {
-               channel_capacity: Some(512),
-               capture_values: None,
-            }),
-         )
-         .await
-         .expect_err("conflicting channelCapacity should be rejected");
-
-         assert!(matches!(err, Error::ObservationConfigConflict(_)));
-
-         let (capacity, capture) = {
-            let instances = app.state::<DbInstances>().inner().inner.read().await;
-            let observable = instances
-               .get("MAIN")
-               .expect("MAIN should be loaded")
-               .observable()
-               .expect("observation should be enabled");
-            (
-               observable.broker().channel_capacity(),
-               observable.broker().capture_values(),
-            )
-         };
-         assert_eq!(
-            capacity, 256,
-            "the live broker's channelCapacity must be unchanged by a rejected observe()"
-         );
-         assert!(
-            capture,
-            "the live broker's captureValues must be unchanged by a rejected observe()"
-         );
-
-         assert!(
-            !app
-               .state::<ObserverRegistrations>()
-               .is_registered("MAIN", webview_b.label())
-               .await,
-            "window B's registration must not be recorded when its observe() is rejected"
-         );
-      });
-   }
-
-   /// An explicit config that matches the live broker's already-active values
-   /// exactly is not a conflict and must succeed.
-   #[test]
-   fn test_observe_identical_explicit_config_succeeds() {
-      let temp_dir = tempfile::tempdir().unwrap();
-      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
-      let key = "MAIN".to_string();
-
-      tauri::async_runtime::block_on(async {
-         let (app, _) =
-            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
-               .await
-               .expect("plugin init task should succeed");
-
-         load_and_create_test_table(&app, "MAIN").await;
-
-         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
-            .build()
-            .expect("webview window A should build");
-         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
-            .build()
-            .expect("webview window B should build");
-
-         commands::observe(
-            app.state::<DbInstances>(),
-            app.state::<ObserverRegistrations>(),
-            webview_a.as_ref().clone(),
-            "MAIN".to_string(),
-            vec!["test".to_string()],
-            None,
-         )
-         .await
-         .expect("window A observe with default config should succeed");
+         .expect("window A observe should succeed");
 
          commands::observe(
             app.state::<DbInstances>(),
@@ -2973,73 +2915,10 @@ mod tests {
             webview_b.as_ref().clone(),
             "MAIN".to_string(),
             vec!["test".to_string()],
-            Some(ObserverConfigParams {
-               channel_capacity: Some(256),
-               capture_values: Some(true),
-            }),
+            config_b,
          )
          .await
-         .expect("explicit config identical to the live broker's values should succeed");
-
-         assert!(
-            app.state::<ObserverRegistrations>()
-               .is_registered("MAIN", webview_b.label())
-               .await,
-            "window B's registration must be recorded once its observe() succeeds"
-         );
-      });
-   }
-
-   /// Guards the `seeded` block in `observe()`: once window A has enabled
-   /// observation with a non-default explicit config, a second window calling
-   /// `observe()` with `config: None` must succeed - its defaults must never be
-   /// compared against the live broker's (already non-default) values as if
-   /// they were an explicit, conflicting request.
-   #[test]
-   fn test_observe_omitted_config_after_explicit_config_succeeds() {
-      let temp_dir = tempfile::tempdir().unwrap();
-      let db_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
-      let key = "MAIN".to_string();
-
-      tauri::async_runtime::block_on(async {
-         let (app, _) =
-            tokio::task::spawn_blocking(move || init_app_with_registered_db_at_path(&key, db_path))
-               .await
-               .expect("plugin init task should succeed");
-
-         load_and_create_test_table(&app, "MAIN").await;
-
-         let webview_a = tauri::WebviewWindowBuilder::new(&app, "window-a", Default::default())
-            .build()
-            .expect("webview window A should build");
-         let webview_b = tauri::WebviewWindowBuilder::new(&app, "window-b", Default::default())
-            .build()
-            .expect("webview window B should build");
-
-         commands::observe(
-            app.state::<DbInstances>(),
-            app.state::<ObserverRegistrations>(),
-            webview_a.as_ref().clone(),
-            "MAIN".to_string(),
-            vec!["test".to_string()],
-            Some(ObserverConfigParams {
-               channel_capacity: Some(512),
-               capture_values: Some(false),
-            }),
-         )
-         .await
-         .expect("window A observe with explicit non-default config should succeed");
-
-         commands::observe(
-            app.state::<DbInstances>(),
-            app.state::<ObserverRegistrations>(),
-            webview_b.as_ref().clone(),
-            "MAIN".to_string(),
-            vec!["test".to_string()],
-            None,
-         )
-         .await
-         .expect("window B observe with config: None should succeed");
+         .expect("window B observe with a compatible config should succeed");
 
          assert!(
             app.state::<ObserverRegistrations>()

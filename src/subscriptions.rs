@@ -489,6 +489,7 @@ impl ObserverRegistrations {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use rstest::rstest;
 
    /// Test-only: an empty, never-populated `DbInstances`, used purely to
    /// obtain real [`DbInstancesGuard`] witnesses (via its own `write()`) for
@@ -501,8 +502,16 @@ mod tests {
       crate::DbInstances::default()
    }
 
+   #[rstest]
+   #[case::distinct_label_is_additive("window-b", 2)]
+   // Same window calling observe() again (e.g. to add more tables) must not
+   // inflate the refcount.
+   #[case::same_label_twice_is_idempotent("window-a", 1)]
    #[tokio::test]
-   async fn test_register_is_additive_across_distinct_labels() {
+   async fn test_register_counts_distinct_labels(
+      #[case] second_label: &str,
+      #[case] expected: usize,
+   ) {
       let regs = ObserverRegistrations::default();
       let db_lock = dummy_db_lock();
 
@@ -514,30 +523,9 @@ mod tests {
       );
       assert_eq!(
          regs
-            .register(&mut db_lock.write().await, "MAIN", "window-b")
+            .register(&mut db_lock.write().await, "MAIN", second_label)
             .await,
-         2
-      );
-   }
-
-   #[tokio::test]
-   async fn test_register_same_label_twice_is_idempotent() {
-      let regs = ObserverRegistrations::default();
-      let db_lock = dummy_db_lock();
-
-      assert_eq!(
-         regs
-            .register(&mut db_lock.write().await, "MAIN", "window-a")
-            .await,
-         1
-      );
-      // Same window calling observe() again (e.g. to add more tables) must not
-      // inflate the refcount.
-      assert_eq!(
-         regs
-            .register(&mut db_lock.write().await, "MAIN", "window-a")
-            .await,
-         1
+         expected
       );
    }
 
@@ -570,33 +558,35 @@ mod tests {
       );
    }
 
+   #[rstest]
+   // Releasing from a db_key with no registrations at all is "never
+   // registered", not "last observer released" - `None`, not `Some(0)`.
+   #[case::db_without_registrations(&[], "window-a")]
+   // Releasing a label that was never registered, for a db_key that DOES
+   // have other registrations, is also a no-op: window-a's registration is
+   // left untouched.
+   #[case::unknown_label_on_registered_db(&["window-a"], "window-unknown")]
    #[tokio::test]
-   async fn test_release_unknown_label_or_db_is_a_noop() {
+   async fn test_release_unknown_label_or_db_is_a_noop(
+      #[case] registered: &[&str],
+      #[case] released: &str,
+   ) {
       let regs = ObserverRegistrations::default();
       let db_lock = dummy_db_lock();
 
-      // Releasing from a db_key with no registrations at all is "never
-      // registered", not "last observer released" - `None`, not `Some(0)`.
-      assert_eq!(
+      for &label in registered {
          regs
-            .release(&mut db_lock.write().await, "MAIN", "window-a")
-            .await,
-         None
-      );
+            .register(&mut db_lock.write().await, "MAIN", label)
+            .await;
+      }
 
-      regs
-         .register(&mut db_lock.write().await, "MAIN", "window-a")
-         .await;
-      // Releasing a label that was never registered, for a db_key that DOES
-      // have other registrations, is also a no-op: window-a's registration is
-      // left untouched.
       assert_eq!(
          regs
-            .release(&mut db_lock.write().await, "MAIN", "window-unknown")
+            .release(&mut db_lock.write().await, "MAIN", released)
             .await,
          None
       );
-      assert_eq!(regs.count_for_db("MAIN").await, 1);
+      assert_eq!(regs.count_for_db("MAIN").await, registered.len());
    }
 
    #[tokio::test]

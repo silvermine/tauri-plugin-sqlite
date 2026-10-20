@@ -915,6 +915,7 @@ impl SqlValue {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use rstest::rstest;
 
    /// Every test in this binary shares the process-global registry, so each one uses a
    /// name of its own.
@@ -928,26 +929,13 @@ mod tests {
       }
    }
 
-   #[test]
-   fn rejects_an_empty_name() {
+   #[rstest]
+   #[case::empty("")]
+   #[case::over_255_bytes(&"x".repeat(256))]
+   #[case::holding_a_nul_byte("unit_n\0ul")]
+   fn rejects_an_invalid_name(#[case] name: &str) {
       assert!(matches!(
-         register_function(function("", 1)),
-         Err(Error::InvalidFunctionName(_))
-      ));
-   }
-
-   #[test]
-   fn rejects_a_name_over_255_bytes() {
-      assert!(matches!(
-         register_function(function(&"x".repeat(256), 1)),
-         Err(Error::InvalidFunctionName(_))
-      ));
-   }
-
-   #[test]
-   fn rejects_a_name_holding_a_nul_byte() {
-      assert!(matches!(
-         register_function(function("unit_n\0ul", 1)),
+         register_function(function(name, 1)),
          Err(Error::InvalidFunctionName(_))
       ));
    }
@@ -971,24 +959,19 @@ mod tests {
       ));
    }
 
-   #[test]
-   fn refuses_a_name_that_replaces_a_builtin() {
-      // Exact-arity match against a built-in: lower() takes one argument.
+   /// The "lower" and "LOWER" cases share a registry key. Both are refused before
+   /// anything is stored, so they can run in parallel without colliding.
+   #[rstest]
+   // Exact-arity match against a built-in: lower() takes one argument.
+   #[case::exact_arity("lower", 1)]
+   // Case-insensitive, matching how SQLite resolves names.
+   #[case::case_insensitive("LOWER", 1)]
+   // A variadic built-in matches every arity: max() accepts any argument count.
+   #[case::variadic_builtin("max", 3)]
+   fn refuses_a_name_that_replaces_a_builtin(#[case] name: &str, #[case] arity: i32) {
       assert!(matches!(
-         register_function(function("lower", 1)),
-         Err(Error::ShadowsBuiltinFunction { arity: 1, .. })
-      ));
-
-      // Case-insensitive, matching how SQLite resolves names.
-      assert!(matches!(
-         register_function(function("LOWER", 1)),
-         Err(Error::ShadowsBuiltinFunction { arity: 1, .. })
-      ));
-
-      // A variadic built-in matches every arity: max() accepts any argument count.
-      assert!(matches!(
-         register_function(function("max", 3)),
-         Err(Error::ShadowsBuiltinFunction { arity: 3, .. })
+         register_function(function(name, arity)),
+         Err(Error::ShadowsBuiltinFunction { arity: refused, .. }) if refused == arity
       ));
    }
 

@@ -8,6 +8,7 @@
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use rstest::rstest;
 use sqlx::sqlite::{Sqlite, SqliteRow};
 use sqlx::{Executor, FromRow};
 use sqlx_sqlite_conn_mgr::{
@@ -238,39 +239,25 @@ async fn a_panicking_handler_produces_an_error_and_leaves_the_pool_usable() {
    assert_eq!(survivor, 1);
 }
 
+/// SQLite's `quote()` renders the echoed value as an SQL literal, so one string pins both
+/// the value and its storage class: text is quoted, a blob is `X'..'`, and `42` and `42.0`
+/// differ.
+#[rstest]
+#[case::null("SELECT quote(fn_round_trip(NULL))", "NULL")]
+#[case::integer("SELECT quote(fn_round_trip(42))", "42")]
+#[case::real("SELECT quote(fn_round_trip(1.5))", "1.5")]
+#[case::text("SELECT quote(fn_round_trip('abc'))", "'abc'")]
+#[case::blob("SELECT quote(fn_round_trip(x'0102ff'))", "X'0102FF'")]
 #[tokio::test]
-async fn every_storage_class_round_trips_and_null_passes_through() {
+async fn every_storage_class_round_trips_and_null_passes_through(
+   #[case] sql: &'static str,
+   #[case] expected: &str,
+) {
    let dir = TempDir::new().unwrap();
    let db = open(&dir, None).await;
-   let pool = db.read_pool().unwrap();
 
-   let null: Option<String> = scalar(pool, "SELECT fn_round_trip(NULL)").await;
-   assert_eq!(null, None);
-
-   let integer: i64 = scalar(pool, "SELECT fn_round_trip(42)").await;
-   assert_eq!(integer, 42);
-
-   let real: f64 = scalar(pool, "SELECT fn_round_trip(1.5)").await;
-   assert_eq!(real, 1.5);
-
-   let text: String = scalar(pool, "SELECT fn_round_trip('abc')").await;
-   assert_eq!(text, "abc");
-
-   let blob: Vec<u8> = scalar(pool, "SELECT fn_round_trip(x'0102ff')").await;
-   assert_eq!(blob, vec![1, 2, 255]);
-
-   // The storage class survives the round trip, rather than everything arriving as text.
-   // sqlx coerces a text value into an i64, so the typed reads above pass either way.
-   let classes: Vec<String> = sqlx::query_scalar(
-      "SELECT typeof(fn_round_trip(42)) \
-       UNION ALL SELECT typeof(fn_round_trip(1.5)) \
-       UNION ALL SELECT typeof(fn_round_trip('abc')) \
-       UNION ALL SELECT typeof(fn_round_trip(x'01'))",
-   )
-   .fetch_all(pool)
-   .await
-   .unwrap();
-   assert_eq!(classes, vec!["integer", "real", "text", "blob"]);
+   let literal: String = scalar(db.read_pool().unwrap(), sql).await;
+   assert_eq!(literal, expected);
 }
 
 /// A zero-argument function drives `dispatch` with an empty argument vector, which no
@@ -284,34 +271,39 @@ async fn a_zero_argument_function_resolves() {
    assert_eq!(value, "no arguments");
 }
 
-/// Two calls with the arguments swapped. One call cannot tell a correct argument order
-/// from a reversed one.
+/// Two calls with the arguments swapped. Either call alone catches a reversed order,
+/// since its two arguments differ. The `swapped` case also catches a dispatch that orders
+/// the arguments by value rather than by position.
+#[rstest]
+#[case::in_order("SELECT fn_pair('a', 'b')", "a|b")]
+#[case::swapped("SELECT fn_pair('b', 'a')", "b|a")]
 #[tokio::test]
-async fn a_two_argument_function_receives_its_arguments_in_order() {
+async fn a_two_argument_function_receives_its_arguments_in_order(
+   #[case] sql: &'static str,
+   #[case] expected: &str,
+) {
    let dir = TempDir::new().unwrap();
    let db = open(&dir, None).await;
-   let pool = db.read_pool().unwrap();
 
-   let forward: String = scalar(pool, "SELECT fn_pair('a', 'b')").await;
-   assert_eq!(forward, "a|b");
-
-   let reversed: String = scalar(pool, "SELECT fn_pair('b', 'a')").await;
-   assert_eq!(reversed, "b|a");
+   let value: String = scalar(db.read_pool().unwrap(), sql).await;
+   assert_eq!(value, expected);
 }
 
 /// SQLite overloads a name by argument count, and the registry holds one entry per name
 /// and arity pair. Each call reaches the handler registered for its own arity.
+#[rstest]
+#[case::one_argument("SELECT fn_over('x')", "one argument")]
+#[case::two_arguments("SELECT fn_over('x', 'y')", "two arguments")]
 #[tokio::test]
-async fn one_name_registered_at_two_arities_resolves_at_both() {
+async fn one_name_registered_at_two_arities_resolves_at_both(
+   #[case] sql: &'static str,
+   #[case] expected: &str,
+) {
    let dir = TempDir::new().unwrap();
    let db = open(&dir, None).await;
-   let pool = db.read_pool().unwrap();
 
-   let one: String = scalar(pool, "SELECT fn_over('x')").await;
-   assert_eq!(one, "one argument");
-
-   let two: String = scalar(pool, "SELECT fn_over('x', 'y')").await;
-   assert_eq!(two, "two arguments");
+   let value: String = scalar(db.read_pool().unwrap(), sql).await;
+   assert_eq!(value, expected);
 }
 
 #[tokio::test]

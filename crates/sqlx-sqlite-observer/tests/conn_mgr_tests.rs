@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use rstest::rstest;
 use sqlx_sqlite_conn_mgr::{AttachedMode, AttachedSpec, SqliteDatabase, SqliteDatabaseConfig};
 use sqlx_sqlite_observer::{ChangeOperation, ObservableSqliteDatabase, ObserverConfig};
 use tokio::time::timeout;
@@ -160,8 +161,14 @@ async fn test_rollback_discards_changes() {
 // CRUD Operations
 // ============================================================================
 
+#[rstest]
+#[case::update("UPDATE users SET name = 'Bob' WHERE id = 1", ChangeOperation::Update)]
+#[case::delete("DELETE FROM users WHERE id = 1", ChangeOperation::Delete)]
 #[tokio::test]
-async fn test_update_notification() {
+async fn test_committed_change_notification(
+   #[case] sql: &'static str,
+   #[case] expected_operation: ChangeOperation,
+) {
    let test_db = setup_test_db().await;
    let config = ObserverConfig::new().with_tables(["users"]);
    let observable = ObservableSqliteDatabase::new(test_db.db.clone(), config);
@@ -179,10 +186,7 @@ async fn test_update_notification() {
    let mut writer = observable.acquire_writer().await.unwrap();
 
    sqlx::query("BEGIN").execute(&mut *writer).await.unwrap();
-   sqlx::query("UPDATE users SET name = 'Bob' WHERE id = 1")
-      .execute(&mut *writer)
-      .await
-      .unwrap();
+   sqlx::query(sql).execute(&mut *writer).await.unwrap();
 
    sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
 
@@ -192,42 +196,7 @@ async fn test_update_notification() {
       .unwrap();
 
    assert_eq!(change.table, "users");
-   assert_eq!(change.operation, Some(ChangeOperation::Update));
-}
-
-#[tokio::test]
-async fn test_delete_notification() {
-   let test_db = setup_test_db().await;
-   let config = ObserverConfig::new().with_tables(["users"]);
-   let observable = ObservableSqliteDatabase::new(test_db.db.clone(), config);
-
-   // Seed data
-   let mut writer = observable.acquire_writer().await.unwrap();
-   sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
-      .execute(&mut *writer)
-      .await
-      .unwrap();
-
-   drop(writer);
-
-   let mut rx = observable.subscribe(["users"]);
-   let mut writer = observable.acquire_writer().await.unwrap();
-
-   sqlx::query("BEGIN").execute(&mut *writer).await.unwrap();
-   sqlx::query("DELETE FROM users WHERE id = 1")
-      .execute(&mut *writer)
-      .await
-      .unwrap();
-
-   sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
-
-   let change = timeout(Duration::from_millis(100), rx.recv())
-      .await
-      .unwrap()
-      .unwrap();
-
-   assert_eq!(change.table, "users");
-   assert_eq!(change.operation, Some(ChangeOperation::Delete));
+   assert_eq!(change.operation, Some(expected_operation));
 }
 
 // ============================================================================

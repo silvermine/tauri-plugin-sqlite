@@ -1,3 +1,4 @@
+use rstest::rstest;
 use serde_json::{Value as JsonValue, json};
 use sqlx_sqlite_toolkit::DatabaseWrapper;
 use tempfile::TempDir;
@@ -218,25 +219,60 @@ async fn test_transactions() {
    db.remove().await.unwrap();
 }
 
+const TYPES_TABLE_DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, num REAL, \
+                               big INTEGER, flag BOOLEAN, data BLOB)";
+
+const LARGE_INT: i64 = 9_007_199_254_740_992; // 2^53
+
+#[rstest]
+#[case::null_decoding(
+   "INSERT INTO t (txt) VALUES ($1)",
+   vec![JsonValue::Null],
+   "txt",
+   JsonValue::Null
+)]
+#[case::large_integer_precision(
+   "INSERT INTO t (big) VALUES ($1)",
+   vec![json!(LARGE_INT)],
+   "big",
+   json!(LARGE_INT)
+)]
+#[case::boolean_stored_as_integer("INSERT INTO t (flag) VALUES (TRUE)", vec![], "flag", json!(1))]
+// BLOB ("Hello" in hex)
+#[case::blob_as_base64(
+   "INSERT INTO t (data) VALUES (X'48656C6C6F')",
+   vec![],
+   "data",
+   json!("SGVsbG8=")
+)]
 #[tokio::test]
-async fn test_type_binding_and_decoding() {
+async fn test_type_binding_and_decoding(
+   #[case] insert_sql: &str,
+   #[case] values: Vec<JsonValue>,
+   #[case] column: &str,
+   #[case] expected: JsonValue,
+) {
    let (db, _temp) = create_test_db().await;
-   db.execute(
-      "CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, num REAL, big INTEGER, flag BOOLEAN, data BLOB)".into(),
-      vec![],
-   )
-   .await
-   .unwrap();
+   db.execute(TYPES_TABLE_DDL.into(), vec![]).await.unwrap();
 
-   let large_int: i64 = 9_007_199_254_740_992; // 2^53
+   db.execute(insert_sql.into(), values).await.unwrap();
 
-   // Insert with various types including NULL
-   db.execute(
-      "INSERT INTO t (txt) VALUES ($1)".into(),
-      vec![JsonValue::Null],
-   )
-   .await
-   .unwrap();
+   let rows = db
+      .fetch_all("SELECT * FROM t ORDER BY id".into(), vec![])
+      .await
+      .unwrap();
+
+   assert_eq!(rows[0].get(column), Some(&expected));
+
+   db.remove().await.unwrap();
+}
+
+// A float is compared with a tolerance rather than by equality, so it stays out
+// of the `test_type_binding_and_decoding` table.
+#[tokio::test]
+async fn test_float_binding_and_decoding() {
+   let (db, _temp) = create_test_db().await;
+   db.execute(TYPES_TABLE_DDL.into(), vec![]).await.unwrap();
 
    db.execute(
       "INSERT INTO t (txt, num) VALUES ($1, $2)".into(),
@@ -245,43 +281,14 @@ async fn test_type_binding_and_decoding() {
    .await
    .unwrap();
 
-   db.execute(
-      "INSERT INTO t (big) VALUES ($1)".into(),
-      vec![json!(large_int)],
-   )
-   .await
-   .unwrap();
-
-   // Boolean
-   db.execute("INSERT INTO t (flag) VALUES (TRUE)".into(), vec![])
-      .await
-      .unwrap();
-
-   // BLOB ("Hello" in hex)
-   db.execute("INSERT INTO t (data) VALUES (X'48656C6C6F')".into(), vec![])
-      .await
-      .unwrap();
-
    let rows = db
       .fetch_all("SELECT * FROM t ORDER BY id".into(), vec![])
       .await
       .unwrap();
 
-   // NULL decoding
-   assert_eq!(rows[0].get("txt"), Some(&JsonValue::Null));
-
    // Float decoding (with tolerance)
-   let num = rows[1].get("num").unwrap().as_f64().unwrap();
+   let num = rows[0].get("num").unwrap().as_f64().unwrap();
    assert!((num - 1.23456).abs() < 0.0001);
-
-   // Large integer precision
-   assert_eq!(rows[2].get("big"), Some(&json!(large_int)));
-
-   // Boolean stored as integer
-   assert_eq!(rows[3].get("flag"), Some(&json!(1)));
-
-   // BLOB as base64
-   assert_eq!(rows[4].get("data").unwrap().as_str(), Some("SGVsbG8="));
 
    db.remove().await.unwrap();
 }

@@ -478,6 +478,7 @@ pub async fn acquire_writer_with_attached(
 mod tests {
    use super::*;
    use crate::SqliteDatabase;
+   use rstest::rstest;
    use sqlx::Row;
    use std::sync::Arc;
    use tempfile::TempDir;
@@ -922,39 +923,33 @@ mod tests {
       assert!(res1.is_ok() && res2.is_ok(), "Both tasks should succeed");
    }
 
+   #[rstest]
+   #[case::empty("")]
+   #[case::starts_with_digit("123invalid")]
+   #[case::contains_hyphen("schema-name")]
+   #[case::contains_space("schema name")]
+   #[case::sql_injection_semicolon("schema;DROP TABLE users")]
+   #[case::sql_injection_quote_comment("schema'--")]
+   #[case::contains_special_chars("schema/*comment*/")]
+   #[case::longer_than_max_len(&"a".repeat(MAX_SCHEMA_NAME_LEN + 1))]
    #[tokio::test]
-   async fn test_invalid_schema_names_rejected() {
+   async fn test_invalid_schema_names_rejected(#[case] invalid_name: &str) {
       let temp_dir = TempDir::new().unwrap();
       let main_db = create_test_db("main.db", &temp_dir).await;
       let other_db = create_test_db("other.db", &temp_dir).await;
 
-      // Test various invalid schema names
-      let too_long = "a".repeat(MAX_SCHEMA_NAME_LEN + 1);
-      let invalid_names = vec![
-         "",                        // Empty
-         "123invalid",              // Starts with digit
-         "schema-name",             // Contains hyphen
-         "schema name",             // Contains space
-         "schema;DROP TABLE users", // SQL injection attempt
-         "schema'--",               // SQL injection attempt
-         "schema/*comment*/",       // Contains special chars
-         &too_long,                 // Longer than MAX_SCHEMA_NAME_LEN
-      ];
+      let specs = vec![AttachedSpec {
+         database: other_db,
+         schema_name: invalid_name.to_string(),
+         mode: AttachedMode::ReadOnly,
+      }];
 
-      for invalid_name in invalid_names {
-         let specs = vec![AttachedSpec {
-            database: other_db.clone(),
-            schema_name: invalid_name.to_string(),
-            mode: AttachedMode::ReadOnly,
-         }];
-
-         let result = acquire_reader_with_attached(&main_db, specs).await;
-         assert!(
-            matches!(result, Err(Error::InvalidSchemaName(_))),
-            "Expected InvalidSchemaName error for '{}'",
-            invalid_name
-         );
-      }
+      let result = acquire_reader_with_attached(&main_db, specs).await;
+      assert!(
+         matches!(result, Err(Error::InvalidSchemaName(_))),
+         "Expected InvalidSchemaName error for '{}'",
+         invalid_name
+      );
    }
 
    /// Pins the accepting side of the length cap - the rejecting side is covered
@@ -1075,66 +1070,60 @@ mod tests {
       );
    }
 
+   /// SQLite's schema namespace is case-insensitive, so "main"/"temp" must be
+   /// rejected regardless of case, and on both the reader and writer paths.
+   #[rstest]
+   #[case::main("main")]
+   #[case::temp("temp")]
+   #[case::main_uppercase("MAIN")]
+   #[case::temp_mixed_case("Temp")]
    #[tokio::test]
-   async fn test_reserved_schema_names_rejected() {
+   async fn test_reserved_schema_names_rejected(#[case] reserved: &str) {
       let temp_dir = TempDir::new().unwrap();
       let main_db = create_test_db("main.db", &temp_dir).await;
       let other_db = create_test_db("other.db", &temp_dir).await;
 
-      // SQLite's schema namespace is case-insensitive, so "main"/"temp" must be
-      // rejected regardless of case, and on both the reader and writer paths.
-      for reserved in ["main", "temp", "MAIN", "Temp"] {
-         let specs = vec![AttachedSpec {
-            database: other_db.clone(),
-            schema_name: reserved.to_string(),
-            mode: AttachedMode::ReadOnly,
-         }];
-         let result = acquire_reader_with_attached(&main_db, specs).await;
-         assert!(
-            matches!(result, Err(Error::InvalidSchemaName(_))),
-            "reader should reject reserved alias '{}', got {:?}",
-            reserved,
-            result.err()
-         );
-
-         let specs = vec![AttachedSpec {
-            database: other_db.clone(),
-            schema_name: reserved.to_string(),
-            mode: AttachedMode::ReadOnly,
-         }];
-         let result = acquire_writer_with_attached(&main_db, specs).await;
-         assert!(
-            matches!(result, Err(Error::InvalidSchemaName(_))),
-            "writer should reject reserved alias '{}', got {:?}",
-            reserved,
-            result.err()
-         );
-      }
-
-      // Load-bearing: every rejection above happens in `validate_attached_specs`,
-      // before any lock is acquired or any `ATTACH` is issued, so nothing should be
-      // left attached and a normal alias should still attach cleanly afterward.
-      assert_only_main_attached(&main_db).await;
       let specs = vec![AttachedSpec {
          database: other_db.clone(),
-         schema_name: "other".to_string(),
+         schema_name: reserved.to_string(),
          mode: AttachedMode::ReadOnly,
       }];
+      let result = acquire_reader_with_attached(&main_db, specs).await;
       assert!(
-         acquire_writer_with_attached(&main_db, specs).await.is_ok(),
-         "a normal alias should still attach after the reserved-name rejections above"
+         matches!(result, Err(Error::InvalidSchemaName(_))),
+         "reader should reject reserved alias '{}', got {:?}",
+         reserved,
+         result.err()
+      );
+
+      let specs = vec![AttachedSpec {
+         database: other_db,
+         schema_name: reserved.to_string(),
+         mode: AttachedMode::ReadOnly,
+      }];
+      let result = acquire_writer_with_attached(&main_db, specs).await;
+      assert!(
+         matches!(result, Err(Error::InvalidSchemaName(_))),
+         "writer should reject reserved alias '{}', got {:?}",
+         reserved,
+         result.err()
       );
    }
 
+   /// Two different files sharing one alias pass the (path-keyed) duplicate-path
+   /// check but must still be rejected before any `ATTACH` runs.
+   #[rstest]
+   #[case::same_alias("x")]
+   // "x" and "X" compare unequal as plain strings but collide in SQLite's
+   // case-insensitive schema namespace - a plain `HashSet<String>` would miss this.
+   #[case::case_insensitive("X")]
    #[tokio::test]
-   async fn test_duplicate_schema_name_different_paths_rejected() {
+   async fn test_duplicate_schema_name_rejected(#[case] second_alias: &str) {
       let temp_dir = TempDir::new().unwrap();
       let main_db = create_test_db("main.db", &temp_dir).await;
       let db_b = create_test_db("b.db", &temp_dir).await;
       let db_c = create_test_db("c.db", &temp_dir).await;
 
-      // Two different files sharing one alias pass the (path-keyed) duplicate-path
-      // check but must still be rejected before any `ATTACH` runs.
       let specs = vec![
          AttachedSpec {
             database: db_b.clone(),
@@ -1143,14 +1132,16 @@ mod tests {
          },
          AttachedSpec {
             database: db_c.clone(),
-            schema_name: "x".to_string(),
+            schema_name: second_alias.to_string(),
             mode: AttachedMode::ReadOnly,
          },
       ];
       let result = acquire_writer_with_attached(&main_db, specs).await;
       assert!(
          matches!(result, Err(Error::DuplicateSchemaName(_))),
-         "two different databases sharing alias 'x' should be rejected, got {:?}",
+         "two different databases with aliases 'x' and '{}' should be rejected as \
+          duplicates, got {:?}",
+         second_alias,
          result.err()
       );
 
@@ -1164,47 +1155,8 @@ mod tests {
       }];
       assert!(
          acquire_writer_with_attached(&main_db, specs).await.is_ok(),
-         "alias 'x' should attach cleanly after the rejected duplicate-alias pair"
-      );
-   }
-
-   #[tokio::test]
-   async fn test_duplicate_schema_name_case_insensitive_rejected() {
-      let temp_dir = TempDir::new().unwrap();
-      let main_db = create_test_db("main.db", &temp_dir).await;
-      let db_x = create_test_db("x.db", &temp_dir).await;
-      let db_upper_x = create_test_db("upper_x.db", &temp_dir).await;
-
-      // "x" and "X" compare unequal as plain strings but collide in SQLite's
-      // case-insensitive schema namespace - a plain `HashSet<String>` would miss this.
-      let specs = vec![
-         AttachedSpec {
-            database: db_x.clone(),
-            schema_name: "x".to_string(),
-            mode: AttachedMode::ReadOnly,
-         },
-         AttachedSpec {
-            database: db_upper_x.clone(),
-            schema_name: "X".to_string(),
-            mode: AttachedMode::ReadOnly,
-         },
-      ];
-      let result = acquire_writer_with_attached(&main_db, specs).await;
-      assert!(
-         matches!(result, Err(Error::DuplicateSchemaName(_))),
-         "the 'x'/'X' pair should be rejected as a case-insensitive duplicate, got {:?}",
-         result.err()
-      );
-
-      assert_only_main_attached(&main_db).await;
-      let specs = vec![AttachedSpec {
-         database: db_x.clone(),
-         schema_name: "x".to_string(),
-         mode: AttachedMode::ReadOnly,
-      }];
-      assert!(
-         acquire_writer_with_attached(&main_db, specs).await.is_ok(),
-         "alias 'x' should attach cleanly after the rejected 'x'/'X' pair"
+         "alias 'x' should attach cleanly after the rejected 'x'/'{}' pair",
+         second_alias
       );
    }
 

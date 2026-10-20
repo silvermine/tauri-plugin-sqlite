@@ -166,163 +166,146 @@ impl Error {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use rstest::rstest;
 
-   #[test]
-   fn test_error_code_unsupported_datatype() {
-      let err = Error::UnsupportedDatatype("WEIRD".into());
-      assert_eq!(err.error_code(), "UNSUPPORTED_DATATYPE");
-   }
-
-   #[test]
-   fn test_error_code_multiple_rows_returned() {
-      let err = Error::MultipleRowsReturned(5);
-      assert_eq!(err.error_code(), "MULTIPLE_ROWS_RETURNED");
-      assert!(err.to_string().contains("5 rows"));
-   }
-
-   #[test]
-   fn test_error_code_transaction_rollback_failed() {
-      let err = Error::TransactionRollbackFailed {
+   #[rstest]
+   #[case::unsupported_datatype(
+      Error::UnsupportedDatatype("WEIRD".into()),
+      "UNSUPPORTED_DATATYPE",
+      &[]
+   )]
+   #[case::multiple_rows_returned(
+      Error::MultipleRowsReturned(5),
+      "MULTIPLE_ROWS_RETURNED",
+      &["5 rows"]
+   )]
+   #[case::transaction_rollback_failed(
+      Error::TransactionRollbackFailed {
          transaction_error: "constraint".into(),
          rollback_error: "busy".into(),
-      };
-      assert_eq!(err.error_code(), "TRANSACTION_ROLLBACK_FAILED");
-      assert!(err.to_string().contains("constraint"));
-      assert!(err.to_string().contains("busy"));
-   }
-
-   #[test]
-   fn test_error_code_transaction_already_finalized() {
-      assert_eq!(
-         Error::TransactionAlreadyFinalized.error_code(),
-         "TRANSACTION_ALREADY_FINALIZED"
-      );
-   }
-
-   #[test]
-   fn test_error_code_transaction_already_active() {
-      let err = Error::TransactionAlreadyActive("main.db".into());
-      assert_eq!(err.error_code(), "TRANSACTION_ALREADY_ACTIVE");
-      assert!(err.to_string().contains("main.db"));
-   }
-
-   #[test]
-   fn test_error_code_no_active_transaction() {
-      let err = Error::NoActiveTransaction("test.db".into());
-      assert_eq!(err.error_code(), "NO_ACTIVE_TRANSACTION");
-      assert!(err.to_string().contains("test.db"));
-   }
-
-   #[test]
-   fn test_error_code_invalid_transaction_token() {
-      assert_eq!(
-         Error::InvalidTransactionToken.error_code(),
-         "INVALID_TRANSACTION_TOKEN"
-      );
-   }
-
-   #[test]
-   fn test_error_code_io() {
-      let err = Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
-      assert_eq!(err.error_code(), "IO_ERROR");
-   }
-
-   #[test]
-   fn test_error_code_transaction_timed_out() {
-      let err = Error::TransactionTimedOut("test.db".into());
-      assert_eq!(err.error_code(), "TRANSACTION_TIMED_OUT");
-      assert!(err.to_string().contains("test.db"));
-   }
-
-   #[test]
-   fn test_error_code_transaction_cancelled() {
-      let err = Error::TransactionCancelled("MAIN".into());
-      assert_eq!(err.error_code(), "TRANSACTION_CANCELLED");
-      assert!(err.to_string().contains("MAIN"));
-   }
-
-   #[test]
-   fn test_error_code_transaction_cleanup_failed() {
-      let err = Error::TransactionCleanupFailed(vec![
+      },
+      "TRANSACTION_ROLLBACK_FAILED",
+      &["constraint", "busy"]
+   )]
+   #[case::transaction_already_finalized(
+      Error::TransactionAlreadyFinalized,
+      "TRANSACTION_ALREADY_FINALIZED",
+      &[]
+   )]
+   #[case::transaction_already_active(
+      Error::TransactionAlreadyActive("main.db".into()),
+      "TRANSACTION_ALREADY_ACTIVE",
+      &["main.db"]
+   )]
+   #[case::no_active_transaction(
+      Error::NoActiveTransaction("test.db".into()),
+      "NO_ACTIVE_TRANSACTION",
+      &["test.db"]
+   )]
+   #[case::invalid_transaction_token(
+      Error::InvalidTransactionToken,
+      "INVALID_TRANSACTION_TOKEN",
+      &[]
+   )]
+   #[case::io(
+      Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
+      "IO_ERROR",
+      &[]
+   )]
+   #[case::transaction_timed_out(
+      Error::TransactionTimedOut("test.db".into()),
+      "TRANSACTION_TIMED_OUT",
+      &["test.db"]
+   )]
+   #[case::transaction_cancelled(
+      Error::TransactionCancelled("MAIN".into()),
+      "TRANSACTION_CANCELLED",
+      &["MAIN"]
+   )]
+   #[case::transaction_cleanup_failed(
+      Error::TransactionCleanupFailed(vec![
          Error::Other("first failure".into()),
          Error::Other("second failure".into()),
-      ]);
-      assert_eq!(err.error_code(), "TRANSACTION_CLEANUP_FAILED");
-      assert!(err.to_string().contains("2 error(s)"));
-      assert!(err.to_string().contains("first failure"));
-      assert!(err.to_string().contains("second failure"));
-      assert_eq!(err.cleanup_errors().unwrap().len(), 2);
+      ]),
+      "TRANSACTION_CLEANUP_FAILED",
+      &["2 error(s)", "first failure", "second failure"]
+   )]
+   #[case::other(Error::Other("something went wrong".into()), "ERROR", &[])]
+   // RowNotFound is not a database error, so no SQLite code
+   #[case::sqlx_non_database(Error::Sqlx(sqlx::Error::RowNotFound), "SQLX_ERROR", &[])]
+   #[case::empty_keyset_columns(
+      Error::EmptyKeysetColumns,
+      "EMPTY_KEYSET_COLUMNS",
+      &["at least one column"]
+   )]
+   #[case::invalid_page_size(Error::InvalidPageSize, "INVALID_PAGE_SIZE", &["greater than zero"])]
+   #[case::cursor_length_mismatch(
+      Error::CursorLengthMismatch {
+         cursor_len: 2,
+         keyset_len: 3,
+      },
+      "CURSOR_LENGTH_MISMATCH",
+      &["2", "3"]
+   )]
+   #[case::invalid_pagination_query(
+      Error::InvalidPaginationQuery,
+      "INVALID_PAGINATION_QUERY",
+      &["top-level ORDER BY or LIMIT"]
+   )]
+   #[case::cursor_column_not_found(
+      Error::CursorColumnNotFound {
+         column: "score".into(),
+      },
+      "CURSOR_COLUMN_NOT_FOUND",
+      &["score"]
+   )]
+   #[case::invalid_column_name(
+      Error::InvalidColumnName {
+         name: "bad;name".into(),
+      },
+      "INVALID_COLUMN_NAME",
+      &["bad;name"]
+   )]
+   #[case::conflicting_cursors(
+      Error::ConflictingCursors,
+      "CONFLICTING_CURSORS",
+      &["after", "before"]
+   )]
+   fn test_error_code_and_message(
+      #[case] err: Error,
+      #[case] expected_code: &str,
+      #[case] message_parts: &[&str],
+   ) {
+      assert_eq!(err.error_code(), expected_code);
+
+      let message = err.to_string();
+      for part in message_parts {
+         assert!(
+            message.contains(part),
+            "{message:?} should contain {part:?}"
+         );
+      }
    }
 
    #[test]
-   fn test_error_code_other() {
+   fn test_other_displays_message_verbatim() {
       let err = Error::Other("something went wrong".into());
-      assert_eq!(err.error_code(), "ERROR");
       assert_eq!(err.to_string(), "something went wrong");
    }
 
    #[test]
-   fn test_error_code_sqlx_non_database() {
-      // RowNotFound is not a database error, so no SQLite code
-      let err = Error::Sqlx(sqlx::Error::RowNotFound);
-      assert_eq!(err.error_code(), "SQLX_ERROR");
-   }
+   fn test_cleanup_errors_returns_each_error() {
+      let err = Error::TransactionCleanupFailed(vec![
+         Error::Other("first failure".into()),
+         Error::Other("second failure".into()),
+      ]);
 
-   #[test]
-   fn test_error_code_empty_keyset_columns() {
-      let err = Error::EmptyKeysetColumns;
-      assert_eq!(err.error_code(), "EMPTY_KEYSET_COLUMNS");
-      assert!(err.to_string().contains("at least one column"));
-   }
-
-   #[test]
-   fn test_error_code_invalid_page_size() {
-      let err = Error::InvalidPageSize;
-      assert_eq!(err.error_code(), "INVALID_PAGE_SIZE");
-      assert!(err.to_string().contains("greater than zero"));
-   }
-
-   #[test]
-   fn test_error_code_cursor_length_mismatch() {
-      let err = Error::CursorLengthMismatch {
-         cursor_len: 2,
-         keyset_len: 3,
-      };
-      assert_eq!(err.error_code(), "CURSOR_LENGTH_MISMATCH");
-      assert!(err.to_string().contains("2"));
-      assert!(err.to_string().contains("3"));
-   }
-
-   #[test]
-   fn test_error_code_invalid_pagination_query() {
-      let err = Error::InvalidPaginationQuery;
-      assert_eq!(err.error_code(), "INVALID_PAGINATION_QUERY");
-      assert!(err.to_string().contains("top-level ORDER BY or LIMIT"));
-   }
-
-   #[test]
-   fn test_error_code_cursor_column_not_found() {
-      let err = Error::CursorColumnNotFound {
-         column: "score".into(),
-      };
-      assert_eq!(err.error_code(), "CURSOR_COLUMN_NOT_FOUND");
-      assert!(err.to_string().contains("score"));
-   }
-
-   #[test]
-   fn test_error_code_invalid_column_name() {
-      let err = Error::InvalidColumnName {
-         name: "bad;name".into(),
-      };
-      assert_eq!(err.error_code(), "INVALID_COLUMN_NAME");
-      assert!(err.to_string().contains("bad;name"));
-   }
-
-   #[test]
-   fn test_error_code_conflicting_cursors() {
-      let err = Error::ConflictingCursors;
-      assert_eq!(err.error_code(), "CONFLICTING_CURSORS");
-      assert!(err.to_string().contains("after"));
-      assert!(err.to_string().contains("before"));
+      let messages: Vec<String> = err
+         .cleanup_errors()
+         .unwrap()
+         .iter()
+         .map(ToString::to_string)
+         .collect();
+      assert_eq!(messages, ["first failure", "second failure"]);
    }
 }

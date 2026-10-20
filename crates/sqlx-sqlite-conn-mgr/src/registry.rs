@@ -150,20 +150,14 @@ pub async fn uncache_database(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use rstest::rstest;
 
-   #[test]
-   fn test_canonicalize_path() {
-      let temp_dir = std::env::temp_dir();
-      let test_path = temp_dir.join("test.db");
-
-      // Test that path is canonicalized to absolute path
-      let canonical = canonicalize_database_path(&test_path).unwrap();
+   #[rstest]
+   #[case::absolute_path(std::env::temp_dir().join("test.db"))]
+   #[case::relative_path(PathBuf::from("./test_relative.db"))]
+   fn test_canonicalize_path_returns_absolute_path(#[case] path: PathBuf) {
+      let canonical = canonicalize_database_path(&path).unwrap();
       assert!(canonical.is_absolute());
-
-      // Test relative path
-      let relative_path = Path::new("./test_relative.db");
-      let canonical_relative = canonicalize_database_path(relative_path).unwrap();
-      assert!(canonical_relative.is_absolute());
    }
 
    #[test]
@@ -176,12 +170,11 @@ mod tests {
       assert!(result.is_err());
    }
 
-   #[test]
-   fn test_mode_memory_query_param() {
-      assert!(is_memory_database(Path::new("file:test?mode=memory")));
-      assert!(is_memory_database(Path::new(
-         "file:/data/db?cache=shared&mode=memory"
-      )));
+   #[rstest]
+   #[case::only_param("file:test?mode=memory")]
+   #[case::after_another_param("file:/data/db?cache=shared&mode=memory")]
+   fn test_mode_memory_query_param(#[case] path: &str) {
+      assert!(is_memory_database(Path::new(path)));
    }
 
    #[test]

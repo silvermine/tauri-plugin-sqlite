@@ -26,3 +26,5 @@ libsqlite3-sys = "0.35.0"
 
 [dev-dependencies]
 tempfile = "3.24.0"
+# Parameterized tests. Default features stay off: see the root Cargo.toml.
+rstest = { version = "0.28.0", default-features = false }

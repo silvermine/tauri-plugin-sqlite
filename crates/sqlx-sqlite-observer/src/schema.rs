@@ -124,37 +124,30 @@ async fn query_pk_columns(
 #[cfg(test)]
 mod tests {
    use super::*;
+   use rstest::rstest;
 
-   #[test]
-   fn test_has_without_rowid_clause() {
-      // Positive cases
-      assert!(has_without_rowid_clause(
-         "CREATE TABLE t (id TEXT PRIMARY KEY) WITHOUT ROWID"
-      ));
-      assert!(has_without_rowid_clause(
-         "CREATE TABLE t (id TEXT PRIMARY KEY) WITHOUT ROWID "
-      ));
-      assert!(has_without_rowid_clause(
-         "CREATE TABLE t (id TEXT PRIMARY KEY)  WITHOUT  ROWID"
-      ));
-      assert!(has_without_rowid_clause(
-         "CREATE TABLE t (id TEXT PRIMARY KEY) without rowid"
-      ));
-      assert!(has_without_rowid_clause(
-         "CREATE TABLE t (id TEXT PRIMARY KEY)\nWITHOUT ROWID"
-      ));
+   #[rstest]
+   #[case::trailing_clause("CREATE TABLE t (id TEXT PRIMARY KEY) WITHOUT ROWID")]
+   #[case::trailing_space("CREATE TABLE t (id TEXT PRIMARY KEY) WITHOUT ROWID ")]
+   #[case::extra_whitespace("CREATE TABLE t (id TEXT PRIMARY KEY)  WITHOUT  ROWID")]
+   #[case::lowercase("CREATE TABLE t (id TEXT PRIMARY KEY) without rowid")]
+   #[case::newline_before_clause("CREATE TABLE t (id TEXT PRIMARY KEY)\nWITHOUT ROWID")]
+   fn test_has_without_rowid_clause_detects(#[case] sql: &str) {
+      assert!(
+         has_without_rowid_clause(sql),
+         "{sql:?} should be detected as WITHOUT ROWID"
+      );
+   }
 
-      // Negative cases - normal tables
-      assert!(!has_without_rowid_clause(
-         "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-      ));
-
-      // Negative cases - false positive prevention
-      assert!(!has_without_rowid_clause(
-         "CREATE TABLE t (note TEXT DEFAULT 'see WITHOUT ROWID docs')"
-      ));
-      assert!(!has_without_rowid_clause(
-         "CREATE TABLE t (id INT, note TEXT) -- WITHOUT ROWID comment"
-      ));
+   #[rstest]
+   #[case::normal_table("CREATE TABLE t (id INTEGER PRIMARY KEY)")]
+   // False positive prevention
+   #[case::in_string_literal("CREATE TABLE t (note TEXT DEFAULT 'see WITHOUT ROWID docs')")]
+   #[case::in_sql_comment("CREATE TABLE t (id INT, note TEXT) -- WITHOUT ROWID comment")]
+   fn test_has_without_rowid_clause_ignores(#[case] sql: &str) {
+      assert!(
+         !has_without_rowid_clause(sql),
+         "{sql:?} should not be detected as WITHOUT ROWID"
+      );
    }
 }

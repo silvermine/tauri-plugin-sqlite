@@ -122,19 +122,16 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use rstest::rstest;
 
-   #[test]
-   fn test_base64_encode() {
-      assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
-      assert_eq!(base64_encode(&[1, 2, 3, 4, 5]), "AQIDBAU=");
-      assert_eq!(base64_encode(&[]), "");
-   }
-
-   #[test]
-   fn test_base64_encode_binary() {
-      // Test with binary data including null bytes
-      assert_eq!(base64_encode(&[0, 0, 0]), "AAAA");
-      assert_eq!(base64_encode(&[255, 255, 255]), "////");
+   #[rstest]
+   #[case::text(b"hello", "aGVsbG8=")]
+   #[case::small_bytes(&[1, 2, 3, 4, 5], "AQIDBAU=")]
+   #[case::empty(&[], "")]
+   #[case::binary_null_bytes(&[0, 0, 0], "AAAA")]
+   #[case::binary_high_bytes(&[255, 255, 255], "////")]
+   fn test_base64_encode(#[case] data: &[u8], #[case] expected: &str) {
+      assert_eq!(base64_encode(data), expected);
    }
 
    #[test]

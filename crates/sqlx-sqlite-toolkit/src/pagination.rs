@@ -472,284 +472,195 @@ pub(crate) fn build_paginated_query(
 #[cfg(test)]
 mod tests {
    use super::*;
+   use rstest::rstest;
    use serde_json::json;
 
    // ─── validate_base_query ───
 
-   #[test]
-   fn validate_rejects_top_level_order_by() {
-      let result = validate_base_query("SELECT * FROM posts ORDER BY id");
-      assert!(result.is_err());
+   #[rstest]
+   #[case::top_level_order_by("SELECT * FROM posts ORDER BY id")]
+   #[case::top_level_limit("SELECT * FROM posts LIMIT 10")]
+   #[case::order_by_after_subquery("SELECT * FROM (SELECT * FROM posts LIMIT 5) ORDER BY id")]
+   #[case::order_by_with_double_space("SELECT * FROM posts ORDER  BY id")]
+   #[case::order_by_with_tab("SELECT * FROM posts ORDER\tBY id")]
+   #[case::order_by_with_newline("SELECT * FROM posts ORDER\nBY id")]
+   #[case::order_by_after_block_comment("SELECT * FROM posts /* comment */ ORDER BY id")]
+   #[case::limit_after_line_comment("SELECT * FROM posts -- comment\nLIMIT 10")]
+   fn validate_base_query_rejects(#[case] query: &str) {
+      let result = validate_base_query(query);
+      assert!(
+         matches!(result, Err(Error::InvalidPaginationQuery)),
+         "{query:?} should be rejected, got {result:?}"
+      );
    }
 
-   #[test]
-   fn validate_rejects_top_level_limit() {
-      let result = validate_base_query("SELECT * FROM posts LIMIT 10");
-      assert!(result.is_err());
-   }
-
-   #[test]
-   fn validate_accepts_clean_query() {
-      let result = validate_base_query("SELECT * FROM posts WHERE category = ?");
-      assert!(result.is_ok());
-   }
-
-   #[test]
-   fn validate_allows_order_by_inside_subquery() {
-      let result = validate_base_query("SELECT * FROM (SELECT * FROM posts ORDER BY id LIMIT 5)");
-      assert!(result.is_ok());
-   }
-
-   #[test]
-   fn validate_allows_limit_inside_subquery() {
-      let result = validate_base_query("SELECT * FROM (SELECT * FROM posts LIMIT 5)");
-      assert!(result.is_ok());
-   }
-
-   #[test]
-   fn validate_rejects_order_by_after_subquery() {
-      let result = validate_base_query("SELECT * FROM (SELECT * FROM posts LIMIT 5) ORDER BY id");
-      assert!(result.is_err());
+   #[rstest]
+   #[case::clean_query("SELECT * FROM posts WHERE category = ?")]
+   #[case::order_by_inside_subquery("SELECT * FROM (SELECT * FROM posts ORDER BY id LIMIT 5)")]
+   #[case::limit_inside_subquery("SELECT * FROM (SELECT * FROM posts LIMIT 5)")]
+   #[case::order_by_in_line_comment("SELECT * FROM posts -- ORDER BY id")]
+   #[case::limit_in_block_comment("SELECT * FROM posts /* LIMIT 10 */")]
+   #[case::order_by_in_string_literal("SELECT * FROM posts WHERE name = 'ORDER BY clause'")]
+   // SQLite escapes single quotes by doubling: 'order''s ORDER BY clause'
+   #[case::keywords_in_escaped_single_quotes(
+      "SELECT * FROM t WHERE name = 'order''s ORDER BY clause'"
+   )]
+   #[case::keywords_in_double_quoted_identifier(r#"SELECT "ORDER BY" FROM posts"#)]
+   fn validate_base_query_accepts(#[case] query: &str) {
+      let result = validate_base_query(query);
+      assert!(
+         result.is_ok(),
+         "{query:?} should be accepted, got {result:?}"
+      );
    }
 
    // ─── has_top_level_where ───
 
-   #[test]
-   fn detects_top_level_where() {
-      assert!(has_top_level_where("SELECT * FROM posts WHERE id > 5"));
+   #[rstest]
+   #[case::top_level_where("SELECT * FROM posts WHERE id > 5")]
+   // The real WHERE is found; the WHERE inside the escaped-quote string is ignored
+   #[case::where_beside_escaped_quote_string("SELECT * FROM t WHERE name = 'it''s WHERE we go'")]
+   fn has_top_level_where_detects(#[case] query: &str) {
+      assert!(
+         has_top_level_where(query),
+         "{query:?} should have a top-level WHERE"
+      );
    }
 
-   #[test]
-   fn no_where_clause() {
-      assert!(!has_top_level_where("SELECT * FROM posts"));
-   }
-
-   #[test]
-   fn where_inside_subquery_only() {
-      assert!(!has_top_level_where(
-         "SELECT * FROM (SELECT * FROM posts WHERE id > 5)"
-      ));
-   }
-
-   // ─── scanner: comments and quoted strings ───
-
-   #[test]
-   fn validate_ignores_order_by_in_line_comment() {
-      let result = validate_base_query("SELECT * FROM posts -- ORDER BY id");
-      assert!(result.is_ok());
-   }
-
-   #[test]
-   fn validate_ignores_limit_in_block_comment() {
-      let result = validate_base_query("SELECT * FROM posts /* LIMIT 10 */");
-      assert!(result.is_ok());
-   }
-
-   #[test]
-   fn validate_ignores_order_by_in_string_literal() {
-      let result = validate_base_query("SELECT * FROM posts WHERE name = 'ORDER BY clause'");
-      assert!(result.is_ok());
-   }
-
-   #[test]
-   fn validate_ignores_keywords_in_escaped_single_quotes() {
-      // SQLite escapes single quotes by doubling: 'order''s ORDER BY clause'
-      let result = validate_base_query("SELECT * FROM t WHERE name = 'order''s ORDER BY clause'");
-      assert!(result.is_ok());
-   }
-
-   #[test]
-   fn validate_ignores_keywords_in_double_quoted_identifier() {
-      let result = validate_base_query(r#"SELECT "ORDER BY" FROM posts"#);
-      assert!(result.is_ok());
-   }
-
-   #[test]
-   fn validate_detects_order_by_after_block_comment() {
-      let result = validate_base_query("SELECT * FROM posts /* comment */ ORDER BY id");
-      assert!(result.is_err());
-   }
-
-   #[test]
-   fn validate_rejects_order_by_with_extra_whitespace() {
-      // Double space
-      assert!(validate_base_query("SELECT * FROM posts ORDER  BY id").is_err());
-      // Tab
-      assert!(validate_base_query("SELECT * FROM posts ORDER\tBY id").is_err());
-      // Newline
-      assert!(validate_base_query("SELECT * FROM posts ORDER\nBY id").is_err());
-   }
-
-   #[test]
-   fn validate_detects_limit_after_line_comment() {
-      let result = validate_base_query("SELECT * FROM posts -- comment\nLIMIT 10");
-      assert!(result.is_err());
-   }
-
-   #[test]
-   fn where_ignores_where_in_line_comment() {
-      assert!(!has_top_level_where("SELECT * FROM posts -- WHERE id > 5"));
-   }
-
-   #[test]
-   fn where_ignores_where_in_string_with_escaped_quotes() {
-      // The real WHERE is found; the WHERE inside the escaped-quote string is ignored
-      assert!(has_top_level_where(
-         "SELECT * FROM t WHERE name = 'it''s WHERE we go'"
-      ));
-      // No real WHERE — the word WHERE is entirely inside a string with escaped quotes
-      assert!(!has_top_level_where("SELECT 'it''s WHERE we go' FROM t"));
+   #[rstest]
+   #[case::no_where_clause("SELECT * FROM posts")]
+   #[case::where_inside_subquery_only("SELECT * FROM (SELECT * FROM posts WHERE id > 5)")]
+   #[case::where_in_line_comment("SELECT * FROM posts -- WHERE id > 5")]
+   // No real WHERE — the word WHERE is entirely inside a string with escaped quotes
+   #[case::where_only_in_escaped_quote_string("SELECT 'it''s WHERE we go' FROM t")]
+   fn has_top_level_where_ignores(#[case] query: &str) {
+      assert!(
+         !has_top_level_where(query),
+         "{query:?} should not have a top-level WHERE"
+      );
    }
 
    // ─── validate_column_name ───
 
-   #[test]
-   fn column_name_valid_simple() {
-      assert!(validate_column_name("id").is_ok());
-      assert!(validate_column_name("category").is_ok());
-      assert!(validate_column_name("_private").is_ok());
-      assert!(validate_column_name("col_123").is_ok());
+   #[rstest]
+   #[case::simple_id("id")]
+   #[case::simple_word("category")]
+   #[case::leading_underscore("_private")]
+   #[case::underscore_and_digits("col_123")]
+   #[case::qualified_table_column("posts.id")]
+   #[case::qualified_schema_table_column("schema.table.column")]
+   fn validate_column_name_accepts(#[case] name: &str) {
+      let result = validate_column_name(name);
+      assert!(
+         result.is_ok(),
+         "{name:?} should be accepted, got {result:?}"
+      );
    }
 
-   #[test]
-   fn column_name_valid_qualified() {
-      assert!(validate_column_name("posts.id").is_ok());
-      assert!(validate_column_name("schema.table.column").is_ok());
-   }
-
-   #[test]
-   fn column_name_rejects_empty() {
-      assert!(validate_column_name("").is_err());
-   }
-
-   #[test]
-   fn column_name_rejects_injection() {
-      assert!(validate_column_name("id; DROP TABLE posts --").is_err());
-      assert!(validate_column_name("id)--").is_err());
-      assert!(validate_column_name("1bad").is_err());
-      assert!(validate_column_name("col name").is_err());
-   }
-
-   #[test]
-   fn column_name_rejects_invalid_dot_structure() {
-      assert!(validate_column_name("table.").is_err()); // trailing dot
-      assert!(validate_column_name("table..column").is_err()); // consecutive dots
-      assert!(validate_column_name(".column").is_err()); // leading dot
+   #[rstest]
+   #[case::empty("")]
+   #[case::semicolon_injection("id; DROP TABLE posts --")]
+   #[case::paren_comment_injection("id)--")]
+   #[case::leading_digit("1bad")]
+   #[case::contains_space("col name")]
+   #[case::trailing_dot("table.")]
+   #[case::consecutive_dots("table..column")]
+   #[case::leading_dot(".column")]
+   fn validate_column_name_rejects(#[case] name: &str) {
+      let result = validate_column_name(name);
+      assert!(
+         matches!(&result, Err(Error::InvalidColumnName { name: rejected }) if rejected == name),
+         "{name:?} should be rejected as InvalidColumnName naming it, got {result:?}"
+      );
    }
 
    // ─── build_cursor_condition ───
 
-   #[test]
-   fn cursor_condition_uniform_asc() {
-      let keyset = vec![KeysetColumn::asc("a"), KeysetColumn::asc("b")];
-      let cursor = vec![json!(1), json!(2)];
-
-      let (sql, values) = build_cursor_condition(&keyset, &cursor, 0);
-
-      assert_eq!(sql, r#"("a", "b") > ($1, $2)"#);
-      assert_eq!(values, vec![json!(1), json!(2)]);
-   }
-
-   #[test]
-   fn cursor_condition_uniform_asc_with_offset() {
-      let keyset = vec![KeysetColumn::asc("a"), KeysetColumn::asc("b")];
-      let cursor = vec![json!(1), json!(2)];
-
-      // Simulate 2 user parameters ($1, $2) preceding the cursor
-      let (sql, values) = build_cursor_condition(&keyset, &cursor, 2);
-
-      assert_eq!(sql, r#"("a", "b") > ($3, $4)"#);
-      assert_eq!(values, vec![json!(1), json!(2)]);
-   }
-
-   #[test]
-   fn cursor_condition_uniform_desc() {
-      let keyset = vec![KeysetColumn::desc("a"), KeysetColumn::desc("b")];
-      let cursor = vec![json!(10), json!(20)];
-
-      let (sql, values) = build_cursor_condition(&keyset, &cursor, 0);
-
-      assert_eq!(sql, r#"("a", "b") < ($1, $2)"#);
-      assert_eq!(values, vec![json!(10), json!(20)]);
-   }
-
-   #[test]
-   fn cursor_condition_mixed_directions() {
-      let keyset = vec![
+   #[rstest]
+   #[case::uniform_asc(
+      vec![KeysetColumn::asc("a"), KeysetColumn::asc("b")],
+      vec![json!(1), json!(2)],
+      0,
+      r#"("a", "b") > ($1, $2)"#,
+      vec![json!(1), json!(2)]
+   )]
+   // Simulate 2 user parameters ($1, $2) preceding the cursor
+   #[case::uniform_asc_with_offset(
+      vec![KeysetColumn::asc("a"), KeysetColumn::asc("b")],
+      vec![json!(1), json!(2)],
+      2,
+      r#"("a", "b") > ($3, $4)"#,
+      vec![json!(1), json!(2)]
+   )]
+   #[case::uniform_desc(
+      vec![KeysetColumn::desc("a"), KeysetColumn::desc("b")],
+      vec![json!(10), json!(20)],
+      0,
+      r#"("a", "b") < ($1, $2)"#,
+      vec![json!(10), json!(20)]
+   )]
+   #[case::mixed_directions(
+      vec![
          KeysetColumn::asc("a"),
          KeysetColumn::desc("b"),
          KeysetColumn::asc("c"),
-      ];
-      let cursor = vec![json!("va"), json!("vb"), json!("vc")];
-
-      let (sql, values) = build_cursor_condition(&keyset, &cursor, 0);
-
-      assert_eq!(
-         sql,
-         r#"("a" > $1) OR ("a" = $2 AND "b" < $3) OR ("a" = $4 AND "b" = $5 AND "c" > $6)"#
-      );
-      assert_eq!(
-         values,
-         vec![
-            json!("va"),
-            json!("va"),
-            json!("vb"),
-            json!("va"),
-            json!("vb"),
-            json!("vc"),
-         ]
-      );
-   }
-
-   #[test]
-   fn cursor_condition_mixed_directions_with_offset() {
-      let keyset = vec![
+      ],
+      vec![json!("va"), json!("vb"), json!("vc")],
+      0,
+      r#"("a" > $1) OR ("a" = $2 AND "b" < $3) OR ("a" = $4 AND "b" = $5 AND "c" > $6)"#,
+      vec![
+         json!("va"),
+         json!("va"),
+         json!("vb"),
+         json!("va"),
+         json!("vb"),
+         json!("vc"),
+      ]
+   )]
+   // Simulate 1 user parameter ($1) preceding the cursor
+   #[case::mixed_directions_with_offset(
+      vec![
          KeysetColumn::asc("a"),
          KeysetColumn::desc("b"),
          KeysetColumn::asc("c"),
-      ];
-      let cursor = vec![json!("va"), json!("vb"), json!("vc")];
+      ],
+      vec![json!("va"), json!("vb"), json!("vc")],
+      1,
+      r#"("a" > $2) OR ("a" = $3 AND "b" < $4) OR ("a" = $5 AND "b" = $6 AND "c" > $7)"#,
+      vec![
+         json!("va"),
+         json!("va"),
+         json!("vb"),
+         json!("va"),
+         json!("vb"),
+         json!("vc"),
+      ]
+   )]
+   #[case::single_column_asc(
+      vec![KeysetColumn::asc("id")],
+      vec![json!(42)],
+      0,
+      r#"("id") > ($1)"#,
+      vec![json!(42)]
+   )]
+   #[case::single_column_desc(
+      vec![KeysetColumn::desc("id")],
+      vec![json!(42)],
+      0,
+      r#"("id") < ($1)"#,
+      vec![json!(42)]
+   )]
+   fn cursor_condition_builds_sql_and_values(
+      #[case] keyset: Vec<KeysetColumn>,
+      #[case] cursor: Vec<JsonValue>,
+      #[case] param_offset: usize,
+      #[case] expected_sql: &str,
+      #[case] expected_values: Vec<JsonValue>,
+   ) {
+      let (sql, values) = build_cursor_condition(&keyset, &cursor, param_offset);
 
-      // Simulate 1 user parameter ($1) preceding the cursor
-      let (sql, values) = build_cursor_condition(&keyset, &cursor, 1);
-
-      assert_eq!(
-         sql,
-         r#"("a" > $2) OR ("a" = $3 AND "b" < $4) OR ("a" = $5 AND "b" = $6 AND "c" > $7)"#
-      );
-      assert_eq!(
-         values,
-         vec![
-            json!("va"),
-            json!("va"),
-            json!("vb"),
-            json!("va"),
-            json!("vb"),
-            json!("vc"),
-         ]
-      );
-   }
-
-   #[test]
-   fn cursor_condition_single_column_asc() {
-      let keyset = vec![KeysetColumn::asc("id")];
-      let cursor = vec![json!(42)];
-
-      let (sql, values) = build_cursor_condition(&keyset, &cursor, 0);
-
-      assert_eq!(sql, r#"("id") > ($1)"#);
-      assert_eq!(values, vec![json!(42)]);
-   }
-
-   #[test]
-   fn cursor_condition_single_column_desc() {
-      let keyset = vec![KeysetColumn::desc("id")];
-      let cursor = vec![json!(42)];
-
-      let (sql, values) = build_cursor_condition(&keyset, &cursor, 0);
-
-      assert_eq!(sql, r#"("id") < ($1)"#);
-      assert_eq!(values, vec![json!(42)]);
+      assert_eq!(sql, expected_sql);
+      assert_eq!(values, expected_values);
    }
 
    // ─── build_order_by ───
@@ -823,10 +734,11 @@ mod tests {
    fn paginated_query_strips_trailing_semicolon() {
       let keyset = vec![KeysetColumn::asc("id")];
 
-      let (sql, _) =
+      let (sql, values) =
          build_paginated_query("SELECT * FROM posts;", &keyset, None, 10, false, 0).unwrap();
 
       assert_eq!(sql, r#"SELECT * FROM posts ORDER BY "id" ASC LIMIT 11"#);
+      assert!(values.is_empty());
    }
 
    #[test]
@@ -876,10 +788,11 @@ mod tests {
 
    // ─── SortDirection::reversed ───
 
-   #[test]
-   fn sort_direction_reversed() {
-      assert_eq!(SortDirection::Asc.reversed(), SortDirection::Desc);
-      assert_eq!(SortDirection::Desc.reversed(), SortDirection::Asc);
+   #[rstest]
+   #[case::asc(SortDirection::Asc, SortDirection::Desc)]
+   #[case::desc(SortDirection::Desc, SortDirection::Asc)]
+   fn sort_direction_reversed(#[case] direction: SortDirection, #[case] expected: SortDirection) {
+      assert_eq!(direction.reversed(), expected);
    }
 
    // ─── build_paginated_query backward ───
@@ -994,43 +907,34 @@ mod tests {
 
    // ─── quote_identifier ───
 
-   #[test]
-   fn quote_identifier_simple() {
-      assert_eq!(quote_identifier("id"), r#""id""#);
-   }
-
-   #[test]
-   fn quote_identifier_with_dot() {
-      assert_eq!(quote_identifier("t.id"), r#""t"."id""#);
-   }
-
-   #[test]
-   fn quote_identifier_schema_table_column() {
-      assert_eq!(
-         quote_identifier("schema.table.col"),
-         r#""schema"."table"."col""#
-      );
+   #[rstest]
+   #[case::simple("id", r#""id""#)]
+   #[case::with_dot("t.id", r#""t"."id""#)]
+   #[case::schema_table_column("schema.table.col", r#""schema"."table"."col""#)]
+   fn quote_identifier_quotes_each_part(#[case] name: &str, #[case] expected: &str) {
+      assert_eq!(quote_identifier(name), expected);
    }
 
    // ─── SortDirection serde ───
 
-   #[test]
-   fn sort_direction_serializes_to_camel_case() {
-      assert_eq!(
-         serde_json::to_string(&SortDirection::Asc).unwrap(),
-         "\"asc\""
-      );
-      assert_eq!(
-         serde_json::to_string(&SortDirection::Desc).unwrap(),
-         "\"desc\""
-      );
+   #[rstest]
+   #[case::asc(SortDirection::Asc, "\"asc\"")]
+   #[case::desc(SortDirection::Desc, "\"desc\"")]
+   fn sort_direction_serializes_to_camel_case(
+      #[case] direction: SortDirection,
+      #[case] expected: &str,
+   ) {
+      assert_eq!(serde_json::to_string(&direction).unwrap(), expected);
    }
 
-   #[test]
-   fn sort_direction_deserializes_from_camel_case() {
-      let asc: SortDirection = serde_json::from_str("\"asc\"").unwrap();
-      let desc: SortDirection = serde_json::from_str("\"desc\"").unwrap();
-      assert_eq!(asc, SortDirection::Asc);
-      assert_eq!(desc, SortDirection::Desc);
+   #[rstest]
+   #[case::asc("\"asc\"", SortDirection::Asc)]
+   #[case::desc("\"desc\"", SortDirection::Desc)]
+   fn sort_direction_deserializes_from_camel_case(
+      #[case] json: &str,
+      #[case] expected: SortDirection,
+   ) {
+      let direction: SortDirection = serde_json::from_str(json).unwrap();
+      assert_eq!(direction, expected);
    }
 }

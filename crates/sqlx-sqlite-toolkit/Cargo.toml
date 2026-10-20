@@ -33,3 +33,5 @@ tracing = { version = "0.1", default-features = false, features = ["std", "relea
 [dev-dependencies]
 tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+# Parameterized tests. Default features stay off: see the root Cargo.toml.
+rstest = { version = "0.28.0", default-features = false }

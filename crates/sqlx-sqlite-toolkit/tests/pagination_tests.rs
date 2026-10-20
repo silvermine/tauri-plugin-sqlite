@@ -1,4 +1,5 @@
-use serde_json::json;
+use rstest::rstest;
+use serde_json::{Value as JsonValue, json};
 use sqlx_sqlite_toolkit::{DatabaseWrapper, Error, KeysetColumn, KeysetPage};
 use tempfile::TempDir;
 
@@ -64,27 +65,37 @@ fn row_ids(page: &KeysetPage) -> Vec<i64> {
 
 // ─── Core Forward Pagination ───
 
+#[rstest]
+// ── Page 1 (no cursor) ──
+// Generated SQL:
+//    SELECT id, title FROM posts ORDER BY id ASC LIMIT 4
+//
+// The builder appends ORDER BY from the keyset and LIMIT = page_size + 1.
+// The extra row is a "sentinel" — if it comes back, there are more pages.
+#[case::asc_single_column(vec![KeysetColumn::asc("id")], &[1, 2, 3], vec![json!(3)])]
+// ── Page 1 (descending, no cursor) ──
+// Generated SQL:
+//    SELECT id, title FROM posts ORDER BY id DESC LIMIT 4
+//
+// Descending keyset means the highest IDs come first.
+#[case::desc_single_column(vec![KeysetColumn::desc("id")], &[7, 6, 5], vec![json!(5)])]
 #[tokio::test]
-async fn first_page_no_cursor() {
+async fn first_page_no_cursor(
+   #[case] keyset: Vec<KeysetColumn>,
+   #[case] expected_ids: &[i64],
+   #[case] next_cursor: Vec<JsonValue>,
+) {
    let (db, _temp) = create_test_db().await;
    seed_posts_table(&db).await;
 
-   let keyset = vec![KeysetColumn::asc("id")];
-
-   // ── Page 1 (no cursor) ──
-   // Generated SQL:
-   //    SELECT id, title FROM posts ORDER BY id ASC LIMIT 4
-   //
-   // The builder appends ORDER BY from the keyset and LIMIT = page_size + 1.
-   // The extra row is a "sentinel" — if it comes back, there are more pages.
    let page = db
       .fetch_page("SELECT id, title FROM posts".into(), vec![], keyset, 3)
       .await
       .unwrap();
 
-   assert_eq!(row_ids(&page), vec![1, 2, 3]);
+   assert_eq!(row_ids(&page), expected_ids);
    assert!(page.has_more);
-   assert_eq!(page.next_cursor, Some(vec![json!(3)]));
+   assert_eq!(page.next_cursor, Some(next_cursor));
 
    db.remove().await.unwrap();
 }
@@ -148,30 +159,6 @@ async fn forward_pagination_all_pages() {
    assert_eq!(row_ids(&page3), vec![7]);
    assert!(!page3.has_more);
    assert_eq!(page3.next_cursor, None);
-
-   db.remove().await.unwrap();
-}
-
-#[tokio::test]
-async fn desc_keyset_single_column() {
-   let (db, _temp) = create_test_db().await;
-   seed_posts_table(&db).await;
-
-   let keyset = vec![KeysetColumn::desc("id")];
-
-   // ── Page 1 (descending, no cursor) ──
-   // Generated SQL:
-   //    SELECT id, title FROM posts ORDER BY id DESC LIMIT 4
-   //
-   // Descending keyset means the highest IDs come first.
-   let page = db
-      .fetch_page("SELECT id, title FROM posts".into(), vec![], keyset, 3)
-      .await
-      .unwrap();
-
-   assert_eq!(row_ids(&page), vec![7, 6, 5]);
-   assert!(page.has_more);
-   assert_eq!(page.next_cursor, Some(vec![json!(5)]));
 
    db.remove().await.unwrap();
 }
@@ -398,15 +385,29 @@ async fn empty_table() {
    db.remove().await.unwrap();
 }
 
+// fetch_page asks for page_size + 1 rows; the extra row is the sentinel that sets has_more.
+#[rstest]
+// 3 rows = page_size: no sentinel row, so has_more is false.
+#[case::exactly_page_size_rows(3, 3, &[1, 2, 3], false, None)]
+// 4 rows = page_size + 1: the sentinel sets has_more and is truncated away.
+#[case::page_size_plus_one_rows(4, 3, &[1, 2, 3], true, Some(vec![json!(3)]))]
+// 1 row, well under page_size (10): no sentinel, so has_more is false.
+#[case::single_row(1, 10, &[1], false, None)]
 #[tokio::test]
-async fn exactly_page_size_rows() {
+async fn has_more_only_when_rows_exceed_page_size(
+   #[case] row_count: i64,
+   #[case] page_size: usize,
+   #[case] expected_ids: &[i64],
+   #[case] has_more: bool,
+   #[case] next_cursor: Option<Vec<JsonValue>>,
+) {
    let (db, _temp) = create_test_db().await;
 
    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)".into(), vec![])
       .await
       .unwrap();
 
-   for id in 1..=3 {
+   for id in 1..=row_count {
       db.execute("INSERT INTO t (id) VALUES ($1)".into(), vec![json!(id)])
          .await
          .unwrap();
@@ -414,84 +415,14 @@ async fn exactly_page_size_rows() {
 
    let keyset = vec![KeysetColumn::asc("id")];
 
-   // ── Exactly page_size rows ──
-   // Generated SQL:
-   //    SELECT id FROM t ORDER BY id ASC LIMIT 4
-   //
-   // 3 rows returned = page_size. No sentinel row → has_more=false.
    let page = db
-      .fetch_page("SELECT id FROM t".into(), vec![], keyset, 3)
+      .fetch_page("SELECT id FROM t".into(), vec![], keyset, page_size)
       .await
       .unwrap();
 
-   assert_eq!(row_ids(&page), vec![1, 2, 3]);
-   assert!(!page.has_more);
-   assert_eq!(page.next_cursor, None);
-
-   db.remove().await.unwrap();
-}
-
-#[tokio::test]
-async fn page_size_plus_one_rows() {
-   let (db, _temp) = create_test_db().await;
-
-   db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)".into(), vec![])
-      .await
-      .unwrap();
-
-   for id in 1..=4 {
-      db.execute("INSERT INTO t (id) VALUES ($1)".into(), vec![json!(id)])
-         .await
-         .unwrap();
-   }
-
-   let keyset = vec![KeysetColumn::asc("id")];
-
-   // ── page_size + 1 rows ──
-   // Generated SQL:
-   //    SELECT id FROM t ORDER BY id ASC LIMIT 4
-   //
-   // 4 rows returned > page_size (3). Sentinel present → has_more=true.
-   // Truncated to 3 rows.
-   let page = db
-      .fetch_page("SELECT id FROM t".into(), vec![], keyset, 3)
-      .await
-      .unwrap();
-
-   assert_eq!(row_ids(&page), vec![1, 2, 3]);
-   assert!(page.has_more);
-   assert_eq!(page.next_cursor, Some(vec![json!(3)]));
-
-   db.remove().await.unwrap();
-}
-
-#[tokio::test]
-async fn single_row() {
-   let (db, _temp) = create_test_db().await;
-
-   db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)".into(), vec![])
-      .await
-      .unwrap();
-
-   db.execute("INSERT INTO t (id) VALUES ($1)".into(), vec![json!(1)])
-      .await
-      .unwrap();
-
-   let keyset = vec![KeysetColumn::asc("id")];
-
-   // ── Single row, generous page_size ──
-   // Generated SQL:
-   //    SELECT id FROM t ORDER BY id ASC LIMIT 11
-   //
-   // 1 row << page_size (10). No sentinel → has_more=false.
-   let page = db
-      .fetch_page("SELECT id FROM t".into(), vec![], keyset, 10)
-      .await
-      .unwrap();
-
-   assert_eq!(row_ids(&page), vec![1]);
-   assert!(!page.has_more);
-   assert_eq!(page.next_cursor, None);
+   assert_eq!(row_ids(&page), expected_ids);
+   assert_eq!(page.has_more, has_more);
+   assert_eq!(page.next_cursor, next_cursor);
 
    db.remove().await.unwrap();
 }
@@ -591,30 +522,36 @@ async fn where_clause_multiple_params_combined_with_cursor() {
 
 // ─── Error Cases ───
 
+#[rstest]
+#[case::empty_keyset("SELECT 1", vec![], 10, "EMPTY_KEYSET_COLUMNS")]
+#[case::zero_page_size("SELECT 1", vec![KeysetColumn::asc("id")], 0, "INVALID_PAGE_SIZE")]
+#[case::query_contains_order_by(
+   "SELECT id FROM posts ORDER BY id",
+   vec![KeysetColumn::asc("id")],
+   10,
+   "INVALID_PAGINATION_QUERY"
+)]
+#[case::query_contains_limit(
+   "SELECT id FROM posts LIMIT 10",
+   vec![KeysetColumn::asc("id")],
+   10,
+   "INVALID_PAGINATION_QUERY"
+)]
 #[tokio::test]
-async fn error_empty_keyset() {
+async fn error_invalid_page_request(
+   #[case] query: &str,
+   #[case] keyset: Vec<KeysetColumn>,
+   #[case] page_size: usize,
+   #[case] expected_code: &str,
+) {
    let (db, _temp) = create_test_db().await;
 
    let err = db
-      .fetch_page("SELECT 1".into(), vec![], vec![], 10)
+      .fetch_page(query.into(), vec![], keyset, page_size)
       .await
       .unwrap_err();
 
-   assert!(matches!(err, Error::EmptyKeysetColumns));
-
-   db.remove().await.unwrap();
-}
-
-#[tokio::test]
-async fn error_zero_page_size() {
-   let (db, _temp) = create_test_db().await;
-
-   let err = db
-      .fetch_page("SELECT 1".into(), vec![], vec![KeysetColumn::asc("id")], 0)
-      .await
-      .unwrap_err();
-
-   assert!(matches!(err, Error::InvalidPageSize));
+   assert_eq!(err.error_code(), expected_code, "got {err:?}");
 
    db.remove().await.unwrap();
 }
@@ -637,44 +574,6 @@ async fn error_cursor_length_mismatch() {
          keyset_len: 1,
       }
    ));
-
-   db.remove().await.unwrap();
-}
-
-#[tokio::test]
-async fn error_query_contains_order_by() {
-   let (db, _temp) = create_test_db().await;
-
-   let err = db
-      .fetch_page(
-         "SELECT id FROM posts ORDER BY id".into(),
-         vec![],
-         vec![KeysetColumn::asc("id")],
-         10,
-      )
-      .await
-      .unwrap_err();
-
-   assert!(matches!(err, Error::InvalidPaginationQuery));
-
-   db.remove().await.unwrap();
-}
-
-#[tokio::test]
-async fn error_query_contains_limit() {
-   let (db, _temp) = create_test_db().await;
-
-   let err = db
-      .fetch_page(
-         "SELECT id FROM posts LIMIT 10".into(),
-         vec![],
-         vec![KeysetColumn::asc("id")],
-         10,
-      )
-      .await
-      .unwrap_err();
-
-   assert!(matches!(err, Error::InvalidPaginationQuery));
 
    db.remove().await.unwrap();
 }
