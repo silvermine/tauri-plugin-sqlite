@@ -17,20 +17,20 @@ default = []
 observer = ["dep:sqlx-sqlite-observer"]
 
 [dependencies]
-sqlx-sqlite-conn-mgr = { path = "../sqlx-sqlite-conn-mgr" }
-sqlx-sqlite-observer = { path = "../sqlx-sqlite-observer", features = ["conn-mgr"], optional = true }
+sqlx-sqlite-conn-mgr = { path = "../sqlx-sqlite-conn-mgr", version = "0.9.0" }
+sqlx-sqlite-observer = { path = "../sqlx-sqlite-observer", version = "0.9.1", features = ["conn-mgr"], optional = true }
 sqlx = { version = "0.9.0", features = ["sqlite", "json", "time", "runtime-tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 indexmap = { version = "2.12", features = ["serde"] }
 base64 = "0.22"
-time = "0.3"
+time = "0.3.47"
 uuid = { version = "1.11", features = ["v4"] }
-tokio = { version = "1.48.0", features = ["sync", "rt"] }
+tokio = { version = "1.54.1", features = ["sync", "rt"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "release_max_level_off"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
 rstest = { version = "0.28.0", default-features = false }

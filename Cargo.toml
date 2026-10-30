@@ -21,8 +21,8 @@ tauri = "2.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
-time = "0.3.44"
-tokio = { version = "1.48.0", features = ["rt", "sync", "time"] }
+time = "0.3.47"
+tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
 indexmap = { version = "2.12.1", features = ["serde"] }
 base64 = "0.22.1"
 tracing = { version = "0.1.41", default-features = false, features = ["std", "release_max_level_off"] }
@@ -32,13 +32,13 @@ uuid = { version = "1.11.0", features = ["v4"] }
 sqlx = { version = "0.9.0", features = ["sqlite", "json", "time", "runtime-tokio"] }
 
 # Connection manager
-sqlx-sqlite-conn-mgr = { path = "crates/sqlx-sqlite-conn-mgr" }
+sqlx-sqlite-conn-mgr = { path = "crates/sqlx-sqlite-conn-mgr", version = "0.9.0" }
 
 # Toolkit (high-level API — builders, transactions, decoding)
-sqlx-sqlite-toolkit = { path = "crates/sqlx-sqlite-toolkit", features = ["observer"] }
+sqlx-sqlite-toolkit = { path = "crates/sqlx-sqlite-toolkit", version = "0.9.1", features = ["observer"] }
 
 # Observer types (for payload conversion)
-sqlx-sqlite-observer = { path = "crates/sqlx-sqlite-observer", features = ["conn-mgr"] }
+sqlx-sqlite-observer = { path = "crates/sqlx-sqlite-observer", version = "0.9.1", features = ["conn-mgr"] }
 
 # Async stream support for observer subscriptions
 futures = "0.3.31"
@@ -49,5 +49,5 @@ tauri-plugin = { version = "2.7.1", features = ["build"] }
 [dev-dependencies]
 tauri = { version = "2.12.0", features = ["test"] }
 tempfile = "3.23.0"
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
 rstest = { version = "0.28.0", default-features = false }
