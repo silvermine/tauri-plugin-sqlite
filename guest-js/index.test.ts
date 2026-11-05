@@ -114,7 +114,7 @@ beforeEach(() => {
          return undefined;
       }
       return undefined;
-   });
+   }, { shouldMockEvents: true });
 });
 
 afterEach(() => { return clearMocks(); });

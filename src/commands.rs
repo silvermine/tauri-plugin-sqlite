@@ -184,14 +184,16 @@ fn resolve_attached_specs(
 /// If the database is already loaded, returns the existing connection.
 /// Otherwise, creates a new connection with optional custom configuration.
 ///
-/// `db_key` must be a registration key from
-/// [`Builder::register_database`] / [`SetupRegistrar::register_database`].
+/// `db_key` must be a registration key from [`crate::Builder::register_database`],
+/// [`crate::SetupRegistrar::register_database`], or
+/// [`crate::DatabaseRegistration::register_database`].
 /// Unregistered keys are rejected with `PATH_NOT_REGISTERED`.
 ///
 /// # Migration Timing
 ///
 /// If migrations are registered for this database, this function waits for them
-/// to complete before proceeding. The migration task (spawned at plugin setup)
+/// to complete before proceeding. The migration task is spawned at plugin setup
+/// or by [`crate::DatabaseRegistration::register_database`]. That task
 /// already called `SqliteDatabase::connect()`, which cached the database instance.
 /// When we call `connect()` here, we get the **same cached instance** from the
 /// registry - so we're not creating duplicate connections.

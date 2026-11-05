@@ -1,4 +1,5 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 async function ensureDatabaseLoaded(db: Database): Promise<void> {
    await db.load();
@@ -276,6 +277,33 @@ export interface MigrationEvent {
 
    /** Error message (on "failed") */
    error?: string;
+}
+
+/**
+ * Payload for the `sqlite:path-replaced` event.
+ *
+ * Rust emits this after `IfExists::Replace` stores a new path for a key that
+ * was already registered. Each `Database` instance for that key clears its
+ * cached path. A write already in flight is not cancelled.
+ *
+ * @example
+ * ```ts
+ * import { listen } from '@tauri-apps/api/event'
+ * import type { PathReplacedEvent } from '@silvermine/tauri-plugin-sqlite'
+ *
+ * await listen<PathReplacedEvent>('sqlite:path-replaced', (event) => {
+ *    const { dbKey, dbPath } = event.payload
+ *    console.log(`${dbKey} now points at ${dbPath}`)
+ * })
+ * ```
+ */
+export interface PathReplacedEvent {
+
+   /** Database registration key (such as `MAIN`) */
+   dbKey: string;
+
+   /** Canonical path now stored for `dbKey` */
+   dbPath: string;
 }
 
 // ─── Pagination Types ───
@@ -807,6 +835,10 @@ class TransactionBuilder implements PromiseLike<WriteQueryResult[]> {
  */
 export default class Database {
 
+   private static _path_generations = new Map<string, number>();
+
+   private static _path_replaced_listener: Promise<unknown> | null = null;
+
    /** Database key for identifying the database */
    public readonly key: string;
 
@@ -818,10 +850,13 @@ export default class Database {
     */
    private _path: string | null = null;
 
+   private _loadedGeneration = 0;
+
    private _loadPromise: Promise<void> | null = null;
 
    public constructor(key: string) {
       this.key = key;
+      Database._ensure_path_replaced_listener();
    }
 
    /**
@@ -831,7 +866,8 @@ export default class Database {
     * returns a `Database` instance once a connection is established.
     *
     * The key must be a key that the Rust side has registered with the plugin
-    * (via `Builder::register_database` / `SetupRegistrar::register_database`),
+    * (via `Builder::register_database`, `SetupRegistrar::register_database`, or
+    * `AppHandle::register_database`),
     * or an in-memory database such as `:memory:`.
     *
     * @param key - The key of the database to load
@@ -870,7 +906,8 @@ export default class Database {
     * `customConfig` or connect eagerly.
     *
     * The key must be registered with the plugin on the Rust side
-    * (via `Builder::register_database` / `SetupRegistrar::register_database`).
+    * (via `Builder::register_database`, `SetupRegistrar::register_database`, or
+    * `AppHandle::register_database`).
     *
     * @example
     * ```ts
@@ -896,6 +933,32 @@ export default class Database {
       await invoke<void>('plugin:sqlite|close_all');
    }
 
+   private static _ensure_path_replaced_listener(): void {
+      if (Database._path_replaced_listener !== null) {
+         return;
+      }
+
+      const listenPromise = listen<PathReplacedEvent>(
+         'sqlite:path-replaced',
+         (event) => {
+            const dbKey = event.payload.dbKey;
+
+            Database._path_generations.set(
+               dbKey,
+               (Database._path_generations.get(dbKey) ?? 0) + 1
+            );
+         }
+      );
+
+      Database._path_replaced_listener = listenPromise;
+
+      listenPromise.catch(() => {
+         if (Database._path_replaced_listener === listenPromise) {
+            Database._path_replaced_listener = null;
+         }
+      });
+   }
+
    /**
     * **path**
     *
@@ -916,8 +979,20 @@ export default class Database {
     * returns a `Database` instance once a connection is established.
     *
     * The key must be a key that the Rust side has registered with the plugin
-    * (via `Builder::register_database` / `SetupRegistrar::register_database`),
+    * (via `Builder::register_database`, `SetupRegistrar::register_database`, or
+    * `AppHandle::register_database`),
     * or an in-memory database such as `:memory:`.
+    *
+    * A Rust `IfExists::Replace` emits `sqlite:path-replaced` with a
+    * {@link PathReplacedEvent}. That event bumps a per-key generation counter.
+    * This instance records the generation when `load()` finishes. A later
+    * `load()` sees a newer generation, drops the cached path, and connects
+    * again. The event does not cancel a write already in flight. Drain writes
+    * on this key before `Replace`. After any reconnect, commands on this
+    * instance use the key's current file. `getPath()` stays at the previous
+    * path until `load()` runs again. An event that arrives while `load()` is
+    * in flight leaves this instance on the generation it started with, so the
+    * next `load()` connects again.
     *
     * @param key - The key of the database to load
     * @param customConfig - Optional custom configuration for connection pools
@@ -939,12 +1014,25 @@ export default class Database {
    public async load(
       customConfig?: CustomConfig
    ): Promise<void> {
+      const generation = Database._path_generations.get(this.key) ?? 0;
+
+      if (this._path !== null && this._loadedGeneration !== generation) {
+         this._resetLoadState();
+      }
+
       if (this._path !== null) {
          return;
       }
 
       if (this._loadPromise) {
-         return this._loadPromise;
+         await this._loadPromise;
+
+         if (this._loadedGeneration !== (Database._path_generations.get(this.key) ?? 0)) {
+            this._resetLoadState();
+            return this.load(customConfig);
+         }
+
+         return;
       }
 
       this._loadPromise = (async () => {
@@ -955,6 +1043,9 @@ export default class Database {
             });
 
             this._path = resolvedPath;
+            // Generation was read before invoke. An event during the call
+            // leaves this instance behind the counter, so the next load() connects again.
+            this._loadedGeneration = generation;
          } catch(err) {
             this._loadPromise = null;
             throw err;
@@ -1519,5 +1610,6 @@ export default class Database {
    private _resetLoadState(): void {
       this._path = null;
       this._loadPromise = null;
+      this._loadedGeneration = 0;
    }
 }

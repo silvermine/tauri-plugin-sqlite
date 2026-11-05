@@ -111,6 +111,14 @@ Or specify individual permissions:
 }
 ```
 
+The guest `Database` class subscribes to the `sqlite:path-replaced` app event after the
+first `Database` is constructed. Ensure the webview can listen to Tauri events:
+[`core:default`](https://v2.tauri.app/reference/acl/capability/) includes that capability;
+when you list permissions explicitly, add
+[`core:event:allow-listen`](https://v2.tauri.app/reference/acl/permission/) (or another
+capability that grants event listen). Without it, path-replace handling does not run; the
+failed `listen()` clears the one-shot slot so a later `Database` construction can retry.
+
 ## Compatibility / upgrading host app to Tauri 2.12
 
 This plugin is developed and tested against **Tauri 2.12.0**.
@@ -183,10 +191,11 @@ in-memory URI. The frontend and Rust callers open databases by **key**, not by p
    * In-memory URIs (`:memory:`, `file::memory:*`, and `file:` URIs with an exact
      `mode=memory` query parameter) are accepted as-is
    * Each registration **key** must map to a **distinct** database path; two keys for the
-     same path fail with `INVALID_CONFIG` when calling `build()` or during plugin setup
-     after `on_setup` merges registrations
+     same path fail with `INVALID_CONFIG` when calling `build()`, during plugin setup
+     after `on_setup` merges registrations, and on a later
+     `AppHandle::register_database`
 
-Invalid registration paths fail at startup with `INVALID_PATH` or `PATH_TRAVERSAL`.
+Invalid registration paths fail with `INVALID_PATH` or `PATH_TRAVERSAL`.
 
 **Why keys:**
 
@@ -250,6 +259,51 @@ let _plugin = Builder::new()
    .build()?;
 # Ok(())
 # }
+```
+
+A key whose path is not known until after plugin setup (for example, a per-profile
+database created only after the profile exists, and is not available on startup of the
+app's first launch) is registered on the running `AppHandle`. Pass `IfExists::Error`
+for a new key. `IfExists::Replace` on a key that was never registered inserts that key.
+`IfExists::Replace` on a registered key closes the loaded connection and points that
+key at a different file. The same path, including after a failed migration, or a path
+already stored for another key, is `INVALID_CONFIG` and leaves the loaded database in
+place. A same-path `Replace` does not run the migrator again. Leave a failed path by
+`Replace` to a different path, or restart the app. The call stores the path and
+returns. Call `connect` to open it. A `Some` migrator is spawned, and `connect` waits
+for it. `None` clears migration state for that key. Subscriptions and observers for
+the key are cleared when the path change closes the loaded database. Stop and drain
+frontend writes on that key before `Replace`. The plugin then emits
+`sqlite:path-replaced` (`dbKey`, `dbPath`). Each `Database` instance for that key
+clears its cached path, so the next `load()` connects again. The event does not
+cancel a write already in flight. Until something reconnects the key, commands return
+`DATABASE_NOT_LOADED`. After a reconnect, every `Database` instance for that key,
+including ones created before the replace, sends commands to the new file.
+`getPath()` stays at the old path until that instance calls `load()` again.
+`close()` closes the current pool for the key. `remove()` deletes the current files
+for the key. The window must call `observe` and `subscribe` again.
+
+```rust
+use tauri::{AppHandle, Runtime};
+use tauri_plugin_sqlite::{Connection, DatabaseRegistration, IfExists};
+
+async fn open_profile_notes<R: Runtime>(
+   app: &AppHandle<R>,
+   notes_path: std::path::PathBuf,
+) -> tauri_plugin_sqlite::Result<()> {
+   app.register_database("NOTES", notes_path, None, IfExists::Error).await?;
+   let _db = app.connect("NOTES").await?;
+   Ok(())
+}
+
+async fn switch_profile_notes<R: Runtime>(
+   app: &AppHandle<R>,
+   notes_path: std::path::PathBuf,
+) -> tauri_plugin_sqlite::Result<()> {
+   app.register_database("NOTES", notes_path, None, IfExists::Replace).await?;
+   let _db = app.connect("NOTES").await?;
+   Ok(())
+}
 ```
 
 The frontend then calls `Database.load(MAIN_DB_KEY)` (see [Connecting](#connecting)).
@@ -699,6 +753,15 @@ await db.observe(['users'], {
      dropping subscribers. Omitting either field inherits the active value; an
      explicit _different_ value fails with `OBSERVATION_CONFIG_CONFLICT`. To change
      them, every window must `unobserve()` first
+   * A Rust `IfExists::Replace` that changes a loaded key closes that key the same way
+     `close()` does: subscriptions abort and observation stops until the window calls
+     `observe()` again. Stop and drain frontend writes on that key before `Replace`.
+     The plugin emits `sqlite:path-replaced`. Each `Database` instance for the key
+     clears its cached path. The event does not cancel a write already in flight.
+     Until something reconnects the key, commands return `DATABASE_NOT_LOADED`. After
+     a reconnect, those instances send commands to the new file. `getPath()` stays at
+     the old path until that instance calls `load()` again. `close()` closes the
+     current pool. `remove()` deletes the current files
    * **Observation is database-wide, not per-connection.** The broker belongs to
      the underlying database file, keyed by its canonical path — not to any one
      way of opening it. Every window that loads the same database key shares it,
@@ -821,6 +884,15 @@ await db.close();            // Close this connection
 await Database.close_all();  // Close all connections
 await db.remove();           // Close and DELETE database file(s) - irreversible!
 ```
+
+A Rust `IfExists::Replace` that changes a loaded key closes that key the same way
+`close()` does. Stop and drain frontend writes on that key before `Replace`. The
+plugin emits `sqlite:path-replaced`. Each `Database` instance for the key clears its
+cached path. The event does not cancel a write already in flight. Until something
+reconnects the key, commands return `DATABASE_NOT_LOADED`. After a reconnect, those
+instances send commands to the new file. `getPath()` stays at the old path until that
+instance calls `load()` again. `close()` closes the current pool. `remove()` deletes
+the current files.
 
 ## API Reference
 
@@ -956,7 +1028,9 @@ from [`sqlx-sqlite-toolkit`](crates/sqlx-sqlite-toolkit/) directly (no registrat
 
 ```rust
 use tauri::{Manager, Runtime};
-use tauri_plugin_sqlite::{Builder, Connection, SqliteDatabaseConfig};
+use tauri_plugin_sqlite::{
+   Builder, Connection, DatabaseRegistration, IfExists, SqliteDatabaseConfig,
+};
 
 const MAIN_DB_KEY: &str = "MAIN";
 
@@ -981,6 +1055,19 @@ async fn example<R: Runtime>(app: tauri::AppHandle<R>) -> tauri_plugin_sqlite::R
       },
    ).await?;
 
+   Ok(())
+}
+
+// After setup, register a key that was not known at startup.
+// IfExists::Error inserts a new key. IfExists::Replace points an existing key at another file.
+async fn register_later<R: Runtime>(
+   app: &tauri::AppHandle<R>,
+   notes_path: std::path::PathBuf,
+   other_path: std::path::PathBuf,
+) -> tauri_plugin_sqlite::Result<()> {
+   app.register_database("NOTES", notes_path, None, IfExists::Error).await?;
+   app.register_database("NOTES", other_path, None, IfExists::Replace).await?;
+   let _db = app.connect("NOTES").await?;
    Ok(())
 }
 ```
