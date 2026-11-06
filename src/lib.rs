@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use serde::Serialize;
 use sqlx_sqlite_conn_mgr::Migrator;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, plugin::Builder as PluginBuilder};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
 mod commands;
@@ -88,7 +88,7 @@ impl DbInstances {
    }
 }
 
-/// Tracks the paths of all registered databases.
+/// Tracks every registered database key and its path.
 /// The String value of the key is the database identifier, not the path.
 /// For example, the value of the key `MAIN` would be something like
 /// `/var/lib/myapp/main.db`.
@@ -96,9 +96,25 @@ impl DbInstances {
 /// This key value is what will be used by the caller to interact with the database.
 /// For example, when calling `load()` or `execute()`, the caller will pass the key value
 /// to identify the database to which they want to connect.
-#[derive(Clone, Default)]
+///
+/// `paths` is the registration map. `registration_lock` is held for
+/// [`DatabaseRegistration::register_database`] and for the connect section from path
+/// lookup through pool insert, so a path change cannot land between those two steps.
+/// [`DatabaseRegistration::register_database`] drops the lock while it waits for this
+/// key's migration to leave `Pending` or `Running`, then takes the lock and checks
+/// the path map again. The lock does not cover that migration wait.
 pub struct RegisteredDatabases {
-   pub(crate) database_path_by_key: Arc<HashMap<String, PathBuf>>,
+   paths: RwLock<HashMap<String, PathBuf>>,
+   registration_lock: Mutex<()>,
+}
+
+impl Default for RegisteredDatabases {
+   fn default() -> Self {
+      Self {
+         paths: RwLock::new(HashMap::new()),
+         registration_lock: Mutex::new(()),
+      }
+   }
 }
 
 /// Contains the information required for registering a database.
@@ -106,11 +122,9 @@ pub struct RegisteredDatabases {
 /// When initializing or setting up the plugin, the caller will pass the path to the database
 /// file and the migrator to use for the database.
 ///
-/// This information is then stored in the `RegisteredDatabases` struct, which is used to
-/// track the paths of all registered databases.
-///
-/// The `migrator` is not held by the app state, but rather is only used after
-/// initialization to run the migrations for the database.
+/// Plugin setup and [`DatabaseRegistration::register_database`] spawn the migrator
+/// from this value when it is `Some`. A `None` argument clears any migration state
+/// stored for that key. [`RegisteredDatabases`] stores the path only.
 #[derive(Debug, Clone)]
 struct DatabaseInfo {
    path: PathBuf,
@@ -136,14 +150,18 @@ fn ensure_distinct_database_paths(
 
    for (key, info) in database_info_by_key {
       if let Some(existing_key) = path_to_key.insert(info.path.clone(), key.as_str()) {
-         return Err(Error::InvalidConfig(format!(
-            "database keys {existing_key} and {key} both register the same path: {}",
-            info.path.display()
-         )));
+         return Err(duplicate_path_config(existing_key, key, &info.path));
       }
    }
 
    Ok(())
+}
+
+fn duplicate_path_config(existing_key: &str, key: &str, path: &Path) -> Error {
+   Error::InvalidConfig(format!(
+      "database keys {existing_key} and {key} both register the same path: {}",
+      path.display()
+   ))
 }
 
 /// Migration status for a database.
@@ -190,6 +208,13 @@ impl MigrationState {
 #[derive(Default)]
 pub struct MigrationStates(pub RwLock<HashMap<String, MigrationState>>);
 
+/// When set, `run_migrations_for_database` for key `MAIN` waits at [`tokio::sync::Barrier::wait`]
+/// after setting [`MigrationStatus::Running`], so tests can run another `connect`
+/// while migration is mid-flight.
+#[cfg(test)]
+static TEST_MAIN_MIGRATION_RUNNING_BARRIER: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>> =
+   std::sync::Mutex::new(None);
+
 /// Event payload emitted during migration operations.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,6 +233,18 @@ pub struct MigrationEvent {
    /// Error message (on "failed")
    #[serde(skip_serializing_if = "Option::is_none")]
    pub error: Option<String>,
+}
+
+/// Event payload emitted after [`IfExists::Replace`] stores a new path for a key.
+///
+/// The frontend event name is `sqlite:path-replaced`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathReplacedEvent {
+   /// Database key whose path changed.
+   pub db_key: String,
+   /// Canonical path now stored for `db_key`.
+   pub db_path: PathBuf,
 }
 
 /// Builder for the SQLite plugin.
@@ -285,7 +322,8 @@ pub struct SetupRegistrar {
 }
 
 impl SetupRegistrar {
-   /// Register a database path, optionally with migrations. See [`Builder::register_database`].
+   /// Register a database key and path, optionally with migrations. See
+   /// [`Builder::register_database`].
    ///
    /// This invocation is to be used when the database path is known at runtime (such as
    /// a path dependent on `app.path().app_data_dir()`).
@@ -419,6 +457,8 @@ impl<R: Runtime> Builder<R> {
    /// Distinct keys must map to distinct database paths. If two distinct keys register
    /// the same path, plugin initialization returns [`Error::InvalidConfig`]. Registrations
    /// from [`on_setup`](Self::on_setup) are validated when the merged map is initialized.
+   /// [`DatabaseRegistration::register_database`] rejects a duplicate path the same
+   /// way after setup.
    pub fn register_database(
       mut self,
       key: &str,
@@ -594,7 +634,8 @@ impl<R: Runtime> Builder<R> {
    ///
    /// Duplicate paths across distinct registration keys are rejected during plugin
    /// initialization (the setup hook), after [`on_setup`](Self::on_setup) registrations
-   /// are merged with static ones.
+   /// are merged with static ones. The same check runs for registrations and path
+   /// changes made after setup.
    pub fn build(self) -> Result<tauri::plugin::TauriPlugin<R>> {
       let database_info_by_key = self.database_info_by_key;
       let transaction_timeout = self.transaction_timeout;
@@ -647,8 +688,13 @@ impl<R: Runtime> Builder<R> {
 
             ensure_distinct_database_paths(&database_info_by_key)?;
 
+            let paths = database_info_by_key
+               .iter()
+               .map(|(key, info)| (key.clone(), info.path.clone()))
+               .collect();
             app.manage(RegisteredDatabases {
-               database_path_by_key: Arc::new(database_info_by_key.iter().map(|(key, info)| (key.clone(), info.path.clone())).collect()),
+               paths: RwLock::new(paths),
+               registration_lock: Mutex::new(()),
             });
 
             let migration_states = app.state::<MigrationStates>();
@@ -896,8 +942,19 @@ async fn run_migrations_for_database<R: Runtime>(
    // Emit running event
    emit_migration_event(&app, key, path, "running", None, None);
 
+   #[cfg(test)]
+   if key == "MAIN" {
+      let barrier = TEST_MAIN_MIGRATION_RUNNING_BARRIER
+         .lock()
+         .expect("test migration barrier lock")
+         .clone();
+      if let Some(barrier) = barrier {
+         barrier.wait().await;
+      }
+   }
+
    // Resolve absolute path and connect
-   let abs_path = match resolve_database_path(key, &app) {
+   let abs_path = match resolve_database_path(key, &app).await {
       Ok(p) => p,
       Err(e) => {
          let error_msg = e.to_string();
@@ -995,6 +1052,20 @@ fn emit_migration_event<R: Runtime>(
    }
 }
 
+/// Tell guest handles that `db_key` now points at `db_path`.
+///
+/// Emit failure is logged. The registration itself already succeeded.
+fn emit_path_replaced_event<R: Runtime>(app: &AppHandle<R>, db_key: &str, db_path: &Path) {
+   let event = PathReplacedEvent {
+      db_key: db_key.to_string(),
+      db_path: db_path.to_path_buf(),
+   };
+
+   if let Err(e) = app.emit("sqlite:path-replaced", &event) {
+      warn!("Failed to emit path replaced event: {}", e);
+   }
+}
+
 /// Connect to a registered database by its registration key.
 ///
 /// Opens the database through the same path as the frontend `load` IPC command
@@ -1003,7 +1074,8 @@ fn emit_migration_event<R: Runtime>(
 /// toolkit use.
 ///
 /// The `database_key` must match a key registered via
-/// [`Builder::register_database`] or [`SetupRegistrar::register_database`].
+/// [`Builder::register_database`], [`SetupRegistrar::register_database`], or
+/// [`DatabaseRegistration::register_database`].
 ///
 /// # Why use a key?
 ///
@@ -1072,6 +1144,57 @@ pub trait Connection<R: Runtime> {
    fn close(&self, database_key: &str) -> impl Future<Output = Result<bool>> + Send;
 }
 
+/// What [`DatabaseRegistration::register_database`] does when `key` is already registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfExists {
+   /// Return [`Error::InvalidConfig`] and leave the stored registration alone.
+   Error,
+   /// Point `key` at a different database file.
+   ///
+   /// An unknown key is inserted. No close runs, because nothing is loaded.
+   ///
+   /// The canonical path this key already has, and a path stored for another key,
+   /// both return [`Error::InvalidConfig`] with no other change. That same-path
+   /// rejection also applies when this key's migration status is `Failed`. A
+   /// same-path `Replace` does not run the migrator again.
+   Replace,
+}
+
+/// Register databases after plugin setup.
+pub trait DatabaseRegistration<R: Runtime> {
+   /// Register a database after plugin setup.
+   ///
+   /// Path rules match [`Builder::register_database`]: absolute
+   /// file path, no `..`, canonicalized, parent directory created when missing.
+   /// In-memory URIs are accepted as-is. This call stores the registration and
+   /// returns. It does not open the database. [`Connection::connect`] waits when
+   /// a migrator was spawned.
+   ///
+   /// `IfExists::Error` returns [`Error::InvalidConfig`] when `key` is already
+   /// registered. `IfExists::Replace` closes a loaded database and stores `path`
+   /// when that path is different. The same canonical path, or a path already
+   /// stored for another key, returns [`Error::InvalidConfig`] and leaves the
+   /// loaded database in place. A same-path `Replace` is rejected after
+   /// `Complete` and after `Failed`. It does not run the migrator again. Leave a
+   /// failed path by `Replace` to a different path, or restart the app.
+   ///
+   /// Close failure returns that error and keeps the stored path. The close
+   /// removes the loaded instance and clears subscriptions before the pool
+   /// close finishes, so a close failure can leave the key unloaded. A later
+   /// [`Connection::connect`] reopens the stored path. A `Some` migrator
+   /// replaces this key's migration state and is spawned the same way plugin
+   /// setup spawns one. `None` removes this key's migration state. Migration
+   /// failure is reported by a later [`Connection::connect`], with the key left
+   /// on the stored path. A successful path change emits `sqlite:path-replaced`.
+   fn register_database(
+      &self,
+      key: &str,
+      path: impl Into<PathBuf> + Send,
+      migrator: Option<Migrator>,
+      if_exists: IfExists,
+   ) -> impl Future<Output = Result<()>> + Send;
+}
+
 /// Delegates to [`connect_to_database`]: same open path as the `load` IPC command.
 impl<R: Runtime> Connection<R> for AppHandle<R> {
    async fn connect(&self, database_key: &str) -> Result<DatabaseWrapper> {
@@ -1119,6 +1242,108 @@ impl<R: Runtime> Connection<R> for AppHandle<R> {
    }
 }
 
+impl<R: Runtime> DatabaseRegistration<R> for AppHandle<R> {
+   async fn register_database(
+      &self,
+      key: &str,
+      path: impl Into<PathBuf> + Send,
+      migrator: Option<Migrator>,
+      if_exists: IfExists,
+   ) -> Result<()> {
+      let registered = self
+         .try_state::<RegisteredDatabases>()
+         .ok_or(Error::MissingState("RegisteredDatabases".into()))?;
+      let migration_states = self
+         .try_state::<MigrationStates>()
+         .ok_or(Error::MissingState("MigrationStates".into()))?;
+      // Path validation does not depend on the registration map. Map checks run
+      // again after every lock, because a wait drops the lock and those checks
+      // would otherwise observe a stale map.
+      let info = validated_database_info(path, migrator)?;
+
+      loop {
+         let _registration_lock = registered.registration_lock.lock().await;
+
+         if migration_is_unsettled(&migration_states, key).await {
+            drop(_registration_lock);
+            wait_until_migration_settled(&migration_states, key).await;
+            continue;
+         }
+
+         if if_exists == IfExists::Error {
+            let paths = registered.paths.read().await;
+            if paths.contains_key(key) {
+               return Err(Error::InvalidConfig(format!(
+                  "database key {key} is already registered"
+               )));
+            }
+         }
+
+         let current_path = {
+            let paths = registered.paths.read().await;
+            if let Some(existing_key) = paths.iter().find_map(|(existing_key, existing_path)| {
+               (existing_key != key && existing_path == &info.path).then_some(existing_key.as_str())
+            }) {
+               return Err(duplicate_path_config(existing_key, key, &info.path));
+            }
+            paths.get(key).cloned()
+         };
+
+         let replaced = if let Some(current_path) = current_path {
+            if current_path == info.path {
+               return Err(Error::InvalidConfig(format!(
+                  "database key {key} is already registered at {}",
+                  info.path.display()
+               )));
+            }
+
+            // `Failed` is settled, so a replace can leave that path. `Pending`
+            // and `Running` already waited above, outside this lock.
+            Connection::close(self, key).await?;
+            true
+         } else {
+            false
+         };
+
+         {
+            let mut paths = registered.paths.write().await;
+            paths.insert(key.to_string(), info.path.clone());
+         }
+
+         spawn_or_clear_migrations(self, &migration_states, key, &info.path, info.migrator).await;
+
+         if replaced {
+            emit_path_replaced_event(self, key, &info.path);
+         }
+         return Ok(());
+      }
+   }
+}
+
+async fn spawn_or_clear_migrations<R: Runtime>(
+   app: &AppHandle<R>,
+   migration_states: &MigrationStates,
+   key: &str,
+   path: &Path,
+   migrator: Option<Arc<Migrator>>,
+) {
+   if let Some(migrator) = migrator {
+      migration_states
+         .0
+         .write()
+         .await
+         .insert(key.to_string(), MigrationState::new());
+      let key = key.to_string();
+      let path = path.to_path_buf();
+      let app_handle = app.clone();
+      tauri::async_runtime::spawn(async move {
+         run_migrations_for_database(app_handle, &key, &path, &migrator).await;
+      });
+   } else {
+      migration_states.0.write().await.remove(key);
+   }
+}
+
 struct ConnectionResponse {
    path: PathBuf,
    wrapper: DatabaseWrapper,
@@ -1130,12 +1355,35 @@ async fn connect_to_database<R: Runtime>(
    custom_config: Option<SqliteDatabaseConfig>,
 ) -> Result<ConnectionResponse> {
    let migration_states = app.state::<MigrationStates>();
+   let registered = app.state::<RegisteredDatabases>();
+
+   loop {
+      // Migration waits must not hold `registration_lock`: one key's long-running
+      // migration would block every `connect`, `load`, and `register_database`.
+      await_migrations(&migration_states, db_key).await?;
+
+      let _registration_lock = registered.registration_lock.lock().await;
+
+      if migration_is_unsettled(&migration_states, db_key).await {
+         drop(_registration_lock);
+         wait_until_migration_settled(&migration_states, db_key).await;
+         continue;
+      }
+
+      // Settled for this key under the lock. Do not call `await_migrations` here: it
+      // would wait on `Pending`/`Running` while holding the global registration mutex.
+      return connect_to_database_locked(app, db_key, custom_config).await;
+   }
+}
+
+async fn connect_to_database_locked<R: Runtime>(
+   app: &AppHandle<R>,
+   db_key: &str,
+   custom_config: Option<SqliteDatabaseConfig>,
+) -> Result<ConnectionResponse> {
    let db_instances = app.state::<DbInstances>();
 
-   // Wait for migrations to complete if registered for this database
-   await_migrations(&migration_states, db_key).await?;
-
-   let path = resolve_database_path(db_key, app)?;
+   let path = resolve_database_path(db_key, app).await?;
 
    let instances = db_instances.inner.read().await;
 
@@ -1187,31 +1435,71 @@ async fn connect_to_database<R: Runtime>(
 /// Returns Err if migrations failed.
 async fn await_migrations(migration_states: &MigrationStates, db_key: &str) -> Result<()> {
    loop {
-      // Get notify handle before checking status
-      let notify = {
-         match migration_states.0.read().await.get(db_key) {
-            // No migrations registered for this database
-            None => return Ok(()),
+      let states = migration_states.0.read().await;
+      let notified = match states.get(db_key) {
+         // No migrations registered for this database
+         None => return Ok(()),
 
-            Some(state) => match &state.status {
-               // Migrations completed successfully
-               MigrationStatus::Complete => return Ok(()),
+         Some(state) => match &state.status {
+            // Migrations completed successfully
+            MigrationStatus::Complete => return Ok(()),
 
-               // Migrations failed - return the error
-               MigrationStatus::Failed(error) => {
-                  return Err(Error::Migration(sqlx::migrate::MigrateError::Source(
-                     error.clone().into(),
-                  )));
-               }
+            // Migrations failed - return the error
+            MigrationStatus::Failed(error) => {
+               return Err(Error::Migration(sqlx::migrate::MigrateError::Source(
+                  error.clone().into(),
+               )));
+            }
 
-               // Migrations still pending or running - wait for notification
-               MigrationStatus::Pending | MigrationStatus::Running => state.notify.clone(),
-            },
-         }
+            // `notify_waiters` stores no permit. Enable the waiter before the
+            // read guard drops, or a status change in that gap is lost.
+            MigrationStatus::Pending | MigrationStatus::Running => {
+               state.notify.clone().notified_owned()
+            }
+         },
       };
+      let mut notified = std::pin::pin!(notified);
+      notified.as_mut().enable();
+      drop(states);
+      notified.await;
+   }
+}
 
-      // Wait for migration state change
-      notify.notified().await;
+/// `true` when this key's migration status is `Pending` or `Running`.
+///
+/// `None`, `Complete`, and `Failed` are not in progress.
+async fn migration_is_unsettled(migration_states: &MigrationStates, db_key: &str) -> bool {
+   let states = migration_states.0.read().await;
+   matches!(
+      states.get(db_key).map(|state| &state.status),
+      Some(MigrationStatus::Pending | MigrationStatus::Running)
+   )
+}
+
+/// Wait until this key's migration task has left `Pending` and `Running`.
+///
+/// `Failed` and `Complete` both count as settled. [`DatabaseRegistration::register_database`]
+/// with [`IfExists::Replace`] uses this so a failed migration still allows the key to
+/// move to another path.
+/// [`await_migrations`] is what turns `Failed` into an error for open calls.
+async fn wait_until_migration_settled(migration_states: &MigrationStates, db_key: &str) {
+   loop {
+      let states = migration_states.0.read().await;
+      let notified = match states.get(db_key) {
+         None => return,
+         Some(state) => match &state.status {
+            MigrationStatus::Complete | MigrationStatus::Failed(_) => return,
+            // `notify_waiters` stores no permit. Enable the waiter before the
+            // read guard drops, or a status change in that gap is lost.
+            MigrationStatus::Pending | MigrationStatus::Running => {
+               state.notify.clone().notified_owned()
+            }
+         },
+      };
+      let mut notified = std::pin::pin!(notified);
+      notified.as_mut().enable();
+      drop(states);
+      notified.await;
    }
 }
 
@@ -1390,13 +1678,15 @@ async fn close_all_loaded_databases_inner(
 /// Resolve a registered database path by key.
 ///
 /// The `db_key` must match a key registered via
-/// [`crate::Builder::register_database`] / [`crate::SetupRegistrar::register_database`].
+/// [`crate::Builder::register_database`], [`crate::SetupRegistrar::register_database`],
+/// or [`crate::DatabaseRegistration::register_database`].
 ///
 /// Returns `Err(Error::PathNotRegistered)` if the key is not registered.
-fn resolve_database_path<R: Runtime>(db_key: &str, app: &AppHandle<R>) -> Result<PathBuf> {
+async fn resolve_database_path<R: Runtime>(db_key: &str, app: &AppHandle<R>) -> Result<PathBuf> {
    let registered_databases = app.state::<RegisteredDatabases>();
+   let paths = registered_databases.paths.read().await;
 
-   if let Some(path) = registered_databases.database_path_by_key.get(db_key) {
+   if let Some(path) = paths.get(db_key) {
       return Ok(path.clone());
    }
 
@@ -1412,6 +1702,7 @@ mod tests {
    use std::collections::HashMap;
    use tauri::plugin::Plugin;
    use tauri::test::{MockRuntime, mock_app, mock_builder, mock_context, noop_assets};
+   use tokio::sync::{Mutex, RwLock};
    use uuid::Uuid;
 
    /// Build and initialize the plugin for a single registered database.
@@ -1525,12 +1816,22 @@ mod tests {
          .unwrap()
    }
 
+   fn init_plugin_app() -> tauri::App<MockRuntime> {
+      let mut plugin = Builder::<MockRuntime>::new().build().unwrap();
+      let app = mock_app();
+      plugin
+         .initialize(app.handle(), serde_json::Value::default())
+         .expect("plugin init should succeed");
+      app
+   }
+
    fn mock_app_with_registrations(
       database_path_by_key: HashMap<String, PathBuf>,
    ) -> tauri::App<MockRuntime> {
       let app = tauri::test::mock_app();
       app.manage(RegisteredDatabases {
-         database_path_by_key: Arc::new(database_path_by_key),
+         paths: RwLock::new(database_path_by_key),
+         registration_lock: Mutex::new(()),
       });
       app.manage(DbInstances::default());
       app.manage(MigrationStates::default());
@@ -1655,11 +1956,11 @@ mod tests {
          .expect("plugin setup should succeed");
 
       assert_eq!(
-         resolve_database_path("STATIC", app.handle()).unwrap(),
+         tauri::async_runtime::block_on(resolve_database_path("STATIC", app.handle())).unwrap(),
          static_db_path
       );
       assert_eq!(
-         resolve_database_path("MAIN", app.handle()).unwrap(),
+         tauri::async_runtime::block_on(resolve_database_path("MAIN", app.handle())).unwrap(),
          main_db_path
       );
 
@@ -1828,7 +2129,8 @@ mod tests {
       database_path_by_key.insert("MAIN".to_string(), second_path.clone());
 
       let app = mock_app_with_registrations(database_path_by_key);
-      let path = resolve_database_path("MAIN", app.handle()).unwrap();
+      let path =
+         tauri::async_runtime::block_on(resolve_database_path("MAIN", app.handle())).unwrap();
 
       assert_eq!(path, second_path);
    }
@@ -3711,6 +4013,829 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
          }
+      });
+   }
+
+   fn migrator_for_table(table: &str) -> Migrator {
+      let migrations_dir = tempfile::tempdir().unwrap();
+      std::fs::write(
+         migrations_dir.path().join("20240101000000_init.sql"),
+         format!("CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, val TEXT);"),
+      )
+      .unwrap();
+      tauri::async_runtime::block_on(Migrator::new(migrations_dir.path())).unwrap()
+   }
+
+   struct ClearTestMainMigrationBarrier;
+
+   impl Drop for ClearTestMainMigrationBarrier {
+      fn drop(&mut self) {
+         if let Ok(mut g) = TEST_MAIN_MIGRATION_RUNNING_BARRIER.lock() {
+            *g = None;
+         }
+      }
+   }
+
+   async fn insert_test_val(app: &tauri::App<MockRuntime>, db_key: &str, val: &str) {
+      commands::execute(
+         app.state::<DbInstances>(),
+         db_key.to_string(),
+         "INSERT INTO test (val) VALUES (?)".to_string(),
+         vec![serde_json::Value::String(val.to_string())],
+         None,
+      )
+      .await
+      .expect("insert should succeed");
+   }
+
+   async fn text_column(wrapper: &DatabaseWrapper, sql: &str, column: &str) -> Vec<String> {
+      wrapper
+         .fetch_all(sql.into(), vec![])
+         .await
+         .expect("query should succeed")
+         .into_iter()
+         .filter_map(|row| {
+            row.get(column)
+               .and_then(|value| value.as_str().map(str::to_string))
+         })
+         .collect()
+   }
+
+   #[test]
+   fn test_register_database_after_setup_then_connect() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("notes.db")).unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &db_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         load_and_create_test_table(&app, "NOTES").await;
+         insert_test_val(&app, "NOTES", "profile").await;
+
+         let wrapper = app.handle().connect("NOTES").await.unwrap();
+         assert_eq!(
+            text_column(&wrapper, "SELECT val FROM test", "val").await,
+            vec!["profile".to_string()]
+         );
+      });
+   }
+
+   #[test]
+   fn test_register_database_after_setup_rejects_duplicate_key_and_path() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let notes_path = validate::validate_database_path(temp_dir.path().join("notes.db")).unwrap();
+      let other_path = validate::validate_database_path(temp_dir.path().join("other.db")).unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &notes_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         app.handle()
+            .register_database("OTHER", &other_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         load_and_create_test_table(&app, "NOTES").await;
+         insert_test_val(&app, "NOTES", "kept").await;
+
+         let duplicate_key = app
+            .handle()
+            .register_database("NOTES", &other_path, None, IfExists::Error)
+            .await
+            .unwrap_err();
+         assert!(matches!(duplicate_key, Error::InvalidConfig(_)));
+         assert!(duplicate_key.to_string().contains("NOTES"));
+
+         let duplicate_path = app
+            .handle()
+            .register_database("BACKUP", &notes_path, None, IfExists::Error)
+            .await
+            .unwrap_err();
+         assert!(matches!(duplicate_path, Error::InvalidConfig(_)));
+         assert!(duplicate_path.to_string().contains("NOTES"));
+         assert!(duplicate_path.to_string().contains("BACKUP"));
+
+         let wrapper = app.handle().connect("NOTES").await.unwrap();
+         assert_eq!(
+            text_column(&wrapper, "SELECT val FROM test", "val").await,
+            vec!["kept".to_string()]
+         );
+      });
+   }
+
+   #[test]
+   fn test_register_database_after_setup_runs_migrations() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let db_path = validate::validate_database_path(temp_dir.path().join("notes.db")).unwrap();
+      let migrator = migrator_for_table("_late_register");
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &db_path, Some(migrator), IfExists::Error)
+            .await
+            .unwrap();
+         let wrapper = app.handle().connect("NOTES").await.unwrap();
+         assert_eq!(
+            text_column(
+               &wrapper,
+               "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_late_register'",
+               "name",
+            )
+            .await,
+            vec!["_late_register".to_string()]
+         );
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_switches_loaded_database() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let old_path = validate::validate_database_path(temp_dir.path().join("old.db")).unwrap();
+      let new_path = validate::validate_database_path(temp_dir.path().join("new.db")).unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &old_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         load_and_create_test_table(&app, "NOTES").await;
+         insert_test_val(&app, "NOTES", "old-profile").await;
+
+         app.handle()
+            .register_database("NOTES", &new_path, None, IfExists::Replace)
+            .await
+            .unwrap();
+         let wrapper = app.handle().connect("NOTES").await.unwrap();
+         assert!(
+            text_column(
+               &wrapper,
+               "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'test'",
+               "name",
+            )
+            .await
+            .is_empty()
+         );
+
+         commands::execute(
+            app.state::<DbInstances>(),
+            "NOTES".to_string(),
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, val TEXT)".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .unwrap();
+         insert_test_val(&app, "NOTES", "new-profile").await;
+         assert_eq!(
+            text_column(&wrapper, "SELECT val FROM test", "val").await,
+            vec!["new-profile".to_string()]
+         );
+
+         let old_file = DatabaseWrapper::connect(&old_path, None).await.unwrap();
+         assert_eq!(
+            text_column(&old_file, "SELECT val FROM test", "val").await,
+            vec!["old-profile".to_string()]
+         );
+         old_file.close().await.unwrap();
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_when_not_loaded() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let old_path = validate::validate_database_path(temp_dir.path().join("old.db")).unwrap();
+      let new_path = validate::validate_database_path(temp_dir.path().join("new.db")).unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &old_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         app.handle()
+            .register_database("NOTES", &new_path, None, IfExists::Replace)
+            .await
+            .unwrap();
+         let wrapper = app.handle().connect("NOTES").await.unwrap();
+         let rows = text_column(&wrapper, "SELECT 'open' AS n", "n").await;
+         assert_eq!(rows, vec!["open".to_string()]);
+         assert_eq!(
+            resolve_database_path("NOTES", app.handle()).await.unwrap(),
+            new_path
+         );
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_rejects_same_and_foreign_paths() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let notes_path = validate::validate_database_path(temp_dir.path().join("notes.db")).unwrap();
+      let other_path = validate::validate_database_path(temp_dir.path().join("other.db")).unwrap();
+      let migrator = migrator_for_table("_same_path");
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &notes_path, Some(migrator), IfExists::Error)
+            .await
+            .unwrap();
+         app.handle()
+            .register_database("OTHER", &other_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         let loaded = app.handle().connect("NOTES").await.unwrap();
+         loaded
+            .execute(
+               "INSERT INTO _same_path (val) VALUES (?)".into(),
+               vec![serde_json::Value::String("kept".to_string())],
+            )
+            .await
+            .unwrap();
+
+         let same_path = match app
+            .handle()
+            .register_database("NOTES", &notes_path, None, IfExists::Replace)
+            .await
+         {
+            Err(error) => error,
+            Ok(_) => panic!("same path should fail"),
+         };
+         assert!(matches!(same_path, Error::InvalidConfig(_)));
+         assert!(
+            app.state::<MigrationStates>()
+               .0
+               .read()
+               .await
+               .get("NOTES")
+               .is_some(),
+            "same-path replace must leave migration state in place"
+         );
+
+         let foreign_path = match app
+            .handle()
+            .register_database("NOTES", &other_path, None, IfExists::Replace)
+            .await
+         {
+            Err(error) => error,
+            Ok(_) => panic!("path owned by another key should fail"),
+         };
+         assert!(matches!(foreign_path, Error::InvalidConfig(_)));
+         assert!(foreign_path.to_string().contains("OTHER"));
+
+         let wrapper = app.handle().connect("NOTES").await.unwrap();
+         assert_eq!(
+            text_column(&wrapper, "SELECT val FROM _same_path", "val").await,
+            vec!["kept".to_string()]
+         );
+         assert_eq!(
+            resolve_database_path("NOTES", app.handle()).await.unwrap(),
+            notes_path
+         );
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_runs_migrator_on_new_file() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let old_path = validate::validate_database_path(temp_dir.path().join("old.db")).unwrap();
+      let new_path = validate::validate_database_path(temp_dir.path().join("new.db")).unwrap();
+      let migrator = migrator_for_table("_retarget_migrate");
+      let replacement = migrator_for_table("_retarget_migrate");
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &old_path, Some(migrator), IfExists::Error)
+            .await
+            .unwrap();
+         let loaded = app.handle().connect("NOTES").await.unwrap();
+         loaded
+            .execute(
+               "INSERT INTO _retarget_migrate (val) VALUES (?)".into(),
+               vec![serde_json::Value::String("old-profile".to_string())],
+            )
+            .await
+            .unwrap();
+
+         app.handle()
+            .register_database("NOTES", &new_path, Some(replacement), IfExists::Replace)
+            .await
+            .unwrap();
+         let wrapper = app.handle().connect("NOTES").await.unwrap();
+         assert_eq!(
+            text_column(
+               &wrapper,
+               "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_retarget_migrate'",
+               "name",
+            )
+            .await,
+            vec!["_retarget_migrate".to_string()]
+         );
+         assert!(
+            text_column(&wrapper, "SELECT val FROM _retarget_migrate", "val")
+               .await
+               .is_empty()
+         );
+
+         let old_file = DatabaseWrapper::connect(&old_path, None).await.unwrap();
+         assert_eq!(
+            text_column(&old_file, "SELECT val FROM _retarget_migrate", "val").await,
+            vec!["old-profile".to_string()]
+         );
+         old_file.close().await.unwrap();
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_clears_observers_and_subscriptions() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let notes_path = validate::validate_database_path(temp_dir.path().join("notes.db")).unwrap();
+      let other_path = validate::validate_database_path(temp_dir.path().join("other.db")).unwrap();
+      let new_path = validate::validate_database_path(temp_dir.path().join("new.db")).unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &notes_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         app.handle()
+            .register_database("OTHER", &other_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         load_and_create_test_table(&app, "NOTES").await;
+         connect_to_database(app.handle(), "OTHER", None)
+            .await
+            .expect("OTHER should load");
+
+         let notes_window =
+            tauri::WebviewWindowBuilder::new(&app, "window-notes", Default::default())
+               .build()
+               .expect("notes window should build");
+         let other_window =
+            tauri::WebviewWindowBuilder::new(&app, "window-other", Default::default())
+               .build()
+               .expect("other window should build");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            notes_window.as_ref().clone(),
+            "NOTES".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("NOTES observe should succeed");
+
+         let (tx, _rx) = std::sync::mpsc::channel::<serde_json::Value>();
+         let channel = tauri::ipc::Channel::new(move |body| {
+            let value: serde_json::Value = body
+               .deserialize()
+               .expect("payload should deserialize as JSON");
+            tx.send(value).ok();
+            Ok(())
+         });
+         commands::subscribe(
+            app.state::<DbInstances>(),
+            app.state::<ActiveSubscriptions>(),
+            app.state::<ObserverRegistrations>(),
+            notes_window.as_ref().clone(),
+            "NOTES".to_string(),
+            vec!["test".to_string()],
+            channel,
+         )
+         .await
+         .expect("NOTES subscribe should succeed");
+
+         commands::observe(
+            app.state::<DbInstances>(),
+            app.state::<ObserverRegistrations>(),
+            other_window.as_ref().clone(),
+            "OTHER".to_string(),
+            vec!["test".to_string()],
+            None,
+         )
+         .await
+         .expect("OTHER observe should succeed");
+
+         assert_eq!(
+            app.state::<ActiveSubscriptions>()
+               .count_for_db("NOTES")
+               .await,
+            1
+         );
+         assert_eq!(
+            app.state::<ObserverRegistrations>()
+               .count_for_db("NOTES")
+               .await,
+            1
+         );
+         assert_eq!(
+            app.state::<ObserverRegistrations>()
+               .count_for_db("OTHER")
+               .await,
+            1
+         );
+
+         app.handle()
+            .register_database("NOTES", &new_path, None, IfExists::Replace)
+            .await
+            .unwrap();
+
+         assert_eq!(
+            app.state::<ActiveSubscriptions>()
+               .count_for_db("NOTES")
+               .await,
+            0,
+            "replace should abort NOTES subscriptions"
+         );
+         assert_eq!(
+            app.state::<ObserverRegistrations>()
+               .count_for_db("NOTES")
+               .await,
+            0,
+            "replace should clear NOTES observers"
+         );
+         assert_eq!(
+            app.state::<ObserverRegistrations>()
+               .count_for_db("OTHER")
+               .await,
+            1,
+            "replace should leave OTHER observers in place"
+         );
+
+         let not_loaded = commands::execute(
+            app.state::<DbInstances>(),
+            "NOTES".to_string(),
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, val TEXT)".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .expect_err("execute before connect should fail");
+         assert!(matches!(not_loaded, Error::DatabaseNotLoaded(_)));
+
+         app.handle().connect("NOTES").await.unwrap();
+         assert_eq!(
+            resolve_database_path("NOTES", app.handle()).await.unwrap(),
+            new_path
+         );
+
+         commands::execute(
+            app.state::<DbInstances>(),
+            "NOTES".to_string(),
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, val TEXT)".to_string(),
+            vec![],
+            None,
+         )
+         .await
+         .expect("execute after connect should succeed");
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_after_failed_migration() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let old_path = validate::validate_database_path(temp_dir.path().join("old.db")).unwrap();
+      let new_path = validate::validate_database_path(temp_dir.path().join("new.db")).unwrap();
+      let migrations_dir = tempfile::tempdir().unwrap();
+      std::fs::write(
+         migrations_dir.path().join("20240101000000_init.sql"),
+         "NOT VALID SQL;",
+      )
+      .unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         let migrator = Migrator::new(migrations_dir.path()).await.unwrap();
+         app.handle()
+            .register_database("NOTES", &old_path, Some(migrator), IfExists::Error)
+            .await
+            .unwrap();
+
+         let err = match app.handle().connect("NOTES").await {
+            Err(error) => error,
+            Ok(_) => panic!("connect should fail after a bad migration"),
+         };
+         assert!(matches!(err, Error::Migration(_)));
+
+         let status = app
+            .state::<MigrationStates>()
+            .0
+            .read()
+            .await
+            .get("NOTES")
+            .expect("failed migration should leave state")
+            .status
+            .clone();
+         assert!(matches!(status, MigrationStatus::Failed(_)));
+
+         app.handle()
+            .register_database("NOTES", &new_path, None, IfExists::Replace)
+            .await
+            .unwrap();
+
+         assert!(
+            app.state::<MigrationStates>()
+               .0
+               .read()
+               .await
+               .get("NOTES")
+               .is_none(),
+            "replace with no migrator should clear migration state"
+         );
+         assert_eq!(
+            resolve_database_path("NOTES", app.handle()).await.unwrap(),
+            new_path
+         );
+         app.handle()
+            .connect("NOTES")
+            .await
+            .expect("connect after replace should succeed");
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_waits_while_migration_pending() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let old_path = validate::validate_database_path(temp_dir.path().join("old.db")).unwrap();
+      let new_path = validate::validate_database_path(temp_dir.path().join("new.db")).unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &old_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         app.state::<MigrationStates>()
+            .0
+            .write()
+            .await
+            .insert("NOTES".to_string(), MigrationState::new());
+
+         let app_handle = app.handle().clone();
+         let replace_path = new_path.clone();
+         let replace_task = tokio::spawn(async move {
+            app_handle
+               .register_database("NOTES", replace_path, None, IfExists::Replace)
+               .await
+         });
+
+         // An early return on Pending finishes this task during the wait.
+         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+         while std::time::Instant::now() < deadline {
+            assert!(
+               !replace_task.is_finished(),
+               "replace finished while migration was still pending"
+            );
+            tokio::task::yield_now().await;
+         }
+
+         app.state::<MigrationStates>()
+            .0
+            .write()
+            .await
+            .get_mut("NOTES")
+            .expect("pending migration state")
+            .update_status(MigrationStatus::Failed(
+               "settled so replace can continue".to_string(),
+            ));
+
+         replace_task
+            .await
+            .expect("replace task should not panic")
+            .expect("replace should succeed after migration settles");
+         assert_eq!(
+            resolve_database_path("NOTES", app.handle()).await.unwrap(),
+            new_path
+         );
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_inserts_unregistered_key() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let notes_path = validate::validate_database_path(temp_dir.path().join("notes.db")).unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("NOTES", &notes_path, None, IfExists::Replace)
+            .await
+            .unwrap();
+         let wrapper = app.handle().connect("NOTES").await.unwrap();
+         assert_eq!(
+            text_column(&wrapper, "SELECT 'open' AS n", "n").await,
+            vec!["open".to_string()]
+         );
+         assert_eq!(
+            resolve_database_path("NOTES", app.handle()).await.unwrap(),
+            notes_path
+         );
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_same_path_after_failed_migration() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let notes_path = validate::validate_database_path(temp_dir.path().join("notes.db")).unwrap();
+      let migrations_dir = tempfile::tempdir().unwrap();
+      std::fs::write(
+         migrations_dir.path().join("20240101000000_init.sql"),
+         "NOT VALID SQL;",
+      )
+      .unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         let migrator = Migrator::new(migrations_dir.path()).await.unwrap();
+         app.handle()
+            .register_database("NOTES", &notes_path, Some(migrator), IfExists::Error)
+            .await
+            .unwrap();
+
+         let connect_error = match app.handle().connect("NOTES").await {
+            Err(error) => error,
+            Ok(_) => panic!("connect should fail after a bad migration"),
+         };
+         assert!(matches!(connect_error, Error::Migration(_)));
+
+         let same_path = match app
+            .handle()
+            .register_database("NOTES", &notes_path, None, IfExists::Replace)
+            .await
+         {
+            Err(error) => error,
+            Ok(_) => panic!("same path after Failed should fail"),
+         };
+         assert!(matches!(same_path, Error::InvalidConfig(_)));
+         assert!(
+            matches!(
+               app.state::<MigrationStates>()
+                  .0
+                  .read()
+                  .await
+                  .get("NOTES")
+                  .expect("failed migration should leave state")
+                  .status,
+               MigrationStatus::Failed(_)
+            ),
+            "same-path replace must leave the failed migration state in place"
+         );
+         assert_eq!(
+            resolve_database_path("NOTES", app.handle()).await.unwrap(),
+            notes_path
+         );
+      });
+   }
+
+   #[test]
+   fn test_register_database_replace_wait_does_not_stall_other_connect() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let main_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let settings_path =
+         validate::validate_database_path(temp_dir.path().join("settings.db")).unwrap();
+      let new_main =
+         validate::validate_database_path(temp_dir.path().join("main-next.db")).unwrap();
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         app.handle()
+            .register_database("MAIN", &main_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         app.handle()
+            .register_database("SETTINGS", &settings_path, None, IfExists::Error)
+            .await
+            .unwrap();
+         app.handle().connect("SETTINGS").await.unwrap();
+
+         app.state::<MigrationStates>()
+            .0
+            .write()
+            .await
+            .insert("MAIN".to_string(), MigrationState::new());
+
+         let app_handle = app.handle().clone();
+         let replace_path = new_main.clone();
+         let replace_task = tokio::spawn(async move {
+            app_handle
+               .register_database("MAIN", replace_path, None, IfExists::Replace)
+               .await
+         });
+
+         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+         while std::time::Instant::now() < deadline {
+            assert!(
+               !replace_task.is_finished(),
+               "replace finished while MAIN migration was still pending"
+            );
+            tokio::task::yield_now().await;
+         }
+
+         tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app.handle().connect("SETTINGS"),
+         )
+         .await
+         .expect("SETTINGS connect timed out behind a MAIN replace wait")
+         .expect("SETTINGS connect should succeed while MAIN replace waits");
+         assert!(
+            !replace_task.is_finished(),
+            "SETTINGS connect should return before the MAIN replace settles"
+         );
+
+         app.state::<MigrationStates>()
+            .0
+            .write()
+            .await
+            .get_mut("MAIN")
+            .expect("pending migration state")
+            .update_status(MigrationStatus::Failed(
+               "settled so replace can continue".to_string(),
+            ));
+
+         replace_task
+            .await
+            .expect("replace task should not panic")
+            .expect("replace should succeed after migration settles");
+         assert_eq!(
+            resolve_database_path("MAIN", app.handle()).await.unwrap(),
+            new_main
+         );
+      });
+   }
+
+   /// While MAIN migration blocks at [`MigrationStatus::Running`], `connect` must still
+   /// release `registration_lock` for that wait (via `await_migrations` outside the loop
+   /// body holding the mutex). Otherwise SETTINGS `connect` blocks behind the global lock.
+   #[test]
+   fn test_connect_while_migration_running_does_not_stall_other_connect() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let main_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let settings_path =
+         validate::validate_database_path(temp_dir.path().join("settings.db")).unwrap();
+      let migrator_main = migrator_for_table("_stall_main");
+      let app = init_plugin_app();
+
+      tauri::async_runtime::block_on(async {
+         let barrier = Arc::new(tokio::sync::Barrier::new(2));
+         *TEST_MAIN_MIGRATION_RUNNING_BARRIER
+            .lock()
+            .expect("test migration barrier lock") = Some(barrier.clone());
+         let _clear_barrier = ClearTestMainMigrationBarrier;
+
+         app.handle()
+            .register_database("MAIN", &main_path, Some(migrator_main), IfExists::Error)
+            .await
+            .unwrap();
+         app.handle()
+            .register_database("SETTINGS", &settings_path, None, IfExists::Error)
+            .await
+            .unwrap();
+
+         let app_h = app.handle().clone();
+         let connect_main = tokio::spawn(async move { app_h.connect("MAIN").await });
+
+         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+         let migration_states = app.state::<MigrationStates>();
+         loop {
+            let states = migration_states.0.read().await;
+            if matches!(
+               states.get("MAIN").map(|s| &s.status),
+               Some(MigrationStatus::Running)
+            ) {
+               break;
+            }
+            drop(states);
+            assert!(
+               std::time::Instant::now() < deadline,
+               "MAIN migration never reached Running"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+         }
+
+         tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app.handle().connect("SETTINGS"),
+         )
+         .await
+         .expect("SETTINGS connect timed out while MAIN migration was running")
+         .expect("SETTINGS connect should succeed while MAIN migration blocks");
+
+         barrier.wait().await;
+
+         connect_main
+            .await
+            .expect("connect MAIN task should not panic")
+            .expect("connect MAIN should complete after barrier release");
       });
    }
 }
