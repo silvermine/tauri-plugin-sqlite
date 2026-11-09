@@ -20,7 +20,7 @@
    "scripts": {
       "build": "rollup -c",
       "check:iife": "rollup -c && git diff --exit-code api-iife.js",
-      "check-node-version": "check-node-version --npm 11.17.0",
+      "check-node-version": "check-node-version --npm 11.19.1",
       "commitlint": "commitlint --from ${COMMITLINT_FROM:-002bcc8} --to ${COMMITLINT_TO:-HEAD}",
       "eslint": "eslint .",
       "eslint:fix": "eslint . --fix",
