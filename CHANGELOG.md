@@ -56,6 +56,7 @@ Databases must be registered on the Rust side with a stable key before they can 
 
 ### Added
 
+- Re-export `sqlx_sqlite_conn_mgr`, `sqlx_sqlite_observer`, and `sqlx_sqlite_toolkit` from the plugin so Rust applications can use their types without separate dependencies (#69). Existing item re-exports remain available.
 - Path validation module (`validate.rs`) with canonicalization at registration time.
 - Parent directory auto-creation during registration validation for file paths.
 - CI check that committed `api-iife.js` matches a fresh Rollup build.

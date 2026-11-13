@@ -15,6 +15,14 @@ mod subscriptions;
 mod validate;
 
 pub use error::{Error, Result};
+
+/// Connection management types used by the plugin.
+pub use sqlx_sqlite_conn_mgr;
+/// Change observation types, including connection manager integration.
+pub use sqlx_sqlite_observer;
+/// Query builders, transactions, and pagination types with observation support.
+pub use sqlx_sqlite_toolkit;
+
 pub use sqlx_sqlite_conn_mgr::{
    AttachedMode, AttachedSpec, FunctionError, InvocationScope, Migrator as SqliteMigrator,
    ScalarFunction, ScalarHandler, SqlValue, SqlValueRef, SqliteDatabaseConfig,

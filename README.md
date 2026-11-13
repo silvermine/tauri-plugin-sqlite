@@ -1024,6 +1024,28 @@ frontend `load` command (`connect_to_database`).
 For standalone Rust projects without the plugin, use `DatabaseWrapper::connect(path)`
 from [`sqlx-sqlite-toolkit`](crates/sqlx-sqlite-toolkit/) directly (no registration).
 
+### Use from Rust
+
+The plugin re-exports its three inner crates. In a Tauri app, depend on
+`tauri-plugin-sqlite` and import their types through the plugin:
+
+```rust
+use tauri_plugin_sqlite::{Connection, DatabaseWrapper};
+use tauri_plugin_sqlite::sqlx_sqlite_conn_mgr::SqliteDatabase;
+use tauri_plugin_sqlite::sqlx_sqlite_observer::{ObserverConfig, TableChange};
+use tauri_plugin_sqlite::sqlx_sqlite_toolkit::{KeysetColumn, KeysetPage, SortDirection};
+```
+
+These paths use the same crate versions and features as the plugin, including observation
+support in the toolkit and connection manager integration in the observer. You do not need
+separate dependencies or matching Git revisions for the inner crates.
+
+Existing imports such as `tauri_plugin_sqlite::DatabaseWrapper` and
+`tauri_plugin_sqlite::SqliteMigrator` continue to work. Error types remain in their own
+namespaces: `tauri_plugin_sqlite::Error` is the plugin error, while
+`tauri_plugin_sqlite::sqlx_sqlite_toolkit::Error` and
+`tauri_plugin_sqlite::sqlx_sqlite_conn_mgr::Error` describe lower-level failures.
+
 ### Setup (Tauri plugin)
 
 ```rust
@@ -1186,7 +1208,7 @@ See [Pagination](#pagination) above for background on why the plugin uses
 keyset pagination. The Rust API works the same way via `fetch_page`:
 
 ```rust
-use sqlx_sqlite_toolkit::pagination::KeysetColumn;
+use tauri_plugin_sqlite::sqlx_sqlite_toolkit::KeysetColumn;
 
 let keyset = vec![
    KeysetColumn::asc("category"),
