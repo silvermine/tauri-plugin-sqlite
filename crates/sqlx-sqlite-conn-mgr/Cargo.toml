@@ -13,7 +13,7 @@ keywords = ["sqlite", "sqlx", "database", "connection-pool", "async"]
 categories = ["database", "asynchronous"]
 
 [dependencies]
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "migrate"] }
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "sqlite", "migrate"] }
 thiserror = "2.0.17"
 tokio = { version = "1.54.1", features = ["full"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_off"] }
@@ -22,7 +22,7 @@ parking_lot = "0.12.3"
 # Registers consumer-supplied scalar functions on every pooled connection.
 # Pinned to the version sqlx-sqlite links: only one version of a `links`
 # crate can exist in a dependency graph.
-libsqlite3-sys = "0.35.0"
+libsqlite3-sys = "0.40.0"
 
 [dev-dependencies]
 tempfile = "3.24.0"

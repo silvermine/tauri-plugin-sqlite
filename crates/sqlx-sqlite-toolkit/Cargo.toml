@@ -19,7 +19,7 @@ observer = ["dep:sqlx-sqlite-observer"]
 [dependencies]
 sqlx-sqlite-conn-mgr = { path = "../sqlx-sqlite-conn-mgr", version = "0.9.0" }
 sqlx-sqlite-observer = { path = "../sqlx-sqlite-observer", version = "0.9.1", features = ["conn-mgr"], optional = true }
-sqlx = { version = "0.9.0", features = ["sqlite", "json", "time", "runtime-tokio"] }
+sqlx = { version = "0.9.1", features = ["sqlite", "json", "time", "runtime-tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
