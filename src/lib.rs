@@ -1707,6 +1707,7 @@ mod tests {
    use crate::commands;
    use crate::subscriptions::ObserverConfigParams;
    use rstest::rstest;
+   use sqlx::ConnectOptions;
    use std::collections::HashMap;
    use tauri::plugin::Plugin;
    use tauri::test::{MockRuntime, mock_app, mock_builder, mock_context, noop_assets};
@@ -2711,6 +2712,96 @@ mod tests {
             Error::Toolkit(sqlx_sqlite_toolkit::Error::TransactionCancelled(_))
          ));
          assert!(err.to_string().contains("transaction cancelled"));
+      });
+   }
+
+   /// A failed `BEGIN IMMEDIATE` returns from `begin_interruptible_transaction`
+   /// before the writer is handed to an `ActiveInterruptibleTransaction`, so
+   /// nothing in the command detaches. The write pool's `after_release` hook has
+   /// to, or the alias stays on MAIN's single write connection and every later
+   /// attach of it fails with "database is already in use" (#83).
+   #[test]
+   fn test_failed_begin_immediate_releases_attached_alias() {
+      let temp_dir = tempfile::tempdir().unwrap();
+      let main_path = validate::validate_database_path(temp_dir.path().join("main.db")).unwrap();
+      let other_path = validate::validate_database_path(temp_dir.path().join("other.db")).unwrap();
+      let hog_path = main_path.clone();
+
+      tauri::async_runtime::block_on(async {
+         let app = tokio::task::spawn_blocking(move || {
+            init_app_with_main_and_other(main_path, other_path)
+         })
+         .await
+         .expect("plugin init task should succeed");
+
+         load_and_create_test_table(&app, "MAIN").await;
+         load_and_create_test_table(&app, "OTHER").await;
+
+         let attach_other = || {
+            Some(vec![commands::AttachedDatabaseSpec {
+               database_key: "OTHER".to_string(),
+               schema_name: "other".to_string(),
+               mode: commands::AttachedDatabaseMode::ReadWrite,
+            }])
+         };
+         let insert_into_other = || {
+            vec![Statement {
+               query: "INSERT INTO other.test (val) VALUES (?)".to_string(),
+               values: vec![serde_json::json!("attached")],
+            }]
+         };
+
+         // A raw connection, opened outside the plugin, holds MAIN's write lock so
+         // the command's own BEGIN IMMEDIATE ends in SQLITE_BUSY. That only
+         // happens once sqlx's default 5-second busy_timeout runs out, which is
+         // why this test takes about 5 seconds.
+         let mut hog = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&hog_path)
+            .connect()
+            .await
+            .expect("open a raw connection to main.db");
+         sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut hog)
+            .await
+            .expect("lock MAIN via the raw connection");
+
+         let err = commands::begin_interruptible_transaction(
+            app.state::<DbInstances>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            "MAIN".to_string(),
+            insert_into_other(),
+            attach_other(),
+         )
+         .await
+         .expect_err("BEGIN IMMEDIATE should fail while the raw connection holds the lock");
+         assert!(
+            err.to_string().contains("database is locked"),
+            "expected a busy/locked error, got: {err}"
+         );
+
+         sqlx::query("ROLLBACK")
+            .execute(&mut hog)
+            .await
+            .expect("release the raw connection's lock");
+         drop(hog);
+
+         let token = commands::begin_interruptible_transaction(
+            app.state::<DbInstances>(),
+            app.state::<ActiveInterruptibleTransactions>(),
+            "MAIN".to_string(),
+            insert_into_other(),
+            attach_other(),
+         )
+         .await
+         .expect("the alias must be reusable after a failed BEGIN IMMEDIATE");
+
+         commands::transaction_continue(
+            app.state::<ActiveInterruptibleTransactions>(),
+            token,
+            commands::TransactionAction::Rollback,
+         )
+         .await
+         .expect("rollback should succeed");
       });
    }
 

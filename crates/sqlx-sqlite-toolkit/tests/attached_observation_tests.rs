@@ -10,8 +10,9 @@
 //!    subscribers as `"main"`.
 //! 2. **Alias release.** The attached alias is detached when the transaction
 //!    finishes (see `builders::detach_after`'s doc for what stranding it costs).
-//!    The second transaction below is the assertion for that; without it, a
-//!    `detach_all()` call silently becoming a no-op passes the whole suite.
+//!    The second transaction below is the assertion for that. It asserts the
+//!    outcome, not the call site: if `detach_all()` silently became a no-op, the
+//!    write pool's `after_release` hook would still release the alias.
 
 #![cfg(feature = "observer")]
 
@@ -97,8 +98,8 @@ async fn observed_attached_transaction_routes_by_owner_and_releases_the_alias() 
    assert_eq!(other_change.table, "logs");
 
    // Reuses the same alias on the same (single) write connection. Fails with
-   // "database other is already in use" if the first transaction didn't
-   // detach.
+   // "database other is already in use" if the alias was not released after the
+   // first transaction.
    main
       .execute_transaction(vec![("INSERT INTO users (name) VALUES ('Yan')", vec![])])
       .attach(vec![make_spec()])
@@ -297,8 +298,8 @@ async fn main_unobserved_attached_observed_alias_is_still_released() {
       .expect("first attached transaction should commit");
 
    // Reuses the same alias on the same (single) write connection. Fails with
-   // "database other is already in use" if the first transaction's detach
-   // regressed on this (main-unobserved) path.
+   // "database other is already in use" if the alias was not released on this
+   // (main-unobserved) path.
    main
       .execute_transaction(vec![(
          "INSERT INTO other.logs (msg) VALUES ('second')",

@@ -106,8 +106,9 @@ impl Drop for AttachedReadConnection {
 /// Guard holding a write connection with attached database(s)
 ///
 /// **Important**: Call `detach_all()` before dropping to properly clean up attached databases.
-/// Without explicit cleanup, attached databases persist on the pooled connection until
-/// it's eventually closed. Derefs to `SqliteConnection` for executing queries.
+/// A guard dropped without it is detached when its connection returns to the write pool
+/// (see the pool's `after_release` hook), but a failure there is never returned to the
+/// caller. Derefs to `SqliteConnection` for executing queries.
 #[must_use = "if unused, the write guard and locks are immediately dropped"]
 #[derive(Debug)]
 pub struct AttachedWriteGuard {
@@ -139,8 +140,8 @@ impl AttachedWriteGuard {
    /// Explicitly detach all attached databases.
    ///
    /// This method should be called before dropping the connection to ensure
-   /// attached databases are properly cleaned up. Without calling this,
-   /// attached databases may persist when the connection is returned to the pool.
+   /// attached databases are properly cleaned up. Without calling this, the
+   /// write pool detaches them when the connection is released.
    pub async fn detach_all(mut self) -> Result<()> {
       for schema_name in &self.schema_names {
          let detach_sql = format!("DETACH DATABASE \"{}\"", schema_name);
@@ -170,7 +171,7 @@ impl Drop for AttachedWriteGuard {
    fn drop(&mut self) {
       // Cannot reliably execute async DETACH in synchronous Drop.
       // Call detach_all() before dropping to ensure cleanup.
-      // Otherwise, databases remain attached until connection is eventually closed.
+      // Otherwise, the write pool's after_release hook detaches them on release.
       // Note: held_writers are also dropped here, releasing write locks.
    }
 }
@@ -459,8 +460,7 @@ pub async fn acquire_writer_with_attached(
          .await
       {
          // Earlier specs in this loop may already be attached to `writer` - unwind
-         // those before returning the original error, or they'd strand on the write
-         // pool's single connection until it goes genuinely idle.
+         // those before returning the original error.
          let original: Error = err.into();
          for attached in &schema_names {
             detach_unwind(&mut writer, attached, &original).await;
@@ -1190,9 +1190,10 @@ mod tests {
          "attaching 11 databases should exceed SQLite's default attach limit"
       );
 
-      // Load-bearing: without unwinding the 10 aliases that attached before the 11th
-      // failed, they would still be live on the write pool's single connection, and
-      // this attach of a brand-new, previously-unused alias would fail too.
+      // The 10 aliases that attached before the 11th failed must be gone by now, or
+      // this attach of a brand-new, previously-unused alias would fail too. This
+      // asserts the outcome, not the unwind loop: the write pool's `after_release`
+      // hook would also detach them.
       let unused_db = create_test_db("unused.db", &temp_dir).await;
       let specs = vec![AttachedSpec {
          database: unused_db,
@@ -1245,6 +1246,74 @@ mod tests {
          "a later attach of an unused alias must succeed once the failed attempt has \
           unwound: {:?}",
          follow_up.err()
+      );
+   }
+
+   /// A writer guard dropped without `detach_all()` - an early `?` return or a
+   /// cancelled future in a caller - must not leave its alias on the write pool's
+   /// single connection. Pins the write pool's `after_release` hook: nothing else
+   /// runs between this drop and the next acquisition.
+   #[tokio::test]
+   async fn test_dropped_writer_guard_releases_alias() {
+      let temp_dir = TempDir::new().unwrap();
+      let main_db = create_test_db("main.db", &temp_dir).await;
+      let other_db = create_test_db("other.db", &temp_dir).await;
+
+      let make_specs = || {
+         vec![AttachedSpec {
+            database: other_db.clone(),
+            schema_name: "other".to_string(),
+            mode: AttachedMode::ReadWrite,
+         }]
+      };
+
+      let mut guard = acquire_writer_with_attached(&main_db, make_specs())
+         .await
+         .unwrap();
+
+      // A temp table lives and dies with its connection. Finding it again on the
+      // next writer proves the hook cleaned this connection up and returned it to
+      // the pool. Discarding the connection would release the alias too, and so
+      // would hide a hook that detaches before it rolls back.
+      sqlx::query("CREATE TEMP TABLE same_connection (id INTEGER)")
+         .execute(&mut *guard)
+         .await
+         .unwrap();
+
+      // The guard is dropped with a transaction still open that has written to the
+      // attached database. SQLite refuses to detach "other" in that state, so the
+      // hook has to roll back first.
+      sqlx::query("BEGIN IMMEDIATE")
+         .execute(&mut *guard)
+         .await
+         .unwrap();
+      sqlx::query("INSERT INTO other.other (value) VALUES ('abandoned')")
+         .execute(&mut *guard)
+         .await
+         .unwrap();
+      drop(guard);
+
+      let mut writer = main_db.acquire_writer().await.unwrap();
+      sqlx::query("SELECT id FROM temp.same_connection")
+         .fetch_all(&mut *writer)
+         .await
+         .expect("the hook must return the connection to the pool, not discard it");
+      drop(writer);
+
+      let guard = acquire_writer_with_attached(&main_db, make_specs())
+         .await
+         .expect("the alias must be reusable after a guard was dropped without detach_all()");
+      guard.detach_all().await.unwrap();
+
+      let mut writer = other_db.acquire_writer().await.unwrap();
+      let abandoned = sqlx::query("SELECT COUNT(*) FROM other WHERE value = 'abandoned'")
+         .fetch_one(&mut *writer)
+         .await
+         .unwrap();
+      assert_eq!(
+         abandoned.get::<i64, _>(0),
+         0,
+         "the abandoned transaction's write must have been rolled back"
       );
    }
 }
