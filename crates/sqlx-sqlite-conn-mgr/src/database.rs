@@ -19,6 +19,46 @@ use tracing::{error, warn};
 /// See: https://www.sqlite.org/lang_analyze.html#recommended_usage_pattern
 const OPTIMIZE_ANALYSIS_LIMIT: u32 = 400;
 
+/// Lowest `seq` that `PRAGMA database_list` gives an attached database. `main` is
+/// always 0 and `temp` is always 1.
+const FIRST_ATTACHED_SEQ: i64 = 2;
+
+/// Detach every database still attached to a connection that is returning to its pool.
+///
+/// The attached guards cannot detach in `Drop` (an async `DETACH` from a synchronous
+/// `Drop`), so a guard dropped without `detach_all()` - an early `?` return, a
+/// cancelled future - gets here with its aliases still live. The caller must have
+/// closed any open transaction first: SQLite refuses to detach a database that an
+/// open transaction has touched.
+///
+/// # Errors
+///
+/// Returns an error if the database list cannot be read or a `DETACH` fails. The
+/// connection's alias state is then unknown and it should not be reused.
+async fn detach_stranded_databases(
+   conn: &mut sqlx::sqlite::SqliteConnection,
+) -> std::result::Result<(), sqlx::Error> {
+   use sqlx::Row;
+
+   let rows = sqlx::query("PRAGMA database_list")
+      .fetch_all(&mut *conn)
+      .await?;
+
+   for row in rows {
+      if row.try_get::<i64, _>("seq")? < FIRST_ATTACHED_SEQ {
+         continue;
+      }
+
+      let schema_name: String = row.try_get("name")?;
+      let detach_sql = format!("DETACH DATABASE \"{}\"", schema_name.replace('"', "\"\""));
+      sqlx::query(sqlx::AssertSqlSafe(detach_sql))
+         .execute(&mut *conn)
+         .await?;
+   }
+
+   Ok(())
+}
+
 /// SQLite database with connection pooling for concurrent reads and optional exclusive writes.
 ///
 /// Once the database is opened it can be used for read-only operations by calling `read_pool()`.
@@ -234,14 +274,22 @@ impl SqliteDatabase {
             .after_release(|conn, _meta| {
                Box::pin(async move {
                   match sqlx::query("ROLLBACK").execute(&mut *conn).await {
-                     Ok(_) => Ok(true),
+                     Ok(_) => {}
                      Err(sqlx::Error::Database(e))
-                        if e.message().contains("no transaction is active") =>
-                     {
-                        Ok(true)
-                     }
+                        if e.message().contains("no transaction is active") => {}
                      Err(err) => {
                         warn!("after_release ROLLBACK failed, discarding connection: {err}");
+                        return Ok(false);
+                     }
+                  }
+
+                  // Same reasoning for ATTACH: a guard dropped without
+                  // `detach_all()` leaves its alias on this connection. Must
+                  // follow the ROLLBACK above (see `detach_stranded_databases`).
+                  match detach_stranded_databases(conn).await {
+                     Ok(()) => Ok(true),
+                     Err(err) => {
+                        warn!("after_release DETACH failed, discarding connection: {err}");
                         Ok(false)
                      }
                   }

@@ -778,10 +778,8 @@ async fn abandoned_attached_transaction_does_not_leak_into_next_commit() {
    // each, then drop the writer directly - no COMMIT, no ROLLBACK, no
    // detach_all(). This is what ObservableWriteGuard::drop's broker fan-out
    // must clean up for every broker in the hook map, not just "main". (The
-   // stale ATTACH this leaves on the pooled connection is a separate,
-   // pre-existing conn-mgr contract - AttachedWriteGuard::drop deliberately
-   // doesn't detach either, see its own doc - so the follow-up commits below
-   // use each database's own plain writer rather than reusing this alias.)
+   // ATTACH this leaves is a separate conn-mgr contract: the write pool's
+   // after_release hook removes it.)
    {
       let specs = vec![AttachedSpec {
          database: db_b.clone(),
@@ -946,10 +944,7 @@ async fn detach_all_discards_buffered_events_for_every_broker() {
       "B must not receive a notification for a never-committed change"
    );
 
-   // Follow-up commits go through each database's own plain writer, not a
-   // re-attach: the failed DETACH above left the "other" alias stranded on
-   // A's pooled connection (same reasoning as
-   // abandoned_attached_transaction_does_not_leak_into_next_commit above).
+   // Follow-up commits go through each database's own plain writer.
    let mut writer_a = observable_a.acquire_writer().await.unwrap();
    sqlx::query("INSERT INTO users (name) VALUES ('RealMain')")
       .execute(&mut *writer_a)
@@ -1054,9 +1049,8 @@ async fn into_inner_discards_buffered_events_for_every_broker() {
    // into_inner() unregisters the hooks and flushes both brokers' buffers
    // before handing back the plain (attached) writer - dropping that writer
    // here doesn't detach (AttachedWriteGuard::drop deliberately can't run an
-   // async DETACH), so the "other" alias is left stranded exactly as it is
-   // in the detach_all test above. Same reason the follow-up commits below
-   // go through each database's own plain writer instead of reusing it.
+   // async DETACH), so the "other" alias is left for the write pool's
+   // after_release hook to remove.
    let unobserved = writer.into_inner();
    drop(unobserved);
 

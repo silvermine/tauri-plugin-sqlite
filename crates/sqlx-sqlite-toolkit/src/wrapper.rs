@@ -70,10 +70,10 @@ impl DerefMut for WriterGuard {
 ///
 /// **Important**: call [`detach_all`](Self::detach_all) before dropping. Neither
 /// inner guard detaches in `Drop`, so a dropped guard leaves the alias on the
-/// pooled write connection until that connection is eventually closed - and the
-/// write pool holds a single connection, so every later attach of that alias
-/// fails until then. `#[must_use]` catches the discarded-guard case but cannot
-/// carry this hazard in its message, which is why it's stated here.
+/// pooled write connection until the write pool's `after_release` hook detaches
+/// it, and a `DETACH` failure there is never returned to the caller.
+/// `#[must_use]` catches the discarded-guard case but cannot carry this hazard
+/// in its message, which is why it's stated here.
 #[must_use = "if unused, the write guard and locks are immediately dropped"]
 pub enum AttachedWriterGuard {
    /// Plain attached writer from the connection manager - unobserved.
@@ -823,8 +823,8 @@ impl InterruptibleTransactionBuilder {
 
       // Begin transaction. A failure here (a busy database, say) is the one early
       // return not covered by `ActiveInterruptibleTransaction`'s Drop, since the
-      // writer hasn't been handed over yet - so detach explicitly, or the alias
-      // strands on the pooled write connection (see `builders::detach_after`).
+      // writer hasn't been handed over yet - so detach explicitly (see
+      // `builders::detach_after`).
       if let Err(err) = writer.begin_immediate().await {
          if let Err(detach_err) = writer.detach_if_attached().await {
             tracing::error!(
@@ -936,8 +936,7 @@ impl TransactionExecutionBuilder {
       };
 
       // Begin transaction. Same reasoning as the commit/rollback arms below: this
-      // early return has to detach too, or the alias strands on the single write
-      // connection.
+      // early return detaches too.
       if let Err(err) = writer.begin_immediate().await {
          if let Err(detach_err) = writer.detach_if_attached().await {
             tracing::error!(

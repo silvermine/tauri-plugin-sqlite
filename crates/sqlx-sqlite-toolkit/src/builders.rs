@@ -15,14 +15,14 @@ use crate::wrapper::{DatabaseWrapper, WriteQueryResult, bind_value};
 /// Runs `detach` and returns `result`, whichever way `result` went.
 ///
 /// Every attached-database query below has to detach on its error paths, not just
-/// on success, because nothing else will: the attached guards' `Drop` impls can't
-/// (an async `DETACH` from a synchronous `Drop`), and the pools' `after_release`
-/// hook runs `ROLLBACK` but never `DETACH`. So a bare `?` between acquiring the
-/// connection and detaching strands the alias on a *pooled* connection, and the
-/// next acquisition that reuses both fails at `ATTACH` with "database ... is
-/// already in use". For writes that is effectively permanent: the write pool is
-/// `max_connections(1)`, and only genuine idleness (default 30s) retires the
-/// connection.
+/// on success: the attached guards' `Drop` impls can't (an async `DETACH` from a
+/// synchronous `Drop`), and the read pool has no `after_release` hook. So a bare
+/// `?` between acquiring a read connection and detaching strands the alias on a
+/// *pooled* connection, and the next acquisition that reuses both fails at
+/// `ATTACH` with "database ... is already in use". The write pool's
+/// `after_release` hook detaches whatever a released writer still has attached,
+/// but detaching here is what returns a `DETACH` failure to the caller on the
+/// success path.
 ///
 /// A detach failure never masks an error the query already produced - it's logged
 /// instead, as in the transaction paths. On the success path there is no earlier

@@ -28,7 +28,7 @@ pub enum TransactionWriter {
    /// because `ObservableWriteGuard` already knows which kind of writer it wraps
    /// and handles both in `detach_all()`. Two variants of the same type would
    /// duplicate that distinction with nothing but the `From` impl below keeping
-   /// them aligned - and a mis-map there strands the `ATTACH` alias.
+   /// them aligned - and a mis-map there skips the explicit `DETACH`.
    #[cfg(feature = "observer")]
    Observable(ObservableWriteGuard),
 }
@@ -86,8 +86,7 @@ impl TransactionWriter {
          // `detach_all()` skips the DETACH but still unregisters the hooks and
          // discards the guard's buffered events - work `Drop` would otherwise do
          // at an unspecified point. Do not "optimize" this into a no-op arm for a
-         // writer that looks unattached; only the guard knows, and getting it
-         // wrong strands the alias on the single write connection permanently.
+         // writer that looks unattached; only the guard knows.
          #[cfg(feature = "observer")]
          Self::Observable(w) => w.detach_all().await?,
          Self::Regular(_) => {}
@@ -232,6 +231,8 @@ impl ActiveInterruptibleTransaction {
    /// Commit this transaction
    pub async fn commit(mut self) -> Result<()> {
       let mut writer = self.take_writer()?;
+      // A failed COMMIT drops the writer here without detaching; the write pool's
+      // `after_release` hook rolls back and detaches it.
       writer.commit().await?;
 
       let db_path = self.db_path.clone();

@@ -622,7 +622,8 @@ pub async fn begin_interruptible_transaction(
       TransactionWriter::from(wrapper.acquire_writer().await?)
    };
 
-   // Begin transaction
+   // Begin transaction. A failure here drops the writer without detaching; the
+   // write pool's `after_release` hook detaches it.
    writer.begin_immediate().await?;
 
    // Execute initial statements

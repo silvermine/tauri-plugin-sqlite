@@ -490,15 +490,12 @@ pub async fn acquire_writer_with_attached_brokers(
       // register_hooks failed before touching any of observable's state
       // (see its own body), so the writer is untouched and still has the
       // ATTACH(es) live on it. Detach before propagating: AttachedWriteGuard's
-      // own Drop deliberately doesn't detach (see its doc), and the write
-      // pool is max_connections(1), so leaving the alias attached here
-      // would strand it on the pooled connection - every later acquisition
-      // that reuses the same alias would then fail at ATTACH with
-      // "database is already in use", permanently.
+      // own Drop deliberately doesn't detach (see its doc), which would
+      // leave the alias for the write pool's after_release hook to remove.
       if let Err(detach_err) = observable.detach_all().await {
          warn!(
             "failed to detach after register_hooks failed ({err}); the \
-             write connection may be stuck with a stale ATTACH: {detach_err}"
+             write pool detaches on release instead: {detach_err}"
          );
       }
       return Err(err);
@@ -555,7 +552,7 @@ impl DerefMut for InnerWriter {
 ///
 /// `#[must_use]` like the guard it came out of, so `guard.into_inner();` as a
 /// bare statement still warns: every hazard the inner guards warn about survives
-/// the unwrapping, including a stranded `ATTACH` for the `Attached` variant.
+/// the unwrapping, including a missed `detach_all()` for the `Attached` variant.
 #[must_use = "if unused, the write guard and locks are immediately dropped"]
 pub enum UnobservedWriter {
    Regular(WriteGuard),
